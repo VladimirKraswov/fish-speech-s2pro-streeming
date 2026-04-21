@@ -13,12 +13,7 @@ from fastapi.responses import JSONResponse
 from loguru import logger
 
 from session_mode.manager import OutboundFrame, SessionManager
-from session_mode.schema import (
-    ClientMessage,
-    ServerError,
-    parse_client_message,
-    event_to_dict,
-)
+from session_mode.schema import ServerError, event_to_dict, parse_client_message
 
 
 _ACTIVE_SESSIONS: dict[str, SessionManager] = {}
@@ -43,6 +38,10 @@ async def _unregister_manager(manager: SessionManager) -> None:
 
 
 async def _sync_manager_registry(manager: SessionManager) -> None:
+    """
+    Session ID может измениться после start_session / patch_config.
+    Держим глобальный registry в консистентном состоянии.
+    """
     async with _ACTIVE_SESSIONS_LOCK:
         stale_keys = [key for key, value in _ACTIVE_SESSIONS.items() if value is manager]
         for key in stale_keys:
@@ -50,6 +49,28 @@ async def _sync_manager_registry(manager: SessionManager) -> None:
                 _ACTIVE_SESSIONS.pop(key, None)
 
         _ACTIVE_SESSIONS[manager.config.session_id] = manager
+
+
+async def _send_ws_error(
+    websocket: WebSocket,
+    *,
+    session_id: str | None,
+    code: str,
+    message: str,
+    fatal: bool = False,
+    details: dict[str, Any] | None = None,
+) -> None:
+    await websocket.send_json(
+        event_to_dict(
+            ServerError(
+                code=code,
+                message=message,
+                session_id=session_id,
+                fatal=fatal,
+                details=details,
+            )
+        )
+    )
 
 
 async def _reader_loop(websocket: WebSocket, manager: SessionManager) -> None:
@@ -61,15 +82,12 @@ async def _reader_loop(websocket: WebSocket, manager: SessionManager) -> None:
             raise WebSocketDisconnect(raw.get("code", 1000))
 
         if raw.get("bytes") is not None:
-            await websocket.send_json(
-                event_to_dict(
-                    ServerError(
-                        code="binary_frame_not_supported",
-                        message="Binary frames are not supported by session_mode input",
-                        session_id=manager.config.session_id,
-                        fatal=False,
-                    )
-                )
+            await _send_ws_error(
+                websocket,
+                session_id=manager.config.session_id,
+                code="binary_frame_not_supported",
+                message="Binary frames are not supported by session_mode input",
+                fatal=False,
             )
             continue
 
@@ -78,19 +96,12 @@ async def _reader_loop(websocket: WebSocket, manager: SessionManager) -> None:
             continue
 
         try:
-            payload: dict[str, Any] | str
             try:
-                payload = json.loads(text)
+                payload: dict[str, Any] | str = json.loads(text)
             except json.JSONDecodeError:
                 payload = text
 
-            if isinstance(payload, str):
-                message: ClientMessage = parse_client_message(
-                    {"type": "text_delta", "text": payload}
-                )
-            else:
-                message = parse_client_message(payload)
-
+            message = parse_client_message(payload)
             await manager.handle(message)
             await _sync_manager_registry(manager)
 
@@ -100,15 +111,12 @@ async def _reader_loop(websocket: WebSocket, manager: SessionManager) -> None:
                 manager.config.session_id,
                 exc,
             )
-            await websocket.send_json(
-                event_to_dict(
-                    ServerError(
-                        code="invalid_client_message",
-                        message=str(exc),
-                        session_id=manager.config.session_id,
-                        fatal=False,
-                    )
-                )
+            await _send_ws_error(
+                websocket,
+                session_id=manager.config.session_id,
+                code="invalid_client_message",
+                message=str(exc),
+                fatal=False,
             )
 
 
@@ -270,6 +278,7 @@ def create_app() -> FastAPI:
         finally:
             with contextlib.suppress(Exception):
                 await manager.close(reason="websocket_closed")
+
             await _unregister_manager(manager)
 
             for task in (reader_task, writer_task):

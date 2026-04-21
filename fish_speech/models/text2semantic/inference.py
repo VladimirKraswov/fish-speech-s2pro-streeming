@@ -717,12 +717,6 @@ class GenerateResponse:
 def split_text_by_speaker(text: str) -> list[str]:
     """
     Split text into turns based on <|speaker:X|> tags.
-
-    Args:
-        text: The full text with speaker tags
-
-    Returns:
-        List of speaker turns, each starting with <|speaker:X|>
     """
     pattern = r"(<\|speaker:\d+\|>)"
     parts = re.split(pattern, text)
@@ -772,14 +766,6 @@ def group_turns_into_batches(
 ) -> list[str]:
     """
     Group turns into batches based on speaker count or byte limit.
-
-    Args:
-        turns: List of speaker turns
-        max_speakers: Maximum number of speakers per batch (default 3)
-        max_bytes: Maximum UTF-8 bytes per batch (default 300)
-
-    Returns:
-        List of batched text strings
     """
     batches = []
     current_batch = []
@@ -829,6 +815,14 @@ def generate_long(
     assert 0 < top_p <= 1, "top_p must be in (0, 1]"
     assert 0 < temperature < 2, "temperature must be in (0, 2)"
 
+    tokenizer = getattr(model, "tokenizer", None)
+    if tokenizer is None:
+        raise RuntimeError(
+            "Model tokenizer is not initialized. Ensure checkpoint directory contains tokenizer files."
+        )
+
+    debug_visualize_prompt = _env_flag("FISH_DEBUG_VISUALIZE_PROMPT", False)
+
     use_prompt = bool(prompt_text) and bool(prompt_tokens)
     if use_prompt and isinstance(prompt_text, str):
         prompt_text = [prompt_text]
@@ -843,7 +837,6 @@ def generate_long(
         prompt_tokens = [i.cpu() for i in prompt_tokens]
 
     model_size = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    tokenizer = model.tokenizer
     max_length = _cache_max_seq_len(model)
 
     base_conversation = Conversation()
@@ -931,12 +924,13 @@ def generate_long(
                 )
             )
 
-            logger.info("Visualizing prompt structure:")
-            conversation_gen.visualize(
-                tokenizer,
-                merge_audio_tokens=True,
-                merge_semantic_tokens=True,
-            )
+            if debug_visualize_prompt:
+                logger.info("Visualizing prompt structure:")
+                conversation_gen.visualize(
+                    tokenizer,
+                    merge_audio_tokens=True,
+                    merge_semantic_tokens=True,
+                )
 
             encoded, audio_masks, audio_parts = conversation_gen.encode_for_inference(
                 tokenizer, num_codebooks=model.config.num_codebooks

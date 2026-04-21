@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 
-from .buffer import BufferEmit, StreamingTextBuffer
+from .buffer import BufferEmit, SPEAKER_TAG_RE, StreamingTextBuffer, WORD_RE
 from .schema import (
     ClientCleanup,
     ClientClear,
@@ -55,10 +55,8 @@ def _now_monotonic() -> float:
 
 
 def _count_words(text: str) -> int:
-    stripped = text.strip()
-    if not stripped:
-        return 0
-    return len(stripped.split())
+    plain = SPEAKER_TAG_RE.sub(" ", text)
+    return len(WORD_RE.findall(plain))
 
 
 def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
@@ -246,12 +244,10 @@ class SessionManager:
         self._last_buffer_append_at = _now_monotonic()
         self._cleanup_sent_for_idle_window = False
 
-        if (
-            self.config.policy.close_tts_stream_on_new_text
-            and self._active_tts_request_task
-            and not self._active_tts_request_task.done()
-        ):
-            self._active_tts_request_task.cancel()
+        if self.config.policy.close_tts_stream_on_new_text:
+            if self._active_tts_request_task and not self._active_tts_request_task.done():
+                self._active_tts_request_task.cancel()
+            await self._drop_pending_chunks()
 
         emits = self._buffer.push(message.text, final=message.final)
 
@@ -327,6 +323,20 @@ class SessionManager:
         trace_id: str | None,
     ) -> None:
         for emit in emits:
+            if self._pending_tts.qsize() >= self.config.policy.max_pending_emit_chunks:
+                await self._emit_error(
+                    code="pending_tts_overflow",
+                    message=(
+                        "Pending TTS queue limit reached; dropping newly emitted chunk"
+                    ),
+                    fatal=False,
+                    details={
+                        "limit": self.config.policy.max_pending_emit_chunks,
+                        "text_preview": emit.text[:120],
+                    },
+                )
+                break
+
             chunk = TTSChunkRequest(
                 session_id=self.config.session_id,
                 text=emit.text,

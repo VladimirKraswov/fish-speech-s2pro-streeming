@@ -12,12 +12,17 @@ WORD_RE = re.compile(r"\b\w+\b", flags=re.UNICODE)
 
 _SENTENCE_ENDINGS = {".", "!", "?", ";", "…", "。", "！", "？", "；"}
 _HARD_BREAKS = {"\n"}
+_BOUNDARY_CHARS = _SENTENCE_ENDINGS.union(_HARD_BREAKS).union(
+    {",", ":", "，", "："}
+)
+
+EmitReason = Literal["punct", "hard_limit", "force", "final"]
 
 
 @dataclass(frozen=True)
 class BufferEmit:
     text: str
-    reason: Literal["punct", "hard_limit", "force", "final"]
+    reason: EmitReason
     words: int
     chars: int
 
@@ -50,8 +55,10 @@ class StreamingTextBuffer:
         self.min_words = min_words
         self.soft_limit_chars = soft_limit_chars
         self.hard_limit_chars = hard_limit_chars
+
         self._buffer = ""
         self._is_first_chunk = True
+        self._last_fragment_ended_at_boundary = False
 
     @property
     def text(self) -> str:
@@ -63,10 +70,12 @@ class StreamingTextBuffer:
     def clear(self) -> None:
         self._buffer = ""
         self._is_first_chunk = True
+        self._last_fragment_ended_at_boundary = False
 
     def replace(self, text: str) -> None:
         self._buffer = self._cleanup_text(text)
         self._is_first_chunk = True
+        self._last_fragment_ended_at_boundary = self._raw_text_ended_at_boundary(text)
 
     def push(
         self,
@@ -76,6 +85,9 @@ class StreamingTextBuffer:
         final: bool = False,
     ) -> list[BufferEmit]:
         if text:
+            self._last_fragment_ended_at_boundary = self._raw_text_ended_at_boundary(
+                text
+            )
             self._buffer = self._append_fragment(self._buffer, text)
 
         return self._drain_ready(force=force, final=final)
@@ -96,27 +108,19 @@ class StreamingTextBuffer:
                 self._buffer = ""
                 break
 
-            split = self._find_split(force=force, final=final)
-            if split is None:
+            split_info = self._find_split(force=force, final=final)
+            if split_info is None:
                 break
+
+            split, reason = split_info
 
             raw_chunk = self._buffer[:split]
             self._buffer = self._buffer[split:].lstrip()
+            self._last_fragment_ended_at_boundary = False
 
             chunk = self._cleanup_text(raw_chunk)
             if not chunk:
                 continue
-
-            if final:
-                reason: Literal["punct", "hard_limit", "force", "final"] = "final"
-            elif force:
-                reason = "force"
-            else:
-                stripped = raw_chunk.rstrip()
-                if stripped and stripped[-1] in _SENTENCE_ENDINGS.union(_HARD_BREAKS):
-                    reason = "punct"
-                else:
-                    reason = "hard_limit"
 
             out.append(
                 BufferEmit(
@@ -133,43 +137,58 @@ class StreamingTextBuffer:
 
         return out
 
-    def _find_split(self, *, force: bool, final: bool) -> int | None:
-        buf = self._buffer.strip()
+    def _find_split(
+        self,
+        *,
+        force: bool,
+        final: bool,
+    ) -> tuple[int, EmitReason] | None:
+        raw = self._buffer
+        buf = raw.strip()
         if not buf:
             return None
 
+        if final:
+            return len(raw), "final"
+
+        if force:
+            return len(raw), "force"
+
         total_words = self._count_words(buf)
 
-        if final or force:
-            return len(self._buffer)
-
-        # Optimization for TTFA: emit the very first chunk as soon as we have at least one word.
+        # Первый чанк можно отдать раньше, но только если последний входной
+        # фрагмент закончился на безопасной границе. Это защищает от озвучки
+        # обрезков слов вроде "Hel" / "при".
         if self._is_first_chunk and total_words >= 1:
-            # We still prefer splitting at a sentence boundary if possible
             punct_split = self._find_sentence_boundary(buf)
             if punct_split is not None:
-                return self._map_stripped_index_to_raw_index(punct_split)
+                return self._map_stripped_index_to_raw_index(punct_split), "punct"
 
-            # If no punctuation but we have some text, just split at the end of the current buffer
-            # (up to hard limit) to get the first audio fast.
-            return len(self._buffer)
+            if self._last_fragment_ended_at_boundary:
+                return len(raw), "force"
+
+            if len(buf) >= self.hard_limit_chars:
+                hard_split = self._find_hard_limit_boundary(buf)
+                return self._map_stripped_index_to_raw_index(hard_split), "hard_limit"
+
+            return None
 
         if total_words < self.min_words and len(buf) < self.hard_limit_chars:
             return None
 
         punct_split = self._find_sentence_boundary(buf)
         if punct_split is not None:
-            return self._map_stripped_index_to_raw_index(punct_split)
+            return self._map_stripped_index_to_raw_index(punct_split), "punct"
 
         if len(buf) >= self.hard_limit_chars:
             hard_split = self._find_hard_limit_boundary(buf)
-            return self._map_stripped_index_to_raw_index(hard_split)
+            return self._map_stripped_index_to_raw_index(hard_split), "hard_limit"
 
         return None
 
     def _find_sentence_boundary(self, buf: str) -> int | None:
         rightmost_valid: int | None = None
-        limit = min(len(buf), self.hard_limit_chars)
+        limit = min(len(buf), self.soft_limit_chars)
 
         for i, ch in enumerate(buf[:limit], start=1):
             if ch not in _SENTENCE_ENDINGS and ch not in _HARD_BREAKS:
@@ -238,6 +257,13 @@ class StreamingTextBuffer:
     def _count_words(text: str) -> int:
         plain = SPEAKER_TAG_RE.sub(" ", text)
         return len(WORD_RE.findall(plain))
+
+    @staticmethod
+    def _raw_text_ended_at_boundary(text: str) -> bool:
+        if not text:
+            return False
+        last = text[-1]
+        return last.isspace() or last in _BOUNDARY_CHARS
 
     def _map_stripped_index_to_raw_index(self, stripped_index: int) -> int:
         raw = self._buffer

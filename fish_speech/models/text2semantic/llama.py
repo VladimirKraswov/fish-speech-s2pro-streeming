@@ -44,20 +44,15 @@ class BaseModelArgs:
     attention_o_bias: bool = False
     attention_qk_norm: bool = False
 
-    # Codebook configs
     codebook_size: int = 160
     num_codebooks: int = 4
 
     semantic_begin_id: int = 0
     semantic_end_id: int = 0
 
-    # Gradient checkpointing
     use_gradient_checkpointing: bool = True
-
-    # Initialize the model
     initializer_range: float = 0.02
 
-    # Dummy vars
     is_reward_model: bool = False
     scale_codebook_embeddings: bool = False
     audio_embed_dim: Optional[int] = None
@@ -92,7 +87,6 @@ class BaseModelArgs:
             case _:
                 raise ValueError(f"Unknown model type: {data['model_type']}")
 
-        # Filter out unexpected keyword arguments
         valid_keys = {f.name for f in dataclasses.fields(cls)}
         data = {k: v for k, v in data.items() if k in valid_keys}
 
@@ -203,7 +197,6 @@ class KVCache(nn.Module):
         self.register_buffer("v_cache", torch.zeros(cache_shape, dtype=dtype))
 
     def update(self, input_pos, k_val, v_val):
-        # input_pos: [S], k_val: [B, H, S, D]
         assert input_pos.shape[0] == k_val.shape[2]
 
         k_out = self.k_cache
@@ -255,7 +248,6 @@ class BaseTransformer(nn.Module):
         super().__init__()
         self.config = config
 
-        # Slow transformer
         self.embeddings = nn.Embedding(
             config.vocab_size,
             config.dim,
@@ -297,7 +289,6 @@ class BaseTransformer(nn.Module):
             persistent=False,
         )
 
-        # For kv cache
         self.max_batch_size = -1
         self.max_seq_len = -1
 
@@ -324,7 +315,6 @@ class BaseTransformer(nn.Module):
             )
 
     def clear_caches(self) -> None:
-        """Release KV cache buffers so VRAM can be freed between requests (avoids OOM on 32 GB)."""
         if not getattr(self, "_cache_setup_done", False):
             return
         for b in self.layers:
@@ -361,7 +351,6 @@ class BaseTransformer(nn.Module):
     ) -> BaseTransformerForwardResult:
         seq_len = inp.size(2)
 
-        # Here we want to merge the embeddings of the codebooks
         x = self.embed(inp)
 
         freqs_cis = self.freqs_cis[:seq_len]
@@ -405,8 +394,6 @@ class BaseTransformer(nn.Module):
         audio_parts: Optional[Tensor] = None,
         return_all: bool = False,
     ) -> BaseTransformerForwardResult:
-
-        # Embedding logic replicated from embed() for compilation compatibility
         embeds = []
         for i in range(self.config.num_codebooks):
             emb = self.codebook_embeddings(
@@ -429,10 +416,7 @@ class BaseTransformer(nn.Module):
                 vq_masks_expanded, x / math.sqrt(self.config.num_codebooks + 1), x
             )
 
-        # Audio embeddings
         if audio_parts is not None:
-            # Note: This assumes self.audio_projector exists if audio_parts is used
-            # It seems missing in init, but we keep existing logic
             if hasattr(self, "audio_projector"):
                 audio_embeds = self.audio_projector(audio_parts)
                 if self.config.scale_codebook_embeddings:
@@ -448,7 +432,7 @@ class BaseTransformer(nn.Module):
         else:
             max_seq_len = self.max_seq_len
 
-        mask = self.causal_mask[None, None, input_pos, :max_seq_len]  # (B, N, Q, K)
+        mask = self.causal_mask[None, None, input_pos, :max_seq_len]
         freqs_cis = self.freqs_cis[input_pos]
 
         for layer in self.layers:
@@ -494,7 +478,6 @@ class BaseTransformer(nn.Module):
         lora_config: LoraConfig | None = None,
         rope_base: int | None = None,
     ) -> "BaseTransformer":
-        # Import wrapper locally to avoid circular dependency or global import issues
         from fish_speech.tokenizer import FishTokenizer
 
         config = BaseModelArgs.from_pretrained(str(path))
@@ -506,6 +489,7 @@ class BaseTransformer(nn.Module):
             config.rope_base = rope_base
             logger.info(f"Override rope_base to {rope_base}")
 
+        tokenizer = None
         try:
             tokenizer = FishTokenizer.from_pretrained(path)
             config.semantic_begin_id = tokenizer.semantic_begin_id
@@ -527,9 +511,8 @@ class BaseTransformer(nn.Module):
                 raise ValueError(f"Unknown model type: {config.model_type}")
 
         logger.info(f"Loading model from {path}, config: {config}")
-        # Initialize model without passing tokenizer explicitly to __init__
         model = model_cls(config)
-        # Attach tokenizer to model instance for inference convenience (optional, but good for user scripts)
+
         model.tokenizer = tokenizer
 
         if load_weights is False:
@@ -616,7 +599,7 @@ class BaseTransformer(nn.Module):
                 state_dict.pop(key)
 
         torch.save(state_dict, path / "model.pth")
-        if hasattr(self, "tokenizer"):
+        if hasattr(self, "tokenizer") and self.tokenizer is not None:
             self.tokenizer.save_pretrained(path)
 
 
@@ -637,7 +620,6 @@ class NaiveTransformer(BaseTransformer):
         token_logits = result.logits
         x = result.hidden_states
 
-        # Codebook
         codebook_logits = self.codebook_output(self.codebook_norm(x))
         codebook_logits = rearrange(
             codebook_logits, "b n (c d) -> b n c d", c=self.config.num_codebooks
@@ -670,16 +652,13 @@ class DualARTransformer(BaseTransformer):
     def __init__(self, config: NaiveModelArgs) -> None:
         super().__init__(config, init_weights=False)
 
-        # Project to fast dim if needed
         if config.fast_dim is not None and config.fast_dim != config.dim:
             self.fast_project_in = nn.Linear(config.dim, config.fast_dim)
         else:
             self.fast_project_in = nn.Identity()
 
-        # Fast transformer
         self.fast_embeddings = nn.Embedding(config.codebook_size, config.fast_dim)
 
-        # The equivalent bs is so large that sdpa doesn't work
         override_config = dataclasses.replace(
             config,
             dim=config.fast_dim,
@@ -719,8 +698,6 @@ class DualARTransformer(BaseTransformer):
     ):
         super().setup_caches(max_batch_size, max_seq_len, dtype)
 
-        # Fast transformer
-        # The max seq len here is the number of codebooks
         for b in self.fast_layers:
             b.attention.kv_cache = KVCache(
                 max_batch_size,
@@ -753,26 +730,20 @@ class DualARTransformer(BaseTransformer):
         token_logits = parent_result.logits
         x = parent_result.hidden_states
 
-        # Fast transformer
         fast_seq_len = self.config.num_codebooks
         fast_mask = self.causal_mask[
             None, None, :fast_seq_len, :fast_seq_len
-        ]  # (B, N, Q, K)
+        ]
         fast_freqs_cis = self.fast_freqs_cis[:fast_seq_len]
 
-        # Extract corresponding parts with labels
         token_labels = labels[:, 0]
-
-        # [MODIFIED] Use config instead of tokenizer
         codebook_mask = (token_labels >= self.config.semantic_begin_id) & (
             token_labels <= self.config.semantic_end_id
         )
 
-        # This gives where input token is <|semantic|>
         x = x[codebook_mask]
 
         if x.shape[0] == 0:
-            # Use dummy input when no vq is required
             x = torch.zeros(
                 (4, self.config.dim),
                 device=x.device,
@@ -799,7 +770,6 @@ class DualARTransformer(BaseTransformer):
             else:
                 x = layer(x, fast_freqs_cis, fast_mask)
 
-        # unflatten the batch and num_codebooks
         fast_out = self.fast_norm(x)
         codebook_logits = self.fast_output(fast_out)
 
@@ -813,19 +783,17 @@ class DualARTransformer(BaseTransformer):
     def forward_generate_fast(
         self, x: Tensor, input_pos: Optional[Tensor] = None
     ) -> Tensor:
-        # Fast transformer
         x = x.view(x.shape[0], 1, -1)
 
         fast_mask = self.causal_mask[
             None, None, input_pos, : self.config.num_codebooks
-        ]  # (B, N, Q, K)
+        ]
         fast_freqs_cis = self.fast_freqs_cis[input_pos]
 
         for layer in self.fast_layers:
             x = layer(x, fast_freqs_cis, fast_mask, input_pos=input_pos)
 
-        # unflatten the batch and num_codebooks
-        fast_out = self.fast_norm(x)  # only take the last token
+        fast_out = self.fast_norm(x)
         codebook_logits = self.fast_output(fast_out)
 
         return codebook_logits
@@ -864,7 +832,6 @@ class Attention(nn.Module):
         assert config.dim % config.n_head == 0
 
         total_head_dim = (config.n_head + 2 * config.n_local_heads) * config.head_dim
-        # key, query, value projections for all heads, but in a batch
         self.wqkv = nn.Linear(
             config.dim, total_head_dim, bias=config.attention_qkv_bias
         )
@@ -936,7 +903,6 @@ class Attention(nn.Module):
                         v,
                         dropout_p=self.dropout if self.training else 0.0,
                         is_causal=True,
-                        # No third party attn_mask here to use flash_attention
                     )
             else:
                 y = F.scaled_dot_product_attention(
@@ -967,9 +933,6 @@ class Attention(nn.Module):
         attn_mask=None,
         dropout_p=0.0,
     ) -> torch.Tensor:
-        # This is a standard scaled dot product attention
-        # It's low efficient, but it doesn't raise cuda error
-
         L, S = query.size(-2), key.size(-2)
         scale_factor = 1 / math.sqrt(query.size(-1))
         attn_bias = torch.zeros(1, 1, L, S, dtype=query.dtype, device=query.device)
@@ -1016,17 +979,6 @@ class RMSNorm(nn.Module):
 
 
 def precompute_freqs_cis(seq_len: int, n_elem: int, base: int = 10000) -> Tensor:
-    """
-    Precomputes frequency tensors for complex exponentials (cis)
-
-    Args:
-        seq_len: Length of the sequence for which positional embeddings are needed.
-        n_elem: Number of elements in the frequency tensor.
-        base: Base value for the frequency scaling (default: 10000).
-
-    Returns:
-        A tensor containing the precomputed frequencies in real and imaginary parts (bfloat16).
-    """
     freqs = 1.0 / (
         base ** (torch.arange(0, n_elem, 2)[: (n_elem // 2)].float() / n_elem)
     )

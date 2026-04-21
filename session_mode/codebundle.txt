@@ -1,7 +1,7 @@
 === CODE BUNDLE ===
 root: /Volumes/Extend/work/fish-speech-s2pro-streeming/session_mode
 ignore: .codebundleignore
-generated: 2026-04-21T19:14:16.368Z
+generated: 2026-04-21T22:28:11.806Z
 
 
 
@@ -46,57 +46,154 @@ path: /app.py
 ----------------------------------------
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import json
 import time
 from contextlib import asynccontextmanager
+from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from loguru import logger
 
-from session_mode.http_api import router as http_router
-from session_mode.runtime import SessionModeRuntime
-from session_mode.settings import SessionModeSettings, get_settings
-from session_mode.ws_api import router as ws_router
+from session_mode.manager import OutboundFrame, SessionManager
+from session_mode.schema import (
+    ClientMessage,
+    ServerError,
+    parse_client_message,
+    event_to_dict,
+)
 
 
-def get_runtime(request: Request) -> SessionModeRuntime:
-    runtime = getattr(request.app.state, "runtime", None)
-    if runtime is None:
-        raise RuntimeError("session runtime is not initialized")
-    return runtime
+_ACTIVE_SESSIONS: dict[str, SessionManager] = {}
+_ACTIVE_SESSIONS_LOCK = asyncio.Lock()
 
 
-def get_app_settings(request: Request) -> SessionModeSettings:
-    settings = getattr(request.app.state, "settings", None)
-    if settings is None:
-        raise RuntimeError("session settings are not initialized")
-    return settings
+async def _register_manager(manager: SessionManager) -> None:
+    async with _ACTIVE_SESSIONS_LOCK:
+        _ACTIVE_SESSIONS[manager.config.session_id] = manager
+
+
+async def _unregister_manager(manager: SessionManager) -> None:
+    async with _ACTIVE_SESSIONS_LOCK:
+        current = _ACTIVE_SESSIONS.get(manager.config.session_id)
+        if current is manager:
+            _ACTIVE_SESSIONS.pop(manager.config.session_id, None)
+            return
+
+        stale_keys = [key for key, value in _ACTIVE_SESSIONS.items() if value is manager]
+        for key in stale_keys:
+            _ACTIVE_SESSIONS.pop(key, None)
+
+
+async def _sync_manager_registry(manager: SessionManager) -> None:
+    async with _ACTIVE_SESSIONS_LOCK:
+        stale_keys = [key for key, value in _ACTIVE_SESSIONS.items() if value is manager]
+        for key in stale_keys:
+            if key != manager.config.session_id:
+                _ACTIVE_SESSIONS.pop(key, None)
+
+        _ACTIVE_SESSIONS[manager.config.session_id] = manager
+
+
+async def _reader_loop(websocket: WebSocket, manager: SessionManager) -> None:
+    while True:
+        raw = await websocket.receive()
+        ws_type = raw.get("type")
+
+        if ws_type == "websocket.disconnect":
+            raise WebSocketDisconnect(raw.get("code", 1000))
+
+        if raw.get("bytes") is not None:
+            await websocket.send_json(
+                event_to_dict(
+                    ServerError(
+                        code="binary_frame_not_supported",
+                        message="Binary frames are not supported by session_mode input",
+                        session_id=manager.config.session_id,
+                        fatal=False,
+                    )
+                )
+            )
+            continue
+
+        text = raw.get("text")
+        if text is None:
+            continue
+
+        try:
+            payload: dict[str, Any] | str
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                payload = text
+
+            if isinstance(payload, str):
+                message: ClientMessage = parse_client_message(
+                    {"type": "text_delta", "text": payload}
+                )
+            else:
+                message = parse_client_message(payload)
+
+            await manager.handle(message)
+            await _sync_manager_registry(manager)
+
+        except Exception as exc:
+            logger.exception(
+                "invalid websocket message session_id={} err={}",
+                manager.config.session_id,
+                exc,
+            )
+            await websocket.send_json(
+                event_to_dict(
+                    ServerError(
+                        code="invalid_client_message",
+                        message=str(exc),
+                        session_id=manager.config.session_id,
+                        fatal=False,
+                    )
+                )
+            )
+
+
+async def _writer_loop(websocket: WebSocket, manager: SessionManager) -> None:
+    while True:
+        frame: OutboundFrame = await manager.next_outbound()
+
+        if frame.event is not None:
+            await websocket.send_json(frame.event)
+
+        if frame.audio is not None:
+            await websocket.send_bytes(frame.audio)
+
+        event_type = None
+        if isinstance(frame.event, dict):
+            event_type = frame.event.get("event") or frame.event.get("type")
+
+        if event_type == "session_closed":
+            return
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    settings = get_settings()
-    runtime = SessionModeRuntime(settings=settings)
-
-    app.state.settings = settings
-    app.state.runtime = runtime
-
-    logger.info(
-        "session_mode starting host={} port={} upstream={} cleanup_mode={}",
-        settings.host,
-        settings.port,
-        settings.tts_base_url,
-        settings.default_cleanup_mode,
-    )
-
-    await runtime.startup()
+    logger.info("session_mode starting")
 
     try:
         yield
     finally:
         logger.info("session_mode shutting down")
-        await runtime.shutdown()
+
+        async with _ACTIVE_SESSIONS_LOCK:
+            managers = list(_ACTIVE_SESSIONS.values())
+            _ACTIVE_SESSIONS.clear()
+
+        for manager in managers:
+            with contextlib.suppress(Exception):
+                await manager.close(reason="app_shutdown")
+
+        logger.info("session_mode stopped")
 
 
 def create_app() -> FastAPI:
@@ -135,21 +232,97 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/health")
-    async def health():
-        return {"ok": True, "service": "session_mode"}
+    async def health() -> dict[str, Any]:
+        async with _ACTIVE_SESSIONS_LOCK:
+            return {
+                "ok": True,
+                "service": "session_mode",
+                "active_sessions": len(_ACTIVE_SESSIONS),
+                "session_ids": sorted(_ACTIVE_SESSIONS.keys()),
+            }
 
     @app.get("/ready")
-    async def ready(request: Request):
-        runtime = get_runtime(request)
-        return {
-            "ok": True,
-            "service": "session_mode",
-            "ready": runtime.is_ready(),
-            "active_sessions": runtime.session_count(),
-        }
+    async def ready() -> dict[str, Any]:
+        async with _ACTIVE_SESSIONS_LOCK:
+            return {
+                "ok": True,
+                "service": "session_mode",
+                "ready": True,
+                "active_sessions": len(_ACTIVE_SESSIONS),
+            }
 
-    app.include_router(http_router)
-    app.include_router(ws_router)
+    @app.get("/sessions")
+    async def list_sessions() -> dict[str, Any]:
+        async with _ACTIVE_SESSIONS_LOCK:
+            return {
+                "count": len(_ACTIVE_SESSIONS),
+                "sessions": {
+                    session_id: manager.snapshot()
+                    for session_id, manager in _ACTIVE_SESSIONS.items()
+                },
+            }
+
+    @app.get("/sessions/{session_id}")
+    async def get_session(session_id: str) -> dict[str, Any]:
+        async with _ACTIVE_SESSIONS_LOCK:
+            manager = _ACTIVE_SESSIONS.get(session_id)
+
+        if manager is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        return manager.snapshot()
+
+    @app.websocket("/ws")
+    async def websocket_session(websocket: WebSocket) -> None:
+        await websocket.accept()
+
+        manager = SessionManager()
+        await manager.start()
+        await _register_manager(manager)
+
+        logger.info("session websocket connected: {}", manager.config.session_id)
+
+        reader_task = asyncio.create_task(
+            _reader_loop(websocket, manager),
+            name=f"session-reader-{manager.config.session_id}",
+        )
+        writer_task = asyncio.create_task(
+            _writer_loop(websocket, manager),
+            name=f"session-writer-{manager.config.session_id}",
+        )
+
+        try:
+            done, pending = await asyncio.wait(
+                {reader_task, writer_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            for task in done:
+                exc = task.exception()
+                if exc is not None and not isinstance(exc, WebSocketDisconnect):
+                    raise exc
+
+            for task in pending:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+        except WebSocketDisconnect:
+            logger.info("session websocket disconnected: {}", manager.config.session_id)
+        except Exception:
+            logger.exception("session websocket failed: {}", manager.config.session_id)
+            with contextlib.suppress(Exception):
+                await websocket.close(code=1011)
+        finally:
+            with contextlib.suppress(Exception):
+                await manager.close(reason="websocket_closed")
+            await _unregister_manager(manager)
+
+            for task in (reader_task, writer_task):
+                if not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
 
     return app
 
@@ -192,12 +365,6 @@ class StreamingTextBuffer:
     - не слать слишком короткие куски в TTS;
     - как можно раньше флашить на естественных границах фразы;
     - не раздувать буфер бесконечно.
-
-    Логика:
-    - пока не набралось min_words — ждем;
-    - как только есть min_words и встретилась граница предложения — отдаем chunk;
-    - если буфер вырос до hard_limit_chars — режем по последнему пробелу;
-    - force/final — отдаем остаток сразу.
     """
 
     def __init__(
@@ -218,6 +385,7 @@ class StreamingTextBuffer:
         self.soft_limit_chars = soft_limit_chars
         self.hard_limit_chars = hard_limit_chars
         self._buffer = ""
+        self._is_first_chunk = True
 
     @property
     def text(self) -> str:
@@ -228,6 +396,11 @@ class StreamingTextBuffer:
 
     def clear(self) -> None:
         self._buffer = ""
+        self._is_first_chunk = True
+
+    def replace(self, text: str) -> None:
+        self._buffer = self._cleanup_text(text)
+        self._is_first_chunk = True
 
     def push(
         self,
@@ -236,18 +409,12 @@ class StreamingTextBuffer:
         force: bool = False,
         final: bool = False,
     ) -> list[BufferEmit]:
-        """
-        Добавляет очередную текстовую дельту в буфер и возвращает готовые chunks.
-        """
         if text:
             self._buffer = self._append_fragment(self._buffer, text)
 
         return self._drain_ready(force=force, final=final)
 
     def flush(self, *, final: bool = False) -> list[BufferEmit]:
-        """
-        Принудительно отдает остаток буфера.
-        """
         return self._drain_ready(force=True, final=final)
 
     def _drain_ready(
@@ -274,20 +441,8 @@ class StreamingTextBuffer:
             if not chunk:
                 continue
 
-            reason: Literal["punct", "hard_limit", "force", "final"]
             if final:
-                reason = "final"
-            elif force:
-                reason = "force"
-            elif split < len(raw_chunk) + len(self._buffer):
-                # сюда обычно не попадем, reason выставляется ниже по эвристике
-                reason = "punct"
-            else:
-                reason = "force"
-
-            # Более точное определение причины.
-            if final:
-                reason = "final"
+                reason: Literal["punct", "hard_limit", "force", "final"] = "final"
             elif force:
                 reason = "force"
             else:
@@ -305,8 +460,8 @@ class StreamingTextBuffer:
                     chars=len(chunk),
                 )
             )
+            self._is_first_chunk = False
 
-            # После force/final нужно отдать все одним куском и закончить.
             if force or final:
                 break
 
@@ -320,6 +475,17 @@ class StreamingTextBuffer:
         total_words = self._count_words(buf)
 
         if final or force:
+            return len(self._buffer)
+
+        # Optimization for TTFA: emit the very first chunk as soon as we have at least one word.
+        if self._is_first_chunk and total_words >= 1:
+            # We still prefer splitting at a sentence boundary if possible
+            punct_split = self._find_sentence_boundary(buf)
+            if punct_split is not None:
+                return self._map_stripped_index_to_raw_index(punct_split)
+
+            # If no punctuation but we have some text, just split at the end of the current buffer
+            # (up to hard limit) to get the first audio fast.
             return len(self._buffer)
 
         if total_words < self.min_words and len(buf) < self.hard_limit_chars:
@@ -336,12 +502,8 @@ class StreamingTextBuffer:
         return None
 
     def _find_sentence_boundary(self, buf: str) -> int | None:
-        """
-        Ищем естественную границу фразы.
-        Берем самую правую границу, если перед ней уже есть min_words.
-        """
         rightmost_valid: int | None = None
-        limit = min(len(buf), self.soft_limit_chars)
+        limit = min(len(buf), self.hard_limit_chars)
 
         for i, ch in enumerate(buf[:limit], start=1):
             if ch not in _SENTENCE_ENDINGS and ch not in _HARD_BREAKS:
@@ -356,11 +518,6 @@ class StreamingTextBuffer:
         return rightmost_valid
 
     def _find_hard_limit_boundary(self, buf: str) -> int:
-        """
-        Когда буфер уже слишком большой:
-        режем по последнему пробелу до hard_limit,
-        иначе режем жестко по hard_limit.
-        """
         limit = min(len(buf), self.hard_limit_chars)
         candidate = buf.rfind(" ", 0, limit)
 
@@ -379,9 +536,9 @@ class StreamingTextBuffer:
         if not base:
             return frag
 
-        needs_space = self._needs_space_between(base, frag)
-        if needs_space:
+        if self._needs_space_between(base, frag):
             return self._cleanup_text(f"{base} {frag}")
+
         return self._cleanup_text(f"{base}{frag}")
 
     @staticmethod
@@ -417,10 +574,6 @@ class StreamingTextBuffer:
         return len(WORD_RE.findall(plain))
 
     def _map_stripped_index_to_raw_index(self, stripped_index: int) -> int:
-        """
-        _find_split работает по stripped версии.
-        Здесь переводим индекс обратно в self._buffer.
-        """
         raw = self._buffer
         stripped = raw.strip()
 
@@ -705,13 +858,13 @@ import asyncio
 import contextlib
 import json
 import logging
-import re
 import time
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
+from .buffer import BufferEmit, StreamingTextBuffer
 from .schema import (
     ClientCleanup,
     ClientClear,
@@ -744,22 +897,9 @@ from .schema import (
 
 logger = logging.getLogger(__name__)
 
-_WORD_RE = re.compile(r"\S+", re.UNICODE)
-_PREFERRED_PUNCT_RE = re.compile(r"[.!?…;\n]")
-_SECONDARY_PUNCT_RE = re.compile(r"[,:]")
-_TRAILING_SPACE_RE = re.compile(r"\s+$")
-_LEADING_SPACE_RE = re.compile(r"^\s+")
-
 
 @dataclass(slots=True)
 class OutboundFrame:
-    """
-    Универсальная сущность для отдачи наружу.
-
-    - event: JSON-событие
-    - audio: бинарный аудио chunk, который websocket слой сможет отправить send_bytes(...)
-    """
-
     event: dict[str, Any] | None = None
     audio: bytes | None = None
 
@@ -769,34 +909,10 @@ def _now_monotonic() -> float:
 
 
 def _count_words(text: str) -> int:
-    return len(_WORD_RE.findall(text))
-
-
-def _trim_left(text: str) -> str:
-    return _LEADING_SPACE_RE.sub("", text)
-
-
-def _trim_right(text: str) -> str:
-    return _TRAILING_SPACE_RE.sub("", text)
-
-
-def _smart_join(left: str, right: str) -> str:
-    if not left:
-        return right
-
-    if not right:
-        return left
-
-    if left[-1].isspace() or right[0].isspace():
-        return left + right
-
-    if right[0] in ",.!?;:)]}":
-        return left + right
-
-    if left[-1] in "([{":
-        return left + right
-
-    return left + " " + right
+    stripped = text.strip()
+    if not stripped:
+        return 0
+    return len(stripped.split())
 
 
 def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
@@ -813,111 +929,17 @@ def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _find_last_regex_before(pattern: re.Pattern[str], text: str, limit: int) -> int | None:
-    last: int | None = None
-    for m in pattern.finditer(text[:limit]):
-        last = m.end()
-    return last
-
-
-def _find_last_whitespace_before(text: str, limit: int) -> int | None:
-    last: int | None = None
-    for idx, ch in enumerate(text[:limit], start=1):
-        if ch.isspace():
-            last = idx
-    return last
-
-
-def _extract_chunk_from_buffer(
-    text: str,
-    *,
-    min_words: int,
-    soft_limit_chars: int,
-    hard_limit_chars: int,
-    force: bool,
-    final: bool,
-) -> tuple[str | None, str, str | None]:
-    """
-    Возвращает:
-    - chunk
-    - remaining
-    - reason
-
-    reason in {"punct", "hard_limit", "force", "final"}
-    """
-    if not text or not text.strip():
-        return None, "", None
-
-    raw = text
-    words = _count_words(raw)
-    chars = len(raw)
-
-    if not force and not final:
-        if words < min_words and chars < soft_limit_chars:
-            return None, raw, None
-
-    stripped = raw.rstrip()
-    if final:
-        return stripped, "", "final"
-
-    preferred_limit = min(chars, hard_limit_chars)
-
-    # 1. Если уже набралось достаточно текста и есть хорошая пунктуация — режем по ней.
-    punct_cut = _find_last_regex_before(_PREFERRED_PUNCT_RE, raw, preferred_limit)
-    if punct_cut is not None:
-        chunk = _trim_right(raw[:punct_cut])
-        rest = _trim_left(raw[punct_cut:])
-        if chunk and (_count_words(chunk) >= min_words or force):
-            return chunk, rest, "punct"
-
-    # 2. Более мягкая пунктуация.
-    secondary_cut = _find_last_regex_before(_SECONDARY_PUNCT_RE, raw, preferred_limit)
-    if secondary_cut is not None and chars >= soft_limit_chars:
-        chunk = _trim_right(raw[:secondary_cut])
-        rest = _trim_left(raw[secondary_cut:])
-        if chunk and (_count_words(chunk) >= min_words or force):
-            return chunk, rest, "punct"
-
-    # 3. Если force — можно отдать весь буфер даже без пунктуации.
-    if force and stripped:
-        return stripped, "", "force"
-
-    # 4. Если перевалили hard_limit — режем по последнему пробелу, либо грубо.
-    if chars >= hard_limit_chars:
-        ws_cut = _find_last_whitespace_before(raw, hard_limit_chars)
-        cut = ws_cut or hard_limit_chars
-        chunk = _trim_right(raw[:cut])
-        rest = _trim_left(raw[cut:])
-        if chunk:
-            return chunk, rest, "hard_limit"
-
-    # 5. Если текст закончился пунктуацией и минимальный размер достигнут.
-    if stripped and stripped[-1] in ".!?…;:" and _count_words(stripped) >= min_words:
-        return stripped, "", "punct"
-
-    # 6. Если буфер длиннее soft_limit и есть хотя бы пробел — можно мягко отрезать.
-    if chars >= soft_limit_chars:
-        ws_cut = _find_last_whitespace_before(raw, min(chars, soft_limit_chars))
-        if ws_cut is not None:
-            chunk = _trim_right(raw[:ws_cut])
-            rest = _trim_left(raw[ws_cut:])
-            if chunk and (_count_words(chunk) >= min_words or force):
-                return chunk, rest, "force"
-
-    return None, raw, None
-
-
 class SessionManager:
     """
-    Один runtime-manager на одну live-session.
+    Один manager на одну realtime-сессию.
 
-    Он умеет:
-    - принимать text deltas
-    - накапливать буфер
-    - резать текст на чанки
-    - последовательно слать чанки в основной TTS backend
-    - прокидывать наружу JSON события + бинарные аудио чанки
-    - по idle делать heavy cleanup backend'а
+    Умеет:
+    - принимать text deltas;
+    - буферизовать текст;
+    - резать его на подходящие chunks;
+    - последовательно стримить chunks в основной TTS backend;
+    - отдавать наружу JSON-события и бинарные аудио чанки;
+    - делать idle cleanup backend'а.
     """
 
     def __init__(self, config: SessionModeConfig | None = None) -> None:
@@ -926,7 +948,6 @@ class SessionManager:
         self._events: asyncio.Queue[OutboundFrame] = asyncio.Queue()
         self._pending_tts: asyncio.Queue[TTSChunkRequest | None] = asyncio.Queue()
 
-        self._buffer_text: str = ""
         self._started = False
         self._closed = False
 
@@ -939,17 +960,19 @@ class SessionManager:
         self._tts_worker_task: asyncio.Task[None] | None = None
         self._idle_watchdog_task: asyncio.Task[None] | None = None
 
+        self._buffer = self._build_buffer()
         self._client = self._build_http_client()
 
-    # -------------------------------------------------------------------------
-    # Public API
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     async def start(self) -> None:
         if self._started:
             return
 
         self._started = True
+
         self._tts_worker_task = asyncio.create_task(
             self._tts_worker_loop(),
             name=f"session-tts-worker-{self.config.session_id}",
@@ -971,7 +994,7 @@ class SessionManager:
             return
 
         self._closed = True
-        self._buffer_text = ""
+        self._buffer.clear()
 
         await self._drop_pending_chunks()
 
@@ -997,6 +1020,10 @@ class SessionManager:
                 reason=reason,
             )
         )
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     async def handle(self, message: ClientMessage) -> None:
         if isinstance(message, ClientStartSession):
@@ -1035,17 +1062,14 @@ class SessionManager:
     async def next_outbound(self) -> OutboundFrame:
         return await self._events.get()
 
-    async def iter_outbound(self):
-        while not self._closed:
-            yield await self.next_outbound()
-
-    # -------------------------------------------------------------------------
-    # Message handlers
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Handlers
+    # ------------------------------------------------------------------
 
     async def _handle_start_session(self, message: ClientStartSession) -> None:
         if message.config is not None:
             self.config = message.config
+            self._rebuild_buffer()
             await self._reset_http_client()
 
         await self.start()
@@ -1055,6 +1079,7 @@ class SessionManager:
             current = self.config.model_dump(mode="json")
             merged = _deep_merge(current, message.patch)
             self.config = SessionModeConfig.model_validate(merged)
+            self._rebuild_buffer(preserve_text=True)
             await self._reset_http_client()
 
             await self._emit_json(
@@ -1082,44 +1107,30 @@ class SessionManager:
         ):
             self._active_tts_request_task.cancel()
 
-        self._buffer_text = _smart_join(self._buffer_text, message.text)
+        emits = self._buffer.push(message.text, final=message.final)
 
         await self._emit_json(
             ServerTextAccepted(
                 session_id=self.config.session_id,
-                buffered_text_len=len(self._buffer_text),
-                buffered_words=_count_words(self._buffer_text),
+                buffered_text_len=len(self._buffer.text),
+                buffered_words=_count_words(self._buffer.text),
                 trace_id=message.trace_id,
                 final=message.final,
             )
         )
 
-        await self._maybe_cut_and_enqueue(
-            force=False,
-            final=message.final,
-            trace_id=message.trace_id,
-        )
-
-        if message.final:
-            await self._maybe_cut_and_enqueue(
-                force=True,
-                final=True,
-                trace_id=message.trace_id,
-            )
+        await self._enqueue_emits(emits=emits, trace_id=message.trace_id)
 
     async def _handle_flush(self, message: ClientFlush) -> None:
         self._touch_activity()
         self._cleanup_sent_for_idle_window = False
 
-        await self._maybe_cut_and_enqueue(
-            force=True,
-            final=message.final,
-            trace_id=None,
-        )
+        emits = self._buffer.flush(final=message.final)
+        await self._enqueue_emits(emits=emits, trace_id=None)
 
     async def _handle_clear(self, message: ClientClear) -> None:
         self._touch_activity()
-        self._buffer_text = ""
+        self._buffer.clear()
 
         await self._emit_json(
             ServerBufferCleared(
@@ -1130,7 +1141,7 @@ class SessionManager:
 
     async def _handle_cleanup(self, message: ClientCleanup) -> None:
         self._touch_activity()
-        self._buffer_text = ""
+        self._buffer.clear()
 
         await self._drop_pending_chunks()
 
@@ -1146,56 +1157,47 @@ class SessionManager:
                 )
             )
 
-    # -------------------------------------------------------------------------
-    # Internal chunking
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Buffer / chunk queue
+    # ------------------------------------------------------------------
 
-    async def _maybe_cut_and_enqueue(
+    def _build_buffer(self) -> StreamingTextBuffer:
+        return StreamingTextBuffer(
+            min_words=self.config.buffer.min_words,
+            soft_limit_chars=self.config.buffer.soft_limit_chars,
+            hard_limit_chars=self.config.buffer.hard_limit_chars,
+        )
+
+    def _rebuild_buffer(self, preserve_text: bool = True) -> None:
+        current_text = self._buffer.text if preserve_text else ""
+        self._buffer = self._build_buffer()
+        if current_text:
+            self._buffer.replace(current_text)
+
+    async def _enqueue_emits(
         self,
         *,
-        force: bool,
-        final: bool,
+        emits: list[BufferEmit],
         trace_id: str | None,
     ) -> None:
-        while True:
-            chunk_text, remaining, reason = _extract_chunk_from_buffer(
-                self._buffer_text,
-                min_words=self.config.buffer.min_words,
-                soft_limit_chars=self.config.buffer.soft_limit_chars,
-                hard_limit_chars=self.config.buffer.hard_limit_chars,
-                force=force,
-                final=final,
-            )
-
-            if not chunk_text or not reason:
-                break
-
-            self._buffer_text = remaining
+        for emit in emits:
             chunk = TTSChunkRequest(
                 session_id=self.config.session_id,
-                text=chunk_text,
-                reason=reason,
-                words=_count_words(chunk_text),
-                chars=len(chunk_text),
+                text=emit.text,
+                reason=emit.reason,
+                words=emit.words,
+                chars=emit.chars,
                 trace_id=trace_id,
-                final=(reason == "final"),
+                final=(emit.reason == "final"),
             )
-            await self._enqueue_chunk(chunk)
-
-            # force/final режет до опустошения буфера
-            if not (force or final):
-                # в обычном режиме отрежем максимум один готовый chunk за итерацию события
-                break
-
-    async def _enqueue_chunk(self, chunk: TTSChunkRequest) -> None:
-        await self._pending_tts.put(chunk)
-        await self._emit_json(
-            ServerChunkQueued(
-                session_id=self.config.session_id,
-                chunk=chunk,
-                queue_size=self._pending_tts.qsize(),
+            await self._pending_tts.put(chunk)
+            await self._emit_json(
+                ServerChunkQueued(
+                    session_id=self.config.session_id,
+                    chunk=chunk,
+                    queue_size=self._pending_tts.qsize(),
+                )
             )
-        )
 
     async def _drop_pending_chunks(self) -> None:
         while True:
@@ -1208,9 +1210,9 @@ class SessionManager:
                 await self._pending_tts.put(None)
                 break
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # TTS worker
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     async def _tts_worker_loop(self) -> None:
         while True:
@@ -1219,12 +1221,14 @@ class SessionManager:
                 return
 
             chunk = item
+
             try:
                 self._active_tts_request_task = asyncio.create_task(
                     self._stream_tts_chunk(chunk),
                     name=f"session-stream-chunk-{chunk.chunk_id}",
                 )
                 await self._active_tts_request_task
+
             except asyncio.CancelledError:
                 if self._closed:
                     return
@@ -1234,14 +1238,16 @@ class SessionManager:
                     fatal=False,
                     details={"chunk_id": chunk.chunk_id},
                 )
+
             except Exception as exc:
-                logger.exception("TTS worker error for chunk_id=%s", chunk.chunk_id)
+                logger.exception("tts worker error chunk_id=%s", chunk.chunk_id)
                 await self._emit_error(
                     code="tts_worker_error",
                     message=str(exc),
                     fatal=False,
                     details={"chunk_id": chunk.chunk_id},
                 )
+
             finally:
                 self._active_tts_request_task = None
                 self._touch_activity()
@@ -1341,9 +1347,9 @@ class SessionManager:
             )
         )
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Idle / cleanup
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     async def _idle_watchdog_loop(self) -> None:
         while True:
@@ -1356,23 +1362,18 @@ class SessionManager:
             idle_for = now - self._last_activity_at
             buffer_idle_for = now - self._last_buffer_append_at
 
-            # 1. Мягкий force flush, если в буфере текст и пришла небольшая пауза.
-            if self._buffer_text.strip():
+            if not self._buffer.empty():
                 if buffer_idle_for >= self.config.policy.force_flush_after_sec:
-                    await self._maybe_cut_and_enqueue(
-                        force=True,
-                        final=False,
-                        trace_id=None,
-                    )
+                    emits = self._buffer.flush(final=False)
+                    await self._enqueue_emits(emits=emits, trace_id=None)
 
-            # 2. Heavy cleanup после длительного простоя, только когда все уже отыгралось.
             total_idle_needed = (
                 self.config.policy.session_idle_timeout_sec
                 + self.config.policy.cleanup_after_idle_sec
             )
 
             is_drained = (
-                not self._buffer_text.strip()
+                self._buffer.empty()
                 and self._pending_tts.qsize() == 0
                 and (
                     self._active_tts_request_task is None
@@ -1424,6 +1425,7 @@ class SessionManager:
                 reason,
             )
             return True
+
         except Exception as exc:
             logger.exception(
                 "session=%s backend cleanup failed reason=%s",
@@ -1438,9 +1440,9 @@ class SessionManager:
             )
             return False
 
-    # -------------------------------------------------------------------------
-    # HTTP / emit helpers
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # IO helpers
+    # ------------------------------------------------------------------
 
     def _build_http_client(self) -> httpx.AsyncClient:
         timeout = httpx.Timeout(
@@ -1452,9 +1454,9 @@ class SessionManager:
         return httpx.AsyncClient(timeout=timeout)
 
     async def _reset_http_client(self) -> None:
-        old = self._client
+        old_client = self._client
         self._client = self._build_http_client()
-        await old.aclose()
+        await old_client.aclose()
 
     async def _emit_json(self, event: ServerEvent) -> None:
         await self._events.put(
@@ -1494,9 +1496,9 @@ class SessionManager:
         self._last_activity_at = _now_monotonic()
         self._cleanup_sent_for_idle_window = False
 
-    # -------------------------------------------------------------------------
-    # Debug helpers
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Debug
+    # ------------------------------------------------------------------
 
     def snapshot(self) -> dict[str, Any]:
         active = (
@@ -1507,8 +1509,8 @@ class SessionManager:
             "session_id": self.config.session_id,
             "started": self._started,
             "closed": self._closed,
-            "buffer_chars": len(self._buffer_text),
-            "buffer_words": _count_words(self._buffer_text),
+            "buffer_chars": len(self._buffer.text),
+            "buffer_words": _count_words(self._buffer.text),
             "pending_tts": self._pending_tts.qsize(),
             "tts_active": active,
             "last_cleanup_ago_sec": (
@@ -1908,266 +1910,9 @@ def event_to_dict(event: ServerEvent) -> dict[str, Any]:
     return event.model_dump(mode="json")
 
 
-path: /server.py
-----------------------------------------
-from __future__ import annotations
-
-import asyncio
-import contextlib
-import json
-import logging
-from typing import Any
-
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-
-from .manager import OutboundFrame, SessionManager
-from .schema import (
-    ClientCleanup,
-    ClientClear,
-    ClientCloseSession,
-    ClientFlush,
-    ClientMessage,
-    ClientPatchConfig,
-    ClientPing,
-    ClientStartSession,
-    ClientTextDelta,
-    ServerSessionClosed,
-)
-
-logger = logging.getLogger(__name__)
-
-_CLIENT_MODELS = (
-    ClientStartSession,
-    ClientPatchConfig,
-    ClientTextDelta,
-    ClientFlush,
-    ClientClear,
-    ClientCleanup,
-    ClientCloseSession,
-    ClientPing,
-)
-
-_ACTIVE_SESSIONS: dict[str, SessionManager] = {}
-_ACTIVE_SESSIONS_LOCK = asyncio.Lock()
-
-
-def _model_type_value(model_cls: type) -> str:
-    field = getattr(model_cls, "model_fields", {}).get("type")
-    if field is None or not isinstance(field.default, str):
-        raise RuntimeError(f"{model_cls.__name__} must define string field `type`")
-    return field.default
-
-
-_CLIENT_MODEL_BY_TYPE: dict[str, type] = {
-    _model_type_value(model_cls): model_cls for model_cls in _CLIENT_MODELS
-}
-_SERVER_SESSION_CLOSED_TYPE = _model_type_value(ServerSessionClosed)
-
-
-def _parse_client_message(data: Any) -> ClientMessage:
-    if isinstance(data, str):
-        return ClientTextDelta(text=data)
-
-    if not isinstance(data, dict):
-        raise ValueError("Client message must be JSON object or plain text")
-
-    msg_type = data.get("type") or data.get("event")
-
-    if msg_type is None:
-        if "text" in data:
-            return ClientTextDelta.model_validate(data)
-        raise ValueError("Missing `type` in client message")
-
-    model_cls = _CLIENT_MODEL_BY_TYPE.get(str(msg_type))
-    if model_cls is None:
-        supported = ", ".join(sorted(_CLIENT_MODEL_BY_TYPE))
-        raise ValueError(f"Unsupported message type `{msg_type}`. Supported: {supported}")
-
-    return model_cls.model_validate(data)
-
-
-async def _register_manager(manager: SessionManager) -> None:
-    async with _ACTIVE_SESSIONS_LOCK:
-        _ACTIVE_SESSIONS[manager.config.session_id] = manager
-
-
-async def _unregister_manager(manager: SessionManager) -> None:
-    async with _ACTIVE_SESSIONS_LOCK:
-        current = _ACTIVE_SESSIONS.get(manager.config.session_id)
-        if current is manager:
-            _ACTIVE_SESSIONS.pop(manager.config.session_id, None)
-            return
-
-        stale_keys = [key for key, value in _ACTIVE_SESSIONS.items() if value is manager]
-        for key in stale_keys:
-            _ACTIVE_SESSIONS.pop(key, None)
-
-
-async def _sync_manager_registry(manager: SessionManager) -> None:
-    async with _ACTIVE_SESSIONS_LOCK:
-        stale_keys = [key for key, value in _ACTIVE_SESSIONS.items() if value is manager]
-        for key in stale_keys:
-            if key != manager.config.session_id:
-                _ACTIVE_SESSIONS.pop(key, None)
-
-        _ACTIVE_SESSIONS[manager.config.session_id] = manager
-
-
-async def _reader_loop(websocket: WebSocket, manager: SessionManager) -> None:
-    while True:
-        raw = await websocket.receive()
-
-        ws_type = raw.get("type")
-        if ws_type == "websocket.disconnect":
-            raise WebSocketDisconnect(raw.get("code", 1000))
-
-        if raw.get("bytes") is not None:
-            await manager.handle(
-                ClientClear(reason="binary_frame_not_supported")
-            )
-            continue
-
-        text = raw.get("text")
-        if text is None:
-            continue
-
-        try:
-            payload = json.loads(text)
-        except json.JSONDecodeError:
-            payload = text
-
-        message = _parse_client_message(payload)
-        await manager.handle(message)
-        await _sync_manager_registry(manager)
-
-
-async def _writer_loop(websocket: WebSocket, manager: SessionManager) -> None:
-    while True:
-        frame: OutboundFrame = await manager.next_outbound()
-
-        if frame.event is not None:
-            await websocket.send_json(frame.event)
-
-        if frame.audio is not None:
-            await websocket.send_bytes(frame.audio)
-
-        event_type = None
-        if isinstance(frame.event, dict):
-            event_type = frame.event.get("type") or frame.event.get("event")
-
-        if (
-            event_type == _SERVER_SESSION_CLOSED_TYPE
-            and manager._events.empty()  # noqa: SLF001
-        ):
-            return
-
-
-def create_app() -> FastAPI:
-    app = FastAPI(title="session_mode", version="1.0.0")
-
-    @app.get("/health")
-    async def health() -> dict[str, Any]:
-        async with _ACTIVE_SESSIONS_LOCK:
-            return {
-                "ok": True,
-                "active_sessions": len(_ACTIVE_SESSIONS),
-                "session_ids": sorted(_ACTIVE_SESSIONS.keys()),
-            }
-
-    @app.get("/sessions")
-    async def list_sessions() -> dict[str, Any]:
-        async with _ACTIVE_SESSIONS_LOCK:
-            return {
-                "count": len(_ACTIVE_SESSIONS),
-                "sessions": {
-                    session_id: manager.snapshot()
-                    for session_id, manager in _ACTIVE_SESSIONS.items()
-                },
-            }
-
-    @app.get("/sessions/{session_id}")
-    async def get_session(session_id: str) -> dict[str, Any]:
-        async with _ACTIVE_SESSIONS_LOCK:
-            manager = _ACTIVE_SESSIONS.get(session_id)
-
-        if manager is None:
-            raise HTTPException(status_code=404, detail="Session not found")
-
-        return manager.snapshot()
-
-    @app.websocket("/ws")
-    async def websocket_session(websocket: WebSocket) -> None:
-        await websocket.accept()
-
-        manager = SessionManager()
-        await manager.start()
-        await _register_manager(manager)
-
-        logger.info("session websocket connected: %s", manager.config.session_id)
-
-        reader_task = asyncio.create_task(
-            _reader_loop(websocket, manager),
-            name=f"session-reader-{manager.config.session_id}",
-        )
-        writer_task = asyncio.create_task(
-            _writer_loop(websocket, manager),
-            name=f"session-writer-{manager.config.session_id}",
-        )
-
-        try:
-            done, pending = await asyncio.wait(
-                {reader_task, writer_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-
-            for task in done:
-                exc = task.exception()
-                if exc is not None and not isinstance(exc, WebSocketDisconnect):
-                    raise exc
-
-            for task in pending:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-
-        except WebSocketDisconnect:
-            logger.info("session websocket disconnected: %s", manager.config.session_id)
-        except Exception:
-            logger.exception("session websocket failed: %s", manager.config.session_id)
-            with contextlib.suppress(Exception):
-                await websocket.close(code=1011)
-        finally:
-            with contextlib.suppress(Exception):
-                await manager.close(reason="websocket_closed")
-            await _unregister_manager(manager)
-
-            for task in (reader_task, writer_task):
-                if not task.done():
-                    task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
-
-    return app
-
-
-app = create_app()
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(
-        "session_mode.app:app",
-        host="0.0.0.0",
-        port=8765,
-        reload=False,
-        ws="auto",
-    )
-
-
 === SUMMARY ===
-included: 7
+included: 6
 skipped(binary): 0
 skipped(size): 0
 skipped(ext): 0
-totalBytes(approx): 64947
+totalBytes(approx): 56936

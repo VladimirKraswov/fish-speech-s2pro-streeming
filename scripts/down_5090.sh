@@ -6,7 +6,13 @@ cd "$REPO_ROOT"
 
 CONTAINER="${CONTAINER:-fish-speech}"
 RUN_DIR="$REPO_ROOT/run"
-PID_FILE="$RUN_DIR/proxy.pid"
+
+PROXY_PID_FILE="$RUN_DIR/proxy.pid"
+SESSION_PID_FILE="$RUN_DIR/session_mode.pid"
+
+STOP_MODEL="${STOP_MODEL:-1}"
+STOP_PROXY="${STOP_PROXY:-1}"
+STOP_SESSION="${STOP_SESSION:-1}"
 
 docker_cmd() {
   if [[ "${DOCKER_USE_SUDO:-0}" == "1" ]]; then
@@ -16,32 +22,58 @@ docker_cmd() {
   fi
 }
 
-echo "[1/2] Stopping proxy"
-if [[ -f "$PID_FILE" ]]; then
-  PID="$(cat "$PID_FILE" 2>/dev/null || true)"
-  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    kill "$PID" 2>/dev/null || true
-    sleep 1
-    if kill -0 "$PID" 2>/dev/null; then
-      kill -9 "$PID" 2>/dev/null || true
+wait_pid_exit() {
+  local pid="$1"
+  local label="$2"
+
+  for _ in $(seq 1 20); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return 0
     fi
+    sleep 0.25
+  done
+
+  echo "Force killing ${label} pid=${pid}"
+  kill -9 "$pid" 2>/dev/null || true
+}
+
+stop_from_pidfile() {
+  local pid_file="$1"
+  local label="$2"
+  local pattern="$3"
+
+  echo "Stopping ${label}"
+
+  if [[ -f "$pid_file" ]]; then
+    local pid
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      wait_pid_exit "$pid" "$label"
+    fi
+    rm -f "$pid_file"
   fi
-  rm -f "$PID_FILE"
+
+  pkill -f "$pattern" 2>/dev/null || true
+}
+
+if [[ "$STOP_PROXY" == "1" ]]; then
+  stop_from_pidfile "$PROXY_PID_FILE" "proxy" 'tools.proxy.fish_proxy_pcm:app'
+else
+  echo "Skipping proxy stop"
 fi
-pkill -f 'uvicorn.*tools.proxy.fish_proxy_pcm:app' 2>/dev/null || true
 
-echo "[1.5/2] Stopping session_mode"
-SESSION_PID_FILE="$REPO_ROOT/run/session_mode.pid"
-if [[ -f "$SESSION_PID_FILE" ]]; then
-  S_PID="$(cat "$SESSION_PID_FILE" 2>/dev/null || true)"
-  if [[ -n "${S_PID:-}" ]] && kill -0 "$S_PID" 2>/dev/null; then
-    kill "$S_PID" 2>/dev/null || true
-  fi
-  rm -f "$SESSION_PID_FILE"
+if [[ "$STOP_SESSION" == "1" ]]; then
+  stop_from_pidfile "$SESSION_PID_FILE" "session_mode" 'session_mode.app:app'
+else
+  echo "Skipping session_mode stop"
 fi
-pkill -f 'uvicorn.*session_mode.app:app' 2>/dev/null || true
 
-echo "[2/2] Stopping model container"
-docker_cmd rm -f "$CONTAINER" 2>/dev/null || true
+if [[ "$STOP_MODEL" == "1" ]]; then
+  echo "Stopping model container"
+  docker_cmd rm -f "$CONTAINER" 2>/dev/null || true
+else
+  echo "Skipping model container stop"
+fi
 
-echo "All stopped"
+echo "Stop sequence completed"

@@ -25,7 +25,6 @@ VIDEO_EXTENSIONS = {
 
 
 def get_latest_checkpoint(path: Path | str) -> Path | None:
-    # Find the latest checkpoint
     ckpt_dir = Path(path)
 
     if ckpt_dir.exists() is False:
@@ -56,29 +55,38 @@ def read_ref_text(ref_text):
 
 def list_files(
     path: Union[Path, str],
-    extensions: set[str] = set(),
+    extensions: set[str] | None = None,
     recursive: bool = False,
     sort: bool = True,
 ) -> list[Path]:
-    """List files in a directory.
+    """
+    List files in a directory.
 
     Args:
-        path (Path): Path to the directory.
-        extensions (set, optional): Extensions to filter. Defaults to None.
-        recursive (bool, optional): Whether to search recursively. Defaults to False.
-        sort (bool, optional): Whether to sort the files. Defaults to True.
+        path: Path to the directory.
+        extensions: Extensions to filter. If empty or None, returns all files.
+        recursive: Whether to search recursively.
+        sort: Whether to sort the files.
 
     Returns:
-        list: List of files.
+        List of files.
     """
-
     if isinstance(path, str):
         path = Path(path)
 
     if not path.exists():
         raise FileNotFoundError(f"Directory {path} does not exist.")
 
-    files = [file for ext in extensions for file in path.rglob(f"*{ext}")]
+    files: list[Path] = []
+
+    if not extensions:
+        iterator = path.rglob("*") if recursive else path.glob("*")
+        files = [file for file in iterator if file.is_file()]
+    else:
+        for ext in extensions:
+            pattern = f"*{ext}"
+            iterator = path.rglob(pattern) if recursive else path.glob(pattern)
+            files.extend(file for file in iterator if file.is_file())
 
     if sort:
         files = natsorted(files)

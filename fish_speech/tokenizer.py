@@ -1,6 +1,5 @@
-import json
+import inspect
 import logging
-from pathlib import Path
 from typing import TYPE_CHECKING, List, Union
 
 import torch
@@ -11,7 +10,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Constants definitions
 EOS_TOKEN = "<|endoftext|>"
 PAD_TOKEN = "<|pad|>"
 IM_START_TOKEN = "<|im_start|>"
@@ -57,6 +55,14 @@ class FishTokenizer:
         self._tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.semantic_id_to_token_id = {}
 
+        try:
+            self._supports_allowed_special = (
+                "allowed_special"
+                in inspect.signature(self._tokenizer.encode).parameters
+            )
+        except (TypeError, ValueError):
+            self._supports_allowed_special = False
+
         vocab = self._tokenizer.get_vocab()
         valid_ids = []
 
@@ -73,12 +79,10 @@ class FishTokenizer:
             )
             self.semantic_begin_id = 0
             self.semantic_end_id = 0
-            # Dummy tensor to prevent crash, though generation will fail
             self.semantic_map_tensor = torch.zeros(4096, dtype=torch.long)
         else:
             self.semantic_begin_id = min(valid_ids)
             self.semantic_end_id = max(valid_ids)
-            # Create a lookup tensor to handle potential gaps in token IDs safely
             self.semantic_map_tensor = torch.zeros(4096, dtype=torch.long)
             for k, v in self.semantic_id_to_token_id.items():
                 self.semantic_map_tensor[k] = v
@@ -105,11 +109,7 @@ class FishTokenizer:
     def encode(
         self, text: str, add_special_tokens: bool = False, **kwargs
     ) -> List[int]:
-        # [FIX] Force Qwen/Tiktoken backends to parse special tokens inline
-        import inspect
-
-        sig = inspect.signature(self._tokenizer.encode)
-        if "allowed_special" in sig.parameters and "allowed_special" not in kwargs:
+        if self._supports_allowed_special and "allowed_special" not in kwargs:
             kwargs["allowed_special"] = "all"
         return self._tokenizer.encode(
             text, add_special_tokens=add_special_tokens, **kwargs

@@ -1,0 +1,1199 @@
+=== CODE BUNDLE ===
+root: /Volumes/Extend/work/fish-speech-s2pro-streeming/scripts
+ignore: .codebundleignore
+generated: 2026-04-21T22:36:07.912Z
+
+
+
+path: /bundle-code.js
+----------------------------------------
+#!/usr/bin/env node
+/**
+ * bundle-code.js
+ * Собирает весь текстовый код проекта в один файл, помечая секции путями.
+ * - Рекурсивный обход
+ * - Пропуск бинарных файлов (по содержимому)
+ * - Игнор по .codebundleignore (gitignore-like)
+ */
+
+
+
+
+
+
+
+const  fs = require("fs");
+const  fsp = require("fs/promises");
+const  path = require("path")
+
+const PROJECT_ROOT = process.cwd();
+const IGNORE_FILE_NAME = ".codebundleignore";
+const OUTPUT_FILE = path.join(PROJECT_ROOT, "codebundle.txt");
+
+const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5MB
+const MAX_TOTAL_BYTES = 200 * 1024 * 1024;   // 200MB
+
+// Если заполнить — соберёт только эти расширения. Если пусто — любые текстовые.
+const ONLY_EXTENSIONS = new Set([
+  // ".js", ".jsx", ".ts", ".tsx", ".json", ".css", ".scss", ".md", ".html", ".yml", ".yaml"
+]);
+
+function normalizeToPosix(p) {
+  return p.split(path.sep).join("/");
+}
+
+function stripBom(s) {
+  return s.charCodeAt(0) === 0xfeff ? s.slice(1) : s;
+}
+
+async function readIgnoreFile(ignorePath) {
+  try {
+    const raw = await fsp.readFile(ignorePath, "utf8");
+    return stripBom(raw)
+      .split(/\r?\n/)
+      .map(l => l.trim())
+      .filter(l => l && !l.startsWith("#"));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Компилируем игнор-правила.
+ * Поддержка:
+ * - "node_modules/" (игнор любой сегмент /node_modules/ в любом месте)
+ * - "dist/" и т.п.
+ * - "*.ext"
+ * - "path/to/file" (точный относительный путь)
+ * - "!pattern" (снять игнор)
+ */
+function buildIgnoreMatcher(patterns) {
+  // дефолтные, чтобы не протекало даже если забыли
+  const defaultPatterns = [
+    "node_modules/",
+    ".git/",
+    "dist/",
+    "build/",
+    ".next/",
+    "coverage/",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+  ];
+
+  const all = [...defaultPatterns, ...patterns];
+
+  const rules = all.map(p => ({
+    neg: p.startsWith("!"),
+    pat: (p.startsWith("!") ? p.slice(1) : p).trim(),
+  })).filter(r => r.pat);
+
+  function matchRule(relPosix, pat) {
+    // relPosix: "admin/node_modules/express/index.js"
+
+    // directory pattern: "node_modules/"
+    if (pat.endsWith("/")) {
+      const seg = pat.slice(0, -1);
+      if (!seg) return false;
+
+      // матч:
+      // - если путь начинается с seg/
+      // - или содержит /seg/ как сегмент
+      return (
+        relPosix === seg ||
+        relPosix.startsWith(seg + "/") ||
+        relPosix.includes("/" + seg + "/") ||
+        relPosix.endsWith("/" + seg)
+      );
+    }
+
+    // glob extension: "*.png"
+    if (pat.startsWith("*.") && !pat.includes("/")) {
+      const ext = pat.slice(1); // ".png"
+      return relPosix.toLowerCase().endsWith(ext.toLowerCase());
+    }
+
+    // exact file path
+    return relPosix === pat;
+  }
+
+  return function isIgnored(relPosix) {
+    let ignored = false;
+    for (const r of rules) {
+      if (matchRule(relPosix, r.pat)) {
+        ignored = !r.neg; // если negation — снимаем игнор
+      }
+    }
+    return ignored;
+  };
+}
+
+async function isProbablyBinary(filePath) {
+  const fd = await fsp.open(filePath, "r");
+  try {
+    const { size } = await fd.stat();
+    const toRead = Math.min(size, 8192);
+    const buf = Buffer.allocUnsafe(toRead);
+    const { bytesRead } = await fd.read(buf, 0, toRead, 0);
+    if (bytesRead === 0) return false;
+
+    let nulCount = 0;
+    let weirdCount = 0;
+    for (let i = 0; i < bytesRead; i++) {
+      const b = buf[i];
+      if (b === 0) nulCount++;
+      const ok =
+        b === 9 || b === 10 || b === 13 || (b >= 32 && b <= 126) || b >= 128;
+      if (!ok) weirdCount++;
+    }
+    if (nulCount > 0) return true;
+    return (weirdCount / bytesRead) > 0.25;
+  } finally {
+    await fd.close();
+  }
+}
+
+async function* walk(dirAbs, isIgnored) {
+  let entries;
+  try {
+    entries = await fsp.readdir(dirAbs, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  entries.sort((a, b) => a.name.localeCompare(b.name));
+
+  for (const ent of entries) {
+    const abs = path.join(dirAbs, ent.name);
+    const rel = path.relative(PROJECT_ROOT, abs);
+    const relPosix = normalizeToPosix(rel);
+
+    // не включаем output и ignore файл
+    if (path.resolve(abs) === path.resolve(OUTPUT_FILE)) continue;
+    if (relPosix === IGNORE_FILE_NAME) continue;
+
+    if (isIgnored(relPosix)) continue;
+
+    if (ent.isDirectory()) {
+      yield* walk(abs, isIgnored);
+    } else if (ent.isFile()) {
+      yield { abs, relPosix };
+    }
+  }
+}
+
+async function bundle() {
+  const ignorePath = path.join(PROJECT_ROOT, IGNORE_FILE_NAME);
+  const patterns = await readIgnoreFile(ignorePath);
+  const isIgnored = buildIgnoreMatcher(patterns);
+
+  const out = fs.createWriteStream(OUTPUT_FILE, { encoding: "utf8" });
+
+  let totalBytes = 0;
+  let included = 0;
+  let skippedBinary = 0;
+  let skippedSize = 0;
+  let skippedExt = 0;
+
+  out.write(`=== CODE BUNDLE ===\n`);
+  out.write(`root: ${normalizeToPosix(PROJECT_ROOT)}\n`);
+  out.write(`ignore: ${IGNORE_FILE_NAME}\n`);
+  out.write(`generated: ${new Date().toISOString()}\n\n`);
+
+  for await (const file of walk(PROJECT_ROOT, isIgnored)) {
+    const ext = path.extname(file.relPosix).toLowerCase();
+    if (ONLY_EXTENSIONS.size && !ONLY_EXTENSIONS.has(ext)) {
+      skippedExt++;
+      continue;
+    }
+
+    let stat;
+    try {
+      stat = await fsp.stat(file.abs);
+    } catch {
+      continue;
+    }
+
+    if (stat.size > MAX_FILE_SIZE_BYTES) {
+      skippedSize++;
+      continue;
+    }
+    if (totalBytes + stat.size > MAX_TOTAL_BYTES) {
+      out.write(`\n\n=== STOP: total size limit reached (${MAX_TOTAL_BYTES} bytes) ===\n`);
+      break;
+    }
+
+    let binary;
+    try {
+      binary = await isProbablyBinary(file.abs);
+    } catch {
+      continue;
+    }
+    if (binary) {
+      skippedBinary++;
+      continue;
+    }
+
+    let content;
+    try {
+      content = await fsp.readFile(file.abs, "utf8");
+    } catch {
+      continue;
+    }
+
+    out.write(`\n\npath: /${file.relPosix}\n`);
+    out.write(`----------------------------------------\n`);
+    out.write(content);
+    if (!content.endsWith("\n")) out.write("\n");
+
+    totalBytes += stat.size;
+    included++;
+  }
+
+  out.write(`\n\n=== SUMMARY ===\n`);
+  out.write(`included: ${included}\n`);
+  out.write(`skipped(binary): ${skippedBinary}\n`);
+  out.write(`skipped(size): ${skippedSize}\n`);
+  out.write(`skipped(ext): ${skippedExt}\n`);
+  out.write(`totalBytes(approx): ${totalBytes}\n`);
+
+  await new Promise((res, rej) => {
+    out.end(res);
+    out.on("error", rej);
+  });
+
+  console.log(`Done. Output: ${OUTPUT_FILE}`);
+}
+
+bundle().catch(err => {
+  console.error("Error:", err);
+  process.exitCode = 1;
+});
+
+
+path: /down_5090.sh
+----------------------------------------
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+CONTAINER="${CONTAINER:-fish-speech}"
+RUN_DIR="$REPO_ROOT/run"
+PID_FILE="$RUN_DIR/proxy.pid"
+
+docker_cmd() {
+  if [[ "${DOCKER_USE_SUDO:-0}" == "1" ]]; then
+    sudo docker "$@"
+  else
+    docker "$@"
+  fi
+}
+
+echo "[1/2] Stopping proxy"
+if [[ -f "$PID_FILE" ]]; then
+  PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
+    kill "$PID" 2>/dev/null || true
+    sleep 1
+    if kill -0 "$PID" 2>/dev/null; then
+      kill -9 "$PID" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$PID_FILE"
+fi
+pkill -f 'uvicorn.*tools.proxy.fish_proxy_pcm:app' 2>/dev/null || true
+
+echo "[1.5/2] Stopping session_mode"
+SESSION_PID_FILE="$REPO_ROOT/run/session_mode.pid"
+if [[ -f "$SESSION_PID_FILE" ]]; then
+  S_PID="$(cat "$SESSION_PID_FILE" 2>/dev/null || true)"
+  if [[ -n "${S_PID:-}" ]] && kill -0 "$S_PID" 2>/dev/null; then
+    kill "$S_PID" 2>/dev/null || true
+  fi
+  rm -f "$SESSION_PID_FILE"
+fi
+pkill -f 'uvicorn.*session_mode.app:app' 2>/dev/null || true
+
+echo "[2/2] Stopping model container"
+docker_cmd rm -f "$CONTAINER" 2>/dev/null || true
+
+echo "All stopped"
+
+
+path: /e2e_memory.sh
+----------------------------------------
+#!/usr/bin/env bash
+# E2E memory check: two TTS requests to verify VRAM is freed between requests (no OOM on 32GB).
+# Server must be running. Usage: PORT=8080 ./scripts/e2e_memory.sh   or: make e2e-memory
+set -e
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+PORT="${PORT:-8080}"
+BASE_URL="${BASE_URL:-http://127.0.0.1:${PORT}}"
+HEALTH_TIMEOUT="${E2E_HEALTH_TIMEOUT:-120}"
+OUT_DIR="${E2E_OUT_DIR:-$REPO_ROOT/results/e2e}"
+mkdir -p "$OUT_DIR"
+
+echo "=== Fish Speech E2E memory (2 requests) ==="
+echo "  BASE_URL=$BASE_URL"
+echo ""
+
+echo "Waiting for server (timeout ${HEALTH_TIMEOUT}s)..."
+WAIT=0
+until curl -sf --connect-timeout 2 "$BASE_URL/v1/health" >/dev/null 2>&1; do
+  sleep 2
+  WAIT=$((WAIT + 2))
+  if [[ $WAIT -ge $HEALTH_TIMEOUT ]]; then
+    echo "ERROR: server not ready"
+    exit 1
+  fi
+done
+echo "Server ready."
+echo ""
+
+MEM1="$OUT_DIR/memory_before.json"
+MEM2="$OUT_DIR/memory_after_req1.json"
+MEM3="$OUT_DIR/memory_after_req2.json"
+
+echo "Memory before:"
+curl -sf "$BASE_URL/v1/debug/memory" | tee "$MEM1" | (command -v jq >/dev/null 2>&1 && jq -c '{allocated_gb, reserved_gb}' || cat)
+echo ""
+
+echo "Request 1 (streaming)..."
+curl -sf -X POST "$BASE_URL/v1/tts" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Hello, this is the first request.","streaming":true}' \
+  --output "$OUT_DIR/e2e_mem_req1.wav" --max-time 60
+echo "Memory after request 1:"
+curl -sf "$BASE_URL/v1/debug/memory" | tee "$MEM2" | (command -v jq >/dev/null 2>&1 && jq -c '{allocated_gb, reserved_gb, max_allocated_gb}' || cat)
+echo ""
+
+sleep 2
+echo "Request 2 (streaming, OOM check)..."
+if curl -sf -X POST "$BASE_URL/v1/tts" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Second request to confirm memory is freed.","streaming":true}' \
+  --output "$OUT_DIR/e2e_mem_req2.wav" --max-time 60; then
+  echo "Request 2: OK"
+else
+  echo "Request 2: FAIL (possible OOM)"
+  exit 1
+fi
+echo "Memory after request 2:"
+curl -sf "$BASE_URL/v1/debug/memory" | tee "$MEM3" | (command -v jq >/dev/null 2>&1 && jq -c '{allocated_gb, reserved_gb, max_allocated_gb}' || cat)
+echo ""
+
+echo "E2E memory passed (two requests succeeded). Outputs in $OUT_DIR"
+
+
+path: /e2e_smoke.sh
+----------------------------------------
+#!/usr/bin/env bash
+# E2E smoke: server must be running (e.g. ./scripts/run_server_32gb.sh).
+# Waits for health, runs TTS (streaming + oneshot), checks /v1/debug/memory.
+# Usage: PORT=8080 ./scripts/e2e_smoke.sh   or: make e2e
+set -e
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+PORT="${PORT:-8080}"
+BASE_URL="${BASE_URL:-http://127.0.0.1:${PORT}}"
+CONTAINER="${CONTAINER:-fish-speech}"
+HEALTH_TIMEOUT="${E2E_HEALTH_TIMEOUT:-120}"
+OUT_DIR="${E2E_OUT_DIR:-$REPO_ROOT/results/e2e}"
+mkdir -p "$OUT_DIR"
+
+echo "=== Fish Speech E2E smoke ==="
+echo "  BASE_URL=$BASE_URL  CONTAINER=$CONTAINER  OUT_DIR=$OUT_DIR"
+echo ""
+
+echo "Waiting for server (timeout ${HEALTH_TIMEOUT}s)..."
+WAIT=0
+until curl -sf --connect-timeout 2 "$BASE_URL/v1/health" >/dev/null 2>&1; do
+  sleep 2
+  WAIT=$((WAIT + 2))
+  if [[ $WAIT -ge $HEALTH_TIMEOUT ]]; then
+    echo "ERROR: server not ready in ${HEALTH_TIMEOUT}s"
+    exit 1
+  fi
+done
+echo "Server ready after ${WAIT}s."
+echo ""
+
+# Optional: use first reference from server (e.g. after preencode + upload)
+REF_ID=""
+if command -v jq >/dev/null 2>&1; then
+  REF_ID=$(curl -sf --compressed "$BASE_URL/v1/references/list" 2>/dev/null | jq -r '.reference_ids[0] // empty' 2>/dev/null) || true
+fi
+if [[ -n "$REF_ID" ]]; then
+  echo "Using reference_id=$REF_ID for TTS"
+fi
+echo ""
+
+# Streaming TTS (with TTFA metrics when python3 + ttfa_smoke.py available)
+echo "--- TTS streaming ---"
+STREAM_OUT="$OUT_DIR/e2e_stream.wav"
+TTFA_OK=0
+if command -v python3 >/dev/null 2>&1 && [[ -f "$REPO_ROOT/scripts/ttfa_smoke.py" ]]; then
+  TTFA_ARGS="--url $BASE_URL --output $STREAM_OUT"
+  [[ -n "$REF_ID" ]] && TTFA_ARGS="$TTFA_ARGS --reference-id $REF_ID"
+  if python3 "$REPO_ROOT/scripts/ttfa_smoke.py" $TTFA_ARGS && [[ -s "$STREAM_OUT" ]]; then
+    TTFA_OK=1
+  else
+    echo "  (ttfa_smoke failed, falling back to curl)"
+  fi
+fi
+if [[ "$TTFA_OK" -ne 1 ]]; then
+  if [[ -n "$REF_ID" ]]; then
+    TTS_JSON="{\"text\":\"Hello, this is an e2e smoke test.\",\"streaming\":true,\"reference_id\":\"$REF_ID\"}"
+  else
+    TTS_JSON='{"text":"Hello, this is an e2e smoke test.","streaming":true}'
+  fi
+  curl -sf -X POST "$BASE_URL/v1/tts" \
+    -H "Content-Type: application/json" \
+    -d "$TTS_JSON" \
+    --output "$STREAM_OUT" --max-time 60
+fi
+if [[ ! -s "$STREAM_OUT" ]]; then
+  echo "ERROR: streaming TTS produced empty or missing file: $STREAM_OUT"
+  exit 1
+fi
+echo "  OK: $STREAM_OUT ($(wc -c < "$STREAM_OUT") bytes)"
+echo ""
+
+# Oneshot TTS (with timing metrics when python3 + ttfa_smoke.py available)
+echo "--- TTS oneshot ---"
+ONESHOT_OUT="$OUT_DIR/e2e_oneshot.wav"
+ONESHOT_TTFA_OK=0
+if command -v python3 >/dev/null 2>&1 && [[ -f "$REPO_ROOT/scripts/ttfa_smoke.py" ]]; then
+  ONESHOT_ARGS="--url $BASE_URL --output $ONESHOT_OUT --oneshot"
+  [[ -n "$REF_ID" ]] && ONESHOT_ARGS="$ONESHOT_ARGS --reference-id $REF_ID"
+  if python3 "$REPO_ROOT/scripts/ttfa_smoke.py" $ONESHOT_ARGS && [[ -s "$ONESHOT_OUT" ]]; then
+    ONESHOT_TTFA_OK=1
+  else
+    echo "  (ttfa_smoke oneshot failed, falling back to curl)"
+  fi
+fi
+if [[ "$ONESHOT_TTFA_OK" -ne 1 ]]; then
+  if [[ -n "$REF_ID" ]]; then
+    ONESHOT_JSON="{\"text\":\"Short test.\",\"streaming\":false,\"reference_id\":\"$REF_ID\"}"
+  else
+    ONESHOT_JSON='{"text":"Short test.","streaming":false}'
+  fi
+  curl -sf -X POST "$BASE_URL/v1/tts" \
+    -H "Content-Type: application/json" \
+    -d "$ONESHOT_JSON" \
+    --output "$ONESHOT_OUT" --max-time 60
+fi
+if [[ ! -s "$ONESHOT_OUT" ]]; then
+  echo "ERROR: oneshot TTS produced empty or missing file: $ONESHOT_OUT"
+  exit 1
+fi
+echo "  OK: $ONESHOT_OUT ($(wc -c < "$ONESHOT_OUT") bytes)"
+echo ""
+
+# Memory
+echo "--- Memory ---"
+curl -sf --compressed "$BASE_URL/v1/debug/memory" | tee "$OUT_DIR/memory_after.json" | (command -v jq >/dev/null 2>&1 && jq -c '{allocated_gb, reserved_gb, max_allocated_gb}' 2>/dev/null || cat) || true
+echo ""
+
+echo "E2E smoke passed. Outputs in $OUT_DIR"
+
+
+path: /logs_5090.sh
+----------------------------------------
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+CONTAINER="${CONTAINER:-fish-speech}"
+PROXY_LOG_FILE="${PROXY_LOG_FILE:-$REPO_ROOT/logs/proxy.log}"
+SESSION_LOG_FILE="${SESSION_LOG_FILE:-$REPO_ROOT/logs/session_mode.log}"
+
+mkdir -p "$REPO_ROOT/logs"
+touch "$PROXY_LOG_FILE"
+
+docker_cmd() {
+  if [[ "${DOCKER_USE_SUDO:-0}" == "1" ]]; then
+    sudo docker "$@"
+  else
+    docker "$@"
+  fi
+}
+
+cleanup() {
+  [[ -n "${MODEL_PID:-}" ]] && kill "$MODEL_PID" 2>/dev/null || true
+  [[ -n "${PROXY_PID:-}" ]] && kill "$PROXY_PID" 2>/dev/null || true
+  [[ -n "${SESSION_PID:-}" ]] && kill "$SESSION_PID" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+echo "=== Live logs ==="
+echo "model container: $CONTAINER"
+echo "proxy log: $PROXY_LOG_FILE"
+echo "session log: $SESSION_LOG_FILE"
+echo
+
+(
+  docker_cmd logs -f "$CONTAINER" 2>&1 | sed 's/^/[model] /'
+) &
+MODEL_PID=$!
+
+(
+  tail -n 50 -F "$PROXY_LOG_FILE" 2>/dev/null | sed 's/^/[proxy] /'
+) &
+PROXY_PID=$!
+
+(
+  tail -n 50 -F "$SESSION_LOG_FILE" 2>/dev/null | sed 's/^/[session] /'
+) &
+SESSION_PID=$!
+
+wait
+
+
+path: /preencode.sh
+----------------------------------------
+#!/usr/bin/env bash
+# Pre-encode reference WAV+txt to references/. Optional: upload to server.
+# Env: PREENCODE_INPUT_DIR, PREENCODE_OUTPUT_DIR, PREENCODE_CHECKPOINT, PREENCODE_REF_ID, UPLOAD, SERVER_URL
+# Usage: ./scripts/preencode.sh   or   UPLOAD=1 ./scripts/preencode.sh
+set -e
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+INPUT_DIR="${PREENCODE_INPUT_DIR:-data/voice_references}"
+OUTPUT_DIR="${PREENCODE_OUTPUT_DIR:-references}"
+CHECKPOINT="${PREENCODE_CHECKPOINT:-checkpoints/s2-pro/codec.pth}"
+REF_ID="${PREENCODE_REF_ID:-}"
+UPLOAD="${UPLOAD:-0}"
+SERVER_URL="${SERVER_URL:-http://127.0.0.1:8080}"
+
+if [[ ! -d "$INPUT_DIR" ]]; then
+  echo "ERROR: PREENCODE_INPUT_DIR=$INPUT_DIR not found. Create folder with <stem>.wav + <stem>.txt"
+  exit 1
+fi
+if [[ ! -f "$CHECKPOINT" ]]; then
+  echo "ERROR: PREENCODE_CHECKPOINT=$CHECKPOINT not found. E.g. PREENCODE_CHECKPOINT=../../checkpoints/s2-pro/codec.pth"
+  exit 1
+fi
+
+set -- --input-dir "$INPUT_DIR" --output-dir "$OUTPUT_DIR" --checkpoint-path "$CHECKPOINT"
+[[ -n "$REF_ID" ]] && set -- "$@" --ref-id "$REF_ID"
+[[ "$UPLOAD" =~ ^(1|true|yes|YES)$ ]] && set -- "$@" --upload --server-url "$SERVER_URL"
+
+exec uv run python tools/preencode_references.py "$@"
+
+
+path: /restart_5090.sh
+----------------------------------------
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+DOCKER_USE_SUDO="${DOCKER_USE_SUDO:-0}" \
+  bash "$REPO_ROOT/scripts/down_5090.sh"
+
+sleep 2
+
+DOCKER_USE_SUDO="${DOCKER_USE_SUDO:-0}" \
+  bash "$REPO_ROOT/scripts/up_5090.sh"
+
+
+path: /run_proxy.sh
+----------------------------------------
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+PROXY_PORT="${PROXY_PORT:-9000}"
+PROXY_HOST="${PROXY_HOST:-0.0.0.0}"
+PROXY_LOG_LEVEL="${PROXY_LOG_LEVEL:-info}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+LOG_DIR="$REPO_ROOT/logs"
+RUN_DIR="$REPO_ROOT/run"
+LOG_FILE="$LOG_DIR/proxy.log"
+PID_FILE="$RUN_DIR/proxy.pid"
+VENV_PATH="$REPO_ROOT/.venv-proxy"
+
+mkdir -p "$LOG_DIR" "$RUN_DIR"
+touch "$LOG_FILE"
+
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  echo "ERROR: python not found: $PYTHON_BIN" >&2
+  exit 1
+fi
+
+if [[ ! -d "$VENV_PATH" ]]; then
+  echo "Creating proxy virtualenv at $VENV_PATH"
+  "$PYTHON_BIN" -m venv "$VENV_PATH"
+fi
+
+set +u
+source "$VENV_PATH/bin/activate"
+set -u
+
+if ! python - <<'PY' >/dev/null 2>&1
+import fastapi, uvicorn, httpx
+print("ok")
+PY
+then
+  echo "Installing proxy dependencies into $VENV_PATH"
+  python -m pip install -U pip setuptools wheel
+  python -m pip install fastapi "uvicorn[standard]" httpx
+fi
+
+if [[ -f "$PID_FILE" ]]; then
+  OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [[ -n "${OLD_PID:-}" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
+    kill "$OLD_PID" 2>/dev/null || true
+    sleep 1
+  fi
+  rm -f "$PID_FILE"
+fi
+
+pkill -f 'uvicorn.*tools.proxy.fish_proxy_pcm:app' 2>/dev/null || true
+
+nohup python -m uvicorn tools.proxy.fish_proxy_pcm:app \
+  --host "$PROXY_HOST" \
+  --port "$PROXY_PORT" \
+  --log-level "$PROXY_LOG_LEVEL" \
+  >> "$LOG_FILE" 2>&1 &
+
+echo $! > "$PID_FILE"
+
+sleep 1
+
+if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+  echo "ERROR: proxy failed to start. Check $LOG_FILE" >&2
+  exit 1
+fi
+
+echo "Proxy started"
+echo "  pid: $(cat "$PID_FILE")"
+echo "  log: $LOG_FILE"
+echo "  url: http://127.0.0.1:${PROXY_PORT}/health"
+
+
+path: /run_server_32gb.sh
+----------------------------------------
+#!/usr/bin/env bash
+# Minimal repro: run API server in Docker for 32GB VRAM (e.g. RTX 5090).
+# From repo root: ./scripts/run_server_32gb.sh
+# Optional: COMPILE=1; PORT=8080; CONTAINER=fish-speech
+# If fish-speech is in a parent repo (e.g. .cache/fish-speech): WORKSPACE_DIR=/path/to/parent CHECKPOINTS_DIR=checkpoints/s2-pro
+set -e
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+IMAGE="${IMAGE:-fish-speech-webui:cu129}"
+CONTAINER="${CONTAINER:-fish-speech}"
+PORT="${PORT:-8080}"
+COMPILE="${COMPILE:-0}"
+CHECKPOINTS_DIR="${CHECKPOINTS_DIR:-checkpoints/s2-pro}"
+
+# When running from a parent repo: mount parent as /workspace so checkpoints and repo are both visible
+if [[ -n "$WORKSPACE_DIR" ]]; then
+  WORKSPACE_DIR="$(cd "$WORKSPACE_DIR" && pwd)"
+  REPO_REL="$(python3 -c "import os; print(os.path.relpath('$REPO_ROOT', '$WORKSPACE_DIR'))")"
+  MOUNT_ROOT="$WORKSPACE_DIR"
+  CHECKPOINTS_REL="$CHECKPOINTS_DIR"
+else
+  MOUNT_ROOT="$REPO_ROOT"
+  REPO_REL="."
+  CHECKPOINTS_REL="$CHECKPOINTS_DIR"
+fi
+
+echo "=== Fish Speech API (32GB / RTX 5090 style) ==="
+echo "  MOUNT_ROOT=$MOUNT_ROOT  REPO_REL=$REPO_REL  CHECKPOINTS=$CHECKPOINTS_REL"
+echo "  IMAGE=$IMAGE  CONTAINER=$CONTAINER  PORT=$PORT  COMPILE=$COMPILE"
+echo ""
+
+# 1) Build image if not present (CUDA 12.9 for modern GPUs)
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  echo "Building image $IMAGE (this may take a while)..."
+  docker build --platform linux/amd64 -f docker/Dockerfile \
+    --build-arg BACKEND=cuda \
+    --build-arg CUDA_VER=12.9.0 \
+    --build-arg UV_EXTRA=cu129 \
+    --target webui \
+    -t "$IMAGE" .
+  echo "Build done."
+else
+  echo "Using existing image $IMAGE"
+fi
+
+# 2) Download checkpoints if missing (only when checkpoints live under repo)
+if [[ -z "$WORKSPACE_DIR" ]]; then
+  if [[ ! -d "$REPO_ROOT/$CHECKPOINTS_DIR" ]] || [[ -z "$(ls -A "$REPO_ROOT/$CHECKPOINTS_DIR" 2>/dev/null)" ]]; then
+    echo "Downloading s2-pro checkpoints to $CHECKPOINTS_DIR ..."
+    mkdir -p "$REPO_ROOT/$CHECKPOINTS_DIR"
+    docker run --rm \
+      --entrypoint /app/.venv/bin/huggingface-cli \
+      -v "$REPO_ROOT":/workspace -w /workspace \
+      "$IMAGE" \
+      download fishaudio/s2-pro --local-dir "$CHECKPOINTS_DIR"
+    echo "Download done."
+  else
+    echo "Checkpoints found at $CHECKPOINTS_DIR"
+  fi
+else
+  if [[ ! -d "$WORKSPACE_DIR/$CHECKPOINTS_DIR" ]] || [[ -z "$(ls -A "$WORKSPACE_DIR/$CHECKPOINTS_DIR" 2>/dev/null)" ]]; then
+    echo "ERROR: WORKSPACE_DIR set but $WORKSPACE_DIR/$CHECKPOINTS_DIR not found. Create it or run without WORKSPACE_DIR to download into repo."
+    exit 1
+  fi
+  echo "Checkpoints found at $WORKSPACE_DIR/$CHECKPOINTS_DIR"
+fi
+
+# 3) Stop existing container if any
+docker rm -f "$CONTAINER" 2>/dev/null || true
+
+# 4) Run server (tuned for 32GB: cache=384, max_new_tokens cap=80; warmup when COMPILE=1)
+echo "Starting server on port $PORT ..."
+docker run -d --rm --name "$CONTAINER" \
+  -p "$PORT:8080" \
+  --gpus all \
+  -e PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
+  -e FISH_CACHE_MAX_SEQ_LEN="${FISH_CACHE_MAX_SEQ_LEN:-320}" \
+  -e FISH_MAX_NEW_TOKENS_CAP="${FISH_MAX_NEW_TOKENS_CAP:-64}" \
+  -e PYTHONPATH=/workspace/"$REPO_REL" \
+  -v "$MOUNT_ROOT":/workspace -w /workspace \
+  --entrypoint /app/.venv/bin/python \
+  "$IMAGE" \
+  /workspace/"$REPO_REL"/tools/api_server.py \
+  --listen 0.0.0.0:8080 \
+  --device cuda \
+  --llama-checkpoint-path "/workspace/$CHECKPOINTS_REL" \
+  --decoder-checkpoint-path "/workspace/$CHECKPOINTS_REL/codec.pth" \
+  $([ "$COMPILE" = "1" ] && echo --compile || true)
+
+echo ""
+echo "Server starting. With COMPILE=1, warmup runs at startup (2–10 min); then /v1/health returns 200."
+echo "  Health:  curl -s http://127.0.0.1:$PORT/v1/health"
+echo "  TTS:    curl -X POST http://127.0.0.1:$PORT/v1/tts -H 'Content-Type: application/json' -d '{\"text\":\"Hello\",\"streaming\":true}' --output out.wav"
+echo "  Memory: curl -s http://127.0.0.1:$PORT/v1/debug/memory"
+echo "  Logs:   docker logs -f $CONTAINER"
+
+
+path: /run_session_mode.sh
+----------------------------------------
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+SESSION_PORT="${SESSION_PORT:-8765}"
+SESSION_HOST="${SESSION_HOST:-0.0.0.0}"
+SESSION_LOG_LEVEL="${SESSION_LOG_LEVEL:-info}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+LOG_DIR="$REPO_ROOT/logs"
+RUN_DIR="$REPO_ROOT/run"
+LOG_FILE="$LOG_DIR/session_mode.log"
+PID_FILE="$RUN_DIR/session_mode.pid"
+VENV_PATH="$REPO_ROOT/.venv-session"
+
+mkdir -p "$LOG_DIR" "$RUN_DIR"
+touch "$LOG_FILE"
+
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  echo "ERROR: python not found: $PYTHON_BIN" >&2
+  exit 1
+fi
+
+if [[ ! -d "$VENV_PATH" ]]; then
+  echo "Creating session_mode virtualenv at $VENV_PATH"
+  "$PYTHON_BIN" -m venv "$VENV_PATH"
+fi
+
+set +u
+source "$VENV_PATH/bin/activate"
+set -u
+
+echo "Installing/checking session_mode dependencies in $VENV_PATH"
+python -m pip install -U pip setuptools wheel >/dev/null
+python -m pip install fastapi "uvicorn[standard]" httpx loguru pydantic pydantic-settings >/dev/null
+
+if [[ -f "$PID_FILE" ]]; then
+  OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [[ -n "${OLD_PID:-}" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
+    kill "$OLD_PID" 2>/dev/null || true
+    sleep 1
+  fi
+  rm -f "$PID_FILE"
+fi
+
+pkill -f 'uvicorn.*session_mode.app:app' 2>/dev/null || true
+
+echo "Starting session_mode manager..."
+nohup python -m uvicorn session_mode.app:app \
+  --host "$SESSION_HOST" \
+  --port "$SESSION_PORT" \
+  --log-level "$SESSION_LOG_LEVEL" \
+  >> "$LOG_FILE" 2>&1 &
+
+echo $! > "$PID_FILE"
+
+sleep 1
+
+if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+  echo "ERROR: session_mode failed to start. Check $LOG_FILE" >&2
+  exit 1
+fi
+
+echo "Session Mode Manager started"
+echo "  pid: $(cat "$PID_FILE")"
+echo "  log: $LOG_FILE"
+echo "  url: http://127.0.0.1:${SESSION_PORT}/health"
+
+
+path: /ttfa_smoke.py
+----------------------------------------
+#!/usr/bin/env python3
+"""One TTS request (streaming or oneshot): measure TTFA and save WAV. Prints ttfa_s, ttfa_audio_s, total_s."""
+
+import argparse
+import sys
+import time
+
+WAV_HEADER_SIZE = 44
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="TTS request with TTFA/timing metrics")
+    p.add_argument("--url", required=True, help="Base URL (e.g. http://127.0.0.1:8080)")
+    p.add_argument("--output", required=True, help="Output WAV path")
+    p.add_argument("--reference-id", default=None, help="Optional reference_id")
+    p.add_argument(
+        "--text", default=None, help="Text to synthesize (default depends on --oneshot)"
+    )
+    p.add_argument(
+        "--oneshot",
+        action="store_true",
+        help="Non-streaming request (streaming: false)",
+    )
+    args = p.parse_args()
+    if args.text is None:
+        args.text = (
+            "Short test." if args.oneshot else "Hello, this is an e2e smoke test."
+        )
+
+    try:
+        import urllib.request
+    except ImportError:
+        print("ERROR: urllib.request required", file=sys.stderr)
+        sys.exit(1)
+
+    url = f"{args.url.rstrip('/')}/v1/tts"
+    body = {"text": args.text, "streaming": not args.oneshot}
+    if args.reference_id:
+        body["reference_id"] = args.reference_id
+    import json
+
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    t0 = time.perf_counter()
+    t1: float | None = None  # first byte
+    t2: float | None = None  # first audio byte (after 44-byte header)
+    out_bytes: list[bytes] = []
+    bytes_read = 0
+
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        while True:
+            chunk = resp.read(8192)
+            if not chunk:
+                break
+            if t1 is None:
+                t1 = time.perf_counter()
+            out_bytes.append(chunk)
+            bytes_read += len(chunk)
+            if t2 is None and bytes_read > WAV_HEADER_SIZE:
+                t2 = time.perf_counter()
+    t3 = time.perf_counter()
+
+    with open(args.output, "wb") as f:
+        f.write(b"".join(out_bytes))
+
+    ttfa_s = (t1 - t0) if t1 is not None else 0.0
+    ttfa_audio_s = (t2 - t0) if t2 is not None else ttfa_s
+    total_s = t3 - t0
+    print(
+        f"  ttfa_s={ttfa_s:.3f}  ttfa_audio_s={ttfa_audio_s:.3f}  total_s={total_s:.3f}  bytes={bytes_read}"
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+
+path: /up_5090.sh
+----------------------------------------
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+IMAGE="${IMAGE:-fish-speech-webui:cu129}"
+CONTAINER="${CONTAINER:-fish-speech}"
+PORT="${PORT:-8080}"
+PROXY_PORT="${PROXY_PORT:-9000}"
+
+COMPILE="${COMPILE:-1}"
+BUILD_IMAGE="${BUILD_IMAGE:-0}"
+START_PROXY="${START_PROXY:-1}"
+START_SESSION="${START_SESSION:-1}"
+EXTRA_WARMUP="${EXTRA_WARMUP:-1}"
+
+CUDA_VER="${CUDA_VER:-12.9.0}"
+UV_EXTRA="${UV_EXTRA:-cu129}"
+CHECKPOINTS_DIR="${CHECKPOINTS_DIR:-checkpoints/s2-pro}"
+
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+FISH_CACHE_MAX_SEQ_LEN="${FISH_CACHE_MAX_SEQ_LEN:-320}"
+FISH_MAX_NEW_TOKENS_CAP="${FISH_MAX_NEW_TOKENS_CAP:-64}"
+
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-1800}"
+LOG_DIR="$REPO_ROOT/logs"
+mkdir -p "$LOG_DIR"
+
+docker_cmd() {
+  if [[ "${DOCKER_USE_SUDO:-0}" == "1" ]]; then
+    sudo docker "$@"
+  else
+    docker "$@"
+  fi
+}
+
+echo "=== Fish Speech full startup (RTX 5090) ==="
+echo "  REPO_ROOT=$REPO_ROOT"
+echo "  IMAGE=$IMAGE"
+echo "  CONTAINER=$CONTAINER"
+echo "  PORT=$PORT"
+echo "  PROXY_PORT=$PROXY_PORT"
+echo "  COMPILE=$COMPILE"
+echo "  CHECKPOINTS_DIR=$CHECKPOINTS_DIR"
+echo
+
+if [[ ! -d "$CHECKPOINTS_DIR" ]] || [[ -z "$(ls -A "$CHECKPOINTS_DIR" 2>/dev/null)" ]]; then
+  echo "ERROR: checkpoints not found in $CHECKPOINTS_DIR" >&2
+  exit 1
+fi
+
+if [[ "$BUILD_IMAGE" == "1" ]] || ! docker_cmd image inspect "$IMAGE" >/dev/null 2>&1; then
+  echo "[1/5] Building Docker image..."
+  docker_cmd build \
+    --platform linux/amd64 \
+    -f docker/Dockerfile \
+    --build-arg BACKEND=cuda \
+    --build-arg CUDA_VER="$CUDA_VER" \
+    --build-arg UV_EXTRA="$UV_EXTRA" \
+    --target webui \
+    -t "$IMAGE" .
+else
+  echo "[1/5] Using existing image: $IMAGE"
+fi
+
+echo "[2/5] Stopping previous processes..."
+DOCKER_USE_SUDO="${DOCKER_USE_SUDO:-0}" bash "$REPO_ROOT/scripts/down_5090.sh"
+
+echo "[3/5] Starting model container..."
+CID="$(
+  docker_cmd run -d --rm \
+    --name "$CONTAINER" \
+    -p "$PORT:8080" \
+    --gpus all \
+    -e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF" \
+    -e FISH_CACHE_MAX_SEQ_LEN="$FISH_CACHE_MAX_SEQ_LEN" \
+    -e FISH_MAX_NEW_TOKENS_CAP="$FISH_MAX_NEW_TOKENS_CAP" \
+    -e PYTHONPATH=/workspace \
+    -v "$REPO_ROOT":/workspace \
+    -w /workspace \
+    --entrypoint /app/.venv/bin/python \
+    "$IMAGE" \
+    /workspace/tools/api_server.py \
+    --listen 0.0.0.0:8080 \
+    --device cuda \
+    --llama-checkpoint-path "/workspace/$CHECKPOINTS_DIR" \
+    --decoder-checkpoint-path "/workspace/$CHECKPOINTS_DIR/codec.pth" \
+    $([[ "$COMPILE" == "1" ]] && echo --compile || true)
+)"
+
+echo "Container started: $CID"
+echo
+
+echo "[4/5] Waiting for model health..."
+START_TS="$(date +%s)"
+
+while true; do
+  if curl -sf "http://127.0.0.1:${PORT}/v1/health" >/dev/null 2>&1; then
+    break
+  fi
+
+  if ! docker_cmd ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+    echo "ERROR: container exited during startup" >&2
+    echo
+    echo "Last model logs:"
+    docker_cmd logs --tail 200 "$CONTAINER" 2>&1 || true
+    exit 1
+  fi
+
+  NOW_TS="$(date +%s)"
+  ELAPSED="$((NOW_TS - START_TS))"
+
+  if (( ELAPSED % 30 == 0 )); then
+    echo "Still warming up... ${ELAPSED}s"
+  fi
+
+  if [[ "$ELAPSED" -ge "$HEALTH_TIMEOUT" ]]; then
+    echo "ERROR: model did not become healthy within ${HEALTH_TIMEOUT}s" >&2
+    echo
+    echo "Last model logs:"
+    docker_cmd logs --tail 200 "$CONTAINER" 2>&1 || true
+    exit 1
+  fi
+
+  sleep 5
+done
+
+echo "Model is healthy after $(( $(date +%s) - START_TS ))s"
+
+if [[ "$EXTRA_WARMUP" == "1" ]]; then
+  echo "Sending one extra warmup streaming request..."
+  BASE_URL="http://127.0.0.1:${PORT}" \
+    bash "$REPO_ROOT/scripts/warmup_5090.sh"
+fi
+
+echo "Current model memory:"
+curl -sf "http://127.0.0.1:${PORT}/v1/debug/memory" || true
+echo
+echo
+
+if [[ "$START_PROXY" == "1" ]]; then
+  echo "[5/6] Starting proxy..."
+  PROXY_PORT="$PROXY_PORT" bash "$REPO_ROOT/scripts/run_proxy.sh"
+
+  echo "Checking proxy health..."
+  sleep 1
+  curl -sf "http://127.0.0.1:${PROXY_PORT}/health" >/dev/null
+  echo "Proxy is healthy"
+fi
+
+SESSION_PORT="${SESSION_PORT:-8765}"
+if [[ "$START_SESSION" == "1" ]]; then
+  echo "[6/6] Starting session_mode..."
+  SESSION_PORT="$SESSION_PORT" bash "$REPO_ROOT/scripts/run_session_mode.sh"
+
+  echo "Checking session_mode health..."
+  sleep 1
+  curl -sf "http://127.0.0.1:${SESSION_PORT}/health" >/dev/null
+  echo "Session Mode is healthy"
+fi
+
+echo
+echo "=== READY ==="
+echo "Model health:   http://127.0.0.1:${PORT}/v1/health"
+echo "Model memory:   http://127.0.0.1:${PORT}/v1/debug/memory"
+echo "Proxy health:   http://127.0.0.1:${PROXY_PORT}/health"
+echo "Proxy stream:   http://127.0.0.1:${PROXY_PORT}/pcm-stream?text=Привет"
+echo "Session health: http://127.0.0.1:${SESSION_PORT}/health"
+echo
+echo "Live logs:"
+echo "  DOCKER_USE_SUDO=${DOCKER_USE_SUDO:-0} bash scripts/logs_5090.sh"
+echo
+echo "Stop all:"
+echo "  DOCKER_USE_SUDO=${DOCKER_USE_SUDO:-0} bash scripts/down_5090.sh"
+echo
+echo "Restart all:"
+echo "  DOCKER_USE_SUDO=${DOCKER_USE_SUDO:-0} bash scripts/restart_5090.sh"
+
+
+path: /upload_references.sh
+----------------------------------------
+#!/usr/bin/env bash
+# Upload existing references/ to server (no encoding). Server skips if hash matches.
+# Env: PREENCODE_OUTPUT_DIR, SERVER_URL (or BASE_URL)
+# Usage: ./scripts/upload_references.sh   or   make upload-references
+set -e
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+OUTPUT_DIR="${PREENCODE_OUTPUT_DIR:-references}"
+SERVER_URL="${SERVER_URL:-${BASE_URL:-http://127.0.0.1:8080}}"
+
+exec uv run python tools/preencode_references.py \
+  --output-dir "$OUTPUT_DIR" \
+  --upload-only --server-url "$SERVER_URL"
+
+
+path: /warmup_5090.sh
+----------------------------------------
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+PORT="${PORT:-8080}"
+BASE_URL="${BASE_URL:-http://127.0.0.1:${PORT}}"
+WARMUP_TIMEOUT="${WARMUP_TIMEOUT:-1800}"
+WARMUP_TEXT="${WARMUP_TEXT:-Привет. Это дополнительный прогрев стримингового режима для Fish Speech.}"
+OUT_FILE="${OUT_FILE:-$REPO_ROOT/logs/warmup_stream.wav}"
+
+mkdir -p "$REPO_ROOT/logs"
+
+echo "Waiting for model health: $BASE_URL/v1/health"
+
+START_TS="$(date +%s)"
+while true; do
+  if curl -sf "$BASE_URL/v1/health" >/dev/null 2>&1; then
+    break
+  fi
+
+  NOW_TS="$(date +%s)"
+  ELAPSED="$((NOW_TS - START_TS))"
+  echo "Still warming up... ${ELAPSED}s"
+
+  if [[ "$ELAPSED" -ge "$WARMUP_TIMEOUT" ]]; then
+    echo "ERROR: model did not become healthy within ${WARMUP_TIMEOUT}s" >&2
+    exit 1
+  fi
+
+  sleep 10
+done
+
+echo "Model is healthy after $(( $(date +%s) - START_TS ))s"
+echo "Sending one extra warmup streaming request..."
+
+curl -sf -X POST "$BASE_URL/v1/tts" \
+  -H 'Content-Type: application/json' \
+  -d "{\"text\":\"${WARMUP_TEXT}\",\"streaming\":true}" \
+  --output "$OUT_FILE" \
+  --max-time 180 >/dev/null
+
+echo "Warmup completed"
+echo "Current memory:"
+curl -sf "$BASE_URL/v1/debug/memory" || true
+echo
+
+
+=== SUMMARY ===
+included: 14
+skipped(binary): 0
+skipped(size): 0
+skipped(ext): 0
+totalBytes(approx): 33738

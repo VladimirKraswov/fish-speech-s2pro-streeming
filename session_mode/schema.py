@@ -6,22 +6,12 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-# -----------------------------
-# Common base
-# -----------------------------
-
-
 class SessionBaseModel(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
         str_strip_whitespace=True,
         validate_assignment=True,
     )
-
-
-# -----------------------------
-# Runtime config
-# -----------------------------
 
 
 class BufferConfig(SessionBaseModel):
@@ -115,11 +105,6 @@ class SessionModeConfig(SessionBaseModel):
     policy: SessionPolicyConfig = Field(default_factory=SessionPolicyConfig)
 
 
-# -----------------------------
-# Client -> server messages
-# -----------------------------
-
-
 class ClientStartSession(SessionBaseModel):
     type: Literal["start_session"] = "start_session"
     config: SessionModeConfig | None = None
@@ -127,8 +112,6 @@ class ClientStartSession(SessionBaseModel):
 
 class ClientPatchConfig(SessionBaseModel):
     type: Literal["patch_config"] = "patch_config"
-
-    # Частичный патч конфига. Сервер сам аккуратно сольет с текущим.
     patch: dict[str, Any]
 
 
@@ -189,11 +172,6 @@ ClientMessage = (
 )
 
 
-# -----------------------------
-# Internal TTS request/response
-# -----------------------------
-
-
 class TTSChunkRequest(SessionBaseModel):
     """
     Внутреннее описание одного отправляемого в backend текстового куска.
@@ -222,11 +200,6 @@ class TTSAudioMeta(SessionBaseModel):
     sample_rate: int = Field(default=44100, ge=8000, le=192000)
     channels: int = Field(default=1, ge=1, le=2)
     format: Literal["pcm", "wav"] = "pcm"
-
-
-# -----------------------------
-# Server -> client events
-# -----------------------------
 
 
 class ServerSessionStarted(SessionBaseModel):
@@ -347,17 +320,30 @@ ServerEvent = (
 )
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
-
-
-def parse_client_message(payload: dict[str, Any]) -> ClientMessage:
+def parse_client_message(payload: dict[str, Any] | str) -> ClientMessage:
     """
     Явный парсер входящих websocket/json сообщений.
-    Так проще дебажить, чем тащить сложные discriminated unions.
+    Поддерживает:
+    - plain text -> text_delta
+    - {"text": "..."} без type -> text_delta
+    - обычные typed messages
     """
+    if isinstance(payload, str):
+        return ClientTextDelta.model_validate(
+            {
+                "type": "text_delta",
+                "text": payload,
+            }
+        )
+
+    if not isinstance(payload, dict):
+        raise ValueError("Client message must be an object or plain text string")
+
     msg_type = payload.get("type")
+
+    if msg_type is None and "text" in payload:
+        payload = {"type": "text_delta", **payload}
+        msg_type = "text_delta"
 
     mapping: dict[str, type[SessionBaseModel]] = {
         "start_session": ClientStartSession,

@@ -1,6 +1,8 @@
 from lightning.pytorch.utilities import rank_zero_only
 
-from fish_speech.utils import logger as log
+from .logger import RankedLogger
+
+log = RankedLogger(__name__, rank_zero_only=True)
 
 
 @rank_zero_only
@@ -23,7 +25,6 @@ def log_hyperparameters(object_dict: dict) -> None:
 
     hparams["model"] = cfg["model"]
 
-    # save number of model parameters
     hparams["model/params/total"] = sum(p.numel() for p in model.parameters())
     hparams["model/params/trainable"] = sum(
         p.numel() for p in model.parameters() if p.requires_grad
@@ -43,6 +44,5 @@ def log_hyperparameters(object_dict: dict) -> None:
     hparams["ckpt_path"] = cfg.get("ckpt_path")
     hparams["seed"] = cfg.get("seed")
 
-    # send hparams to all loggers
-    for logger in trainer.loggers:
-        logger.log_hyperparams(hparams)
+    for trainer_logger in trainer.loggers:
+        trainer_logger.log_hyperparams(hparams)

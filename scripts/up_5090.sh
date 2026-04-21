@@ -12,6 +12,7 @@ PROXY_PORT="${PROXY_PORT:-9000}"
 COMPILE="${COMPILE:-1}"
 BUILD_IMAGE="${BUILD_IMAGE:-0}"
 START_PROXY="${START_PROXY:-1}"
+START_SESSION="${START_SESSION:-1}"
 EXTRA_WARMUP="${EXTRA_WARMUP:-1}"
 
 CUDA_VER="${CUDA_VER:-12.9.0}"
@@ -139,7 +140,7 @@ echo
 echo
 
 if [[ "$START_PROXY" == "1" ]]; then
-  echo "[5/5] Starting proxy..."
+  echo "[5/6] Starting proxy..."
   PROXY_PORT="$PROXY_PORT" bash "$REPO_ROOT/scripts/run_proxy.sh"
 
   echo "Checking proxy health..."
@@ -148,12 +149,24 @@ if [[ "$START_PROXY" == "1" ]]; then
   echo "Proxy is healthy"
 fi
 
+SESSION_PORT="${SESSION_PORT:-8765}"
+if [[ "$START_SESSION" == "1" ]]; then
+  echo "[6/6] Starting session_mode..."
+  SESSION_PORT="$SESSION_PORT" bash "$REPO_ROOT/scripts/run_session_mode.sh"
+
+  echo "Checking session_mode health..."
+  sleep 1
+  curl -sf "http://127.0.0.1:${SESSION_PORT}/health" >/dev/null
+  echo "Session Mode is healthy"
+fi
+
 echo
 echo "=== READY ==="
-echo "Model health:  http://127.0.0.1:${PORT}/v1/health"
-echo "Model memory:  http://127.0.0.1:${PORT}/v1/debug/memory"
-echo "Proxy health:  http://127.0.0.1:${PROXY_PORT}/health"
-echo "Proxy stream:  http://127.0.0.1:${PROXY_PORT}/pcm-stream?text=Привет"
+echo "Model health:   http://127.0.0.1:${PORT}/v1/health"
+echo "Model memory:   http://127.0.0.1:${PORT}/v1/debug/memory"
+echo "Proxy health:   http://127.0.0.1:${PROXY_PORT}/health"
+echo "Proxy stream:   http://127.0.0.1:${PROXY_PORT}/pcm-stream?text=Привет"
+echo "Session health: http://127.0.0.1:${SESSION_PORT}/health"
 echo
 echo "Live logs:"
 echo "  DOCKER_USE_SUDO=${DOCKER_USE_SUDO:-0} bash scripts/logs_5090.sh"

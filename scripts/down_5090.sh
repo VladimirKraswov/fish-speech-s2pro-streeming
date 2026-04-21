@@ -30,6 +30,17 @@ if [[ -f "$PID_FILE" ]]; then
 fi
 pkill -f 'uvicorn.*tools.proxy.fish_proxy_pcm:app' 2>/dev/null || true
 
+echo "[1.5/2] Stopping session_mode"
+SESSION_PID_FILE="$REPO_ROOT/run/session_mode.pid"
+if [[ -f "$SESSION_PID_FILE" ]]; then
+  S_PID="$(cat "$SESSION_PID_FILE" 2>/dev/null || true)"
+  if [[ -n "${S_PID:-}" ]] && kill -0 "$S_PID" 2>/dev/null; then
+    kill "$S_PID" 2>/dev/null || true
+  fi
+  rm -f "$SESSION_PID_FILE"
+fi
+pkill -f 'uvicorn.*session_mode.app:app' 2>/dev/null || true
+
 echo "[2/2] Stopping model container"
 docker_cmd rm -f "$CONTAINER" 2>/dev/null || true
 

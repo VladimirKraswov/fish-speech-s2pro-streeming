@@ -283,10 +283,10 @@ async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
             )
 
         # Check if streaming is enabled
-        if req.streaming and req.format != "wav":
+        if req.streaming and req.format not in ("wav", "pcm"):
             raise HTTPException(
                 HTTPStatus.BAD_REQUEST,
-                content="Streaming only supports WAV format",
+                content="Streaming only supports WAV and PCM formats",
             )
 
         # Perform TTS

@@ -125,7 +125,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         else:
             sample_rate = self.decoder_model.sample_rate
 
-        if req.streaming:
+        if req.streaming and req.format == "wav":
             _mark("yield_header")
             yield InferenceResult(
                 code="header",
@@ -218,11 +218,13 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                         getattr(result, "text", None),
                     )
 
+                # Ack before decoding to allow LLM generation to overlap with DAC decode.
+                if ack_queue is not None:
+                    ack_queue.put(None)
+
                 try:
                     segment = self.get_audio_segment(result)
                 except Exception as seg_err:
-                    if ack_queue is not None:
-                        ack_queue.put(None)
                     if stream_tokens:
                         logger.exception(
                             "stream: get_audio_segment FAILED seg_idx={} codes_shape={} req={}: {}",
@@ -245,12 +247,6 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                         len(segment),
                         req_tag,
                     )
-
-                # Ack immediately after decode is complete.
-                # This preserves back-pressure between LLM generation and DAC decode,
-                # and avoids deadlock if the HTTP client closes while we're yielding.
-                if ack_queue is not None:
-                    ack_queue.put(None)
 
                 if req.streaming:
                     _mark("yield_segment", segment_idx=seg_idx)

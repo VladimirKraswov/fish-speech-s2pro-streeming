@@ -380,6 +380,9 @@ def decode_n_tokens(
             current_stream_chunk_size = stream_chunk_size
 
     for i in tqdm(range(num_new_tokens)):
+        if i == 0 and do_stream_log:
+            logger.info("stream: decode_n_tokens started generating first token")
+
         if do_stream_log and i < 3:
             logger.info(
                 "stream: decode_n_tokens iter={} cur_token.shape={} input_pos={}",
@@ -1260,10 +1263,11 @@ def launch_thread_safe_queue(
                                 torch.cuda.max_memory_allocated() / (1024**3),
                             )
                         logger.info(
-                            "queue_put req={} action={} delta_ms={:.1f} total_ms={:.1f}{}",
+                            "queue_put req={} action={} delta_ms={:.1f} total_ms={:.1f} time_since_req_start_ms={:.1f}{}",
                             req_tag,
                             action,
                             delta_ms,
+                            total_ms,
                             total_ms,
                             vram_s,
                         )

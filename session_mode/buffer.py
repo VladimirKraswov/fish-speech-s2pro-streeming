@@ -51,6 +51,7 @@ class StreamingTextBuffer:
         self.soft_limit_chars = soft_limit_chars
         self.hard_limit_chars = hard_limit_chars
         self._buffer = ""
+        self._is_first_chunk = True
 
     @property
     def text(self) -> str:
@@ -61,9 +62,11 @@ class StreamingTextBuffer:
 
     def clear(self) -> None:
         self._buffer = ""
+        self._is_first_chunk = True
 
     def replace(self, text: str) -> None:
         self._buffer = self._cleanup_text(text)
+        self._is_first_chunk = True
 
     def push(
         self,
@@ -123,6 +126,7 @@ class StreamingTextBuffer:
                     chars=len(chunk),
                 )
             )
+            self._is_first_chunk = False
 
             if force or final:
                 break
@@ -137,6 +141,17 @@ class StreamingTextBuffer:
         total_words = self._count_words(buf)
 
         if final or force:
+            return len(self._buffer)
+
+        # Optimization for TTFA: emit the very first chunk as soon as we have at least one word.
+        if self._is_first_chunk and total_words >= 1:
+            # We still prefer splitting at a sentence boundary if possible
+            punct_split = self._find_sentence_boundary(buf)
+            if punct_split is not None:
+                return self._map_stripped_index_to_raw_index(punct_split)
+
+            # If no punctuation but we have some text, just split at the end of the current buffer
+            # (up to hard limit) to get the first audio fast.
             return len(self._buffer)
 
         if total_words < self.min_words and len(buf) < self.hard_limit_chars:

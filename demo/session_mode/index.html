@@ -892,7 +892,8 @@
       previewText: "",
       mirror: {
         buffer: "",
-        commits: []
+        commits: [],
+        isFirstChunk: true
       },
 
       actualCommits: [],
@@ -966,6 +967,7 @@
       state.previewText = "";
       state.mirror.buffer = "";
       state.mirror.commits = [];
+      state.mirror.isFirstChunk = true;
       state.actualCommits = [];
       state.timeline = [];
       state.chunkLanes = new Map();
@@ -1222,7 +1224,7 @@
     }
 
     function extractChunkFromBuffer(text, opts) {
-      const { minWords, softLimitChars, hardLimitChars, force, final } = opts;
+      const { minWords, softLimitChars, hardLimitChars, force, final, isFirstChunk } = opts;
 
       if (!text || !text.trim()) {
         return { chunk: null, remaining: "", reason: null };
@@ -1232,10 +1234,26 @@
       const words = countWords(raw);
       const chars = raw.length;
 
-      if (!force && !final) {
+      if (!force && !final && !isFirstChunk) {
         if (words < minWords && chars < softLimitChars) {
           return { chunk: null, remaining: raw, reason: null };
         }
+      }
+
+      if (isFirstChunk && words >= 1 && !force && !final) {
+        // Optimization for TTFA: emit the very first chunk as soon as we have at least one word.
+        // Try punctuation first.
+        const preferredLimit = Math.min(chars, hardLimitChars);
+        const preferredPunct = /[.!?…;\n]/g;
+        const punctCut = findLastRegexBefore(preferredPunct, raw, preferredLimit);
+        if (punctCut !== null) {
+          const chunk = trimRight(raw.slice(0, punctCut));
+          const rest = trimLeft(raw.slice(punctCut));
+          if (chunk) return { chunk, remaining: rest, reason: "punct" };
+        }
+
+        // Just split it all if no punct.
+        return { chunk: trimRight(raw), remaining: "", reason: "force" };
       }
 
       const stripped = raw.replace(/\s+$/, "");
@@ -1312,13 +1330,15 @@
         const res = extractChunkFromBuffer(state.mirror.buffer, {
           ...optsBase,
           force: false,
-          final: false
+          final: false,
+          isFirstChunk: state.mirror.isFirstChunk
         });
 
         if (!res.chunk || !res.reason) {
           keepLooping = false;
         } else {
           state.mirror.buffer = res.remaining;
+          state.mirror.isFirstChunk = false;
           state.mirror.commits.push({
             text: res.chunk,
             reason: res.reason,

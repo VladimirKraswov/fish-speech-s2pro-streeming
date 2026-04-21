@@ -4,26 +4,49 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-HOST="${HOST:-0.0.0.0}"
-PORT="${PORT:-9000}"
-LOG_LEVEL="${LOG_LEVEL:-info}"
+PROXY_PORT="${PROXY_PORT:-9000}"
+PROXY_HOST="${PROXY_HOST:-0.0.0.0}"
+PROXY_LOG_LEVEL="${PROXY_LOG_LEVEL:-info}"
 
-# По умолчанию запускаем PCM/NDJSON proxy для минимального TTFA в браузере.
-PROXY_APP="${PROXY_APP:-tools.proxy.fish_proxy_pcm:app}"
+LOG_DIR="$REPO_ROOT/logs"
+RUN_DIR="$REPO_ROOT/run"
+LOG_FILE="$LOG_DIR/proxy.log"
+PID_FILE="$RUN_DIR/proxy.pid"
 
-if ! command -v uv >/dev/null 2>&1; then
-  echo "ERROR: uv not found. Install uv or run inside the project environment." >&2
+mkdir -p "$LOG_DIR" "$RUN_DIR"
+
+if [[ -d "$REPO_ROOT/.venv-proxy" ]]; then
+  VENV_PATH="$REPO_ROOT/.venv-proxy"
+elif [[ -d "$REPO_ROOT/.venv" ]]; then
+  VENV_PATH="$REPO_ROOT/.venv"
+else
+  echo "ERROR: virtualenv not found (.venv-proxy or .venv)" >&2
   exit 1
 fi
 
-echo "=== Fish Speech proxy ==="
-echo "  app=$PROXY_APP"
-echo "  host=$HOST"
-echo "  port=$PORT"
-echo "  log_level=$LOG_LEVEL"
-echo
+pkill -f 'uvicorn.*tools.proxy.fish_proxy_pcm:app' 2>/dev/null || true
+rm -f "$PID_FILE"
 
-exec uv run uvicorn "$PROXY_APP" \
-  --host "$HOST" \
-  --port "$PORT" \
-  --log-level "$LOG_LEVEL"
+set +u
+source "$VENV_PATH/bin/activate"
+set -u
+
+nohup uvicorn tools.proxy.fish_proxy_pcm:app \
+  --host "$PROXY_HOST" \
+  --port "$PROXY_PORT" \
+  --log-level "$PROXY_LOG_LEVEL" \
+  >> "$LOG_FILE" 2>&1 &
+
+echo $! > "$PID_FILE"
+
+sleep 1
+
+if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+  echo "ERROR: proxy failed to start. Check $LOG_FILE" >&2
+  exit 1
+fi
+
+echo "Proxy started"
+echo "  pid:  $(cat "$PID_FILE")"
+echo "  log:  $LOG_FILE"
+echo "  url:  http://127.0.0.1:${PROXY_PORT}/health"

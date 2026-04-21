@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Fish Speech Client</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 760px;
+      margin: 40px auto;
+      padding: 0 16px;
+    }
+    .row {
+      display: flex;
+      gap: 8px;
+    }
+    input, button {
+      font-size: 18px;
+      padding: 10px 12px;
+    }
+    input {
+      flex: 1;
+    }
+    button {
+      width: 90px;
+    }
+    #status {
+      margin-top: 14px;
+      color: #333;
+      white-space: pre-wrap;
+    }
+    #log {
+      margin-top: 14px;
+      background: #111;
+      color: #ddd;
+      padding: 12px;
+      border-radius: 8px;
+      min-height: 220px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font-family: ui-monospace, monospace;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <div class="row">
+    <input id="text" type="text" value="Сегодня утром я решил пройтись по улице." />
+    <button id="ok">OK</button>
+  </div>
+
+  <div id="status">Готово</div>
+  <div id="log"></div>
+
+  <script>
+    const BACKEND_BASE = 'http://192.168.31.32:9000';
+
+    const input = document.getElementById('text');
+    const button = document.getElementById('ok');
+    const statusEl = document.getElementById('status');
+    const logEl = document.getElementById('log');
+
+    let audioCtx = null;
+    let processor = null;
+    let gainNode = null;
+    let abortController = null;
+    let currentRun = 0;
+    let clickTs = 0;
+
+    let streamMeta = null;
+    let lastSeq = 0;
+    let firstSoundLogged = false;
+
+    // Очередь PCM уже в float32
+    let pcmQueue = [];
+    let currentChunk = null;
+    let currentChunkOffset = 0;
+
+    function log(msg) {
+      const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      logEl.textContent += line + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+      console.log(line);
+    }
+
+    function setStatus(msg) {
+      statusEl.textContent = msg;
+    }
+
+    function resetPlaybackQueue() {
+      pcmQueue = [];
+      currentChunk = null;
+      currentChunkOffset = 0;
+      streamMeta = null;
+      lastSeq = 0;
+      firstSoundLogged = false;
+    }
+
+    async function ensureAudio() {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({
+          latencyHint: 'interactive'
+        });
+      }
+
+      if (!gainNode) {
+        gainNode = audioCtx.createGain();
+        gainNode.gain.value = 1.0;
+        gainNode.connect(audioCtx.destination);
+      }
+
+      if (!processor) {
+        // 2048 сэмплов при 44.1kHz ~= 46 мс
+        processor = audioCtx.createScriptProcessor(2048, 0, 1);
+        processor.onaudioprocess = (event) => {
+          const out = event.outputBuffer.getChannelData(0);
+          out.fill(0);
+
+          let writePos = 0;
+
+          while (writePos < out.length) {
+            if (!currentChunk) {
+              if (pcmQueue.length === 0) {
+                break;
+              }
+              currentChunk = pcmQueue.shift();
+              currentChunkOffset = 0;
+            }
+
+            const remainingChunk = currentChunk.length - currentChunkOffset;
+            const remainingOut = out.length - writePos;
+            const n = Math.min(remainingChunk, remainingOut);
+
+            out.set(
+              currentChunk.subarray(currentChunkOffset, currentChunkOffset + n),
+              writePos
+            );
+
+            currentChunkOffset += n;
+            writePos += n;
+
+            if (currentChunkOffset >= currentChunk.length) {
+              currentChunk = null;
+              currentChunkOffset = 0;
+            }
+          }
+        };
+        processor.connect(gainNode);
+      }
+
+      await audioCtx.resume();
+    }
+
+    function abortPrevious() {
+      if (abortController) {
+        try { abortController.abort(); } catch {}
+      }
+      abortController = null;
+      resetPlaybackQueue();
+      currentRun += 1;
+      return currentRun;
+    }
+
+    function base64ToUint8Array(base64) {
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return bytes;
+    }
+
+    function pcm16ToFloat32(bytes) {
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const samples = bytes.byteLength / 2;
+      const out = new Float32Array(samples);
+
+      for (let i = 0; i < samples; i++) {
+        const s = view.getInt16(i * 2, true);
+        out[i] = Math.max(-1, Math.min(1, s / 32768));
+      }
+
+      return out;
+    }
+
+    function pushPcmChunk(float32Chunk, seq) {
+      if (seq != null) {
+        if (seq <= lastSeq) {
+          log(`drop duplicate/out-of-order seq=${seq} lastSeq=${lastSeq}`);
+          return;
+        }
+        lastSeq = seq;
+      }
+
+      pcmQueue.push(float32Chunk);
+
+      if (!firstSoundLogged) {
+        firstSoundLogged = true;
+        const ms = Math.round(performance.now() - clickTs);
+        setStatus(`Первый звук пошёл через ${ms} мс`);
+        log(`FIRST_AUDIBLE_MS=${ms}`);
+      }
+    }
+
+    async function playStream(text) {
+      const runId = abortPrevious();
+      clickTs = performance.now();
+
+      await ensureAudio();
+
+      setStatus('Запрос отправлен...');
+      log(`run=${runId} click`);
+
+      abortController = new AbortController();
+      const url = `${BACKEND_BASE}/pcm-stream?text=${encodeURIComponent(text)}&_ts=${Date.now()}`;
+
+      let resp;
+      try {
+        resp = await fetch(url, {
+          method: 'GET',
+          cache: 'no-store',
+          signal: abortController.signal,
+        });
+      } catch (e) {
+        setStatus('Ошибка подключения');
+        log(`run=${runId} fetch failed: ${e}`);
+        return;
+      }
+
+      if (!resp.ok || !resp.body) {
+        setStatus(`HTTP ошибка: ${resp.status}`);
+        log(`run=${runId} bad response status=${resp.status}`);
+        return;
+      }
+
+      setStatus('Поток подключён');
+      log(`run=${runId} connected`);
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let textBuf = '';
+
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+
+          if (runId !== currentRun) {
+            log(`run=${runId} stale response ignored`);
+            break;
+          }
+
+          textBuf += decoder.decode(value, { stream: true });
+
+          while (true) {
+            const idx = textBuf.indexOf('\n');
+            if (idx === -1) break;
+
+            const line = textBuf.slice(0, idx).trim();
+            textBuf = textBuf.slice(idx + 1);
+
+            if (!line) continue;
+
+            let event;
+            try {
+              event = JSON.parse(line);
+            } catch {
+              log(`run=${runId} bad json`);
+              continue;
+            }
+
+            if (event.type === 'proxy_start') {
+              log(`run=${runId} proxy_start req=${event.req_id}`);
+              continue;
+            }
+
+            if (event.type === 'meta') {
+              streamMeta = event;
+              log(`run=${runId} meta sr=${event.sample_rate} ch=${event.channels}`);
+              continue;
+            }
+
+            if (event.type === 'pcm') {
+              if (!streamMeta) {
+                log(`run=${runId} pcm before meta`);
+                continue;
+              }
+
+              const bytes = base64ToUint8Array(event.data);
+              const floatChunk = pcm16ToFloat32(bytes);
+              pushPcmChunk(floatChunk, event.seq ?? null);
+
+              log(`run=${runId} pcm seq=${event.seq ?? '-'} bytes=${bytes.byteLength}`);
+              continue;
+            }
+
+            if (event.type === 'done') {
+              setStatus('Готово');
+              log(`run=${runId} done`);
+              continue;
+            }
+
+            if (event.type === 'error') {
+              setStatus(`Ошибка: ${event.message}`);
+              log(`run=${runId} error=${event.message}`);
+              continue;
+            }
+          }
+        }
+
+        if (runId === currentRun) {
+          log(`run=${runId} stream finished`);
+        }
+      } catch (e) {
+        if (abortController?.signal.aborted) {
+          log(`run=${runId} aborted`);
+          setStatus('Остановлено');
+        } else {
+          log(`run=${runId} read error: ${e}`);
+          setStatus(`Ошибка чтения: ${e}`);
+        }
+      }
+    }
+
+    button.addEventListener('click', async () => {
+      let text = input.value.trim();
+      if (!text) return;
+
+      // Практически полезно: если нет финальной пунктуации, добавим точку.
+      // Это часто уменьшает "хвосты" и повторения у TTS.
+      if (!/[.!?…]$/.test(text)) {
+        text += '.';
+      }
+
+      button.disabled = true;
+      try {
+        await playStream(text);
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        button.click();
+      }
+    });
+  </script>
+</body>
+</html>

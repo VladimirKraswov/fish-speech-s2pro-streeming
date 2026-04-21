@@ -320,7 +320,8 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             prompt_tokens=prompt_tokens,
             prompt_text=prompt_texts,
             stream_tokens=stream_tokens,
-            stream_chunk_size=getattr(req, "stream_chunk_size", 20),
+            stream_chunk_size=getattr(req, "stream_chunk_size", 8),
+            initial_stream_chunk_size=getattr(req, "initial_stream_chunk_size", 10),
             ack_queue=ack_queue,
         )
 

@@ -222,12 +222,20 @@ def decode_n_tokens(
     audio_parts: torch.Tensor,
     decode_one_token=decode_one_token_ar,
     stream_chunk_size: Optional[int] = None,
+    initial_stream_chunk_size: Optional[int] = None,
+    initial_token_chunk: Optional[torch.Tensor] = None,
     compile: bool = False,
 ) -> Iterator[torch.Tensor]:
     """
-    Generate tokens autoregressively. When stream_chunk_size is None, yields once
-    with the full tensor (backward compatible). When stream_chunk_size is set, yields
-    every stream_chunk_size tokens for low-TTFA streaming.
+    Generate tokens autoregressively.
+
+    Non-streaming mode:
+      - yields once with the full tensor (backward compatible)
+
+    Streaming mode:
+      - keeps the very first emitted chunk slightly larger than steady-state chunks,
+        so the browser/player has a safer startup buffer and starts playback earlier
+        without underrun.
     """
     need_normal_state = stream_chunk_size is not None
     # Streaming path: all state must be normal tensors (not inference tensors) so AOT
@@ -255,7 +263,25 @@ def decode_n_tokens(
         if need_normal_state
         else _prev_zeros
     )
+
     new_tokens: list[torch.Tensor] = []
+    first_chunk_emitted = stream_chunk_size is None
+
+    if stream_chunk_size is not None:
+        if initial_stream_chunk_size is None:
+            initial_stream_chunk_size = stream_chunk_size
+        initial_stream_chunk_size = max(1, int(initial_stream_chunk_size))
+        stream_chunk_size = max(1, int(stream_chunk_size))
+
+        if initial_token_chunk is not None:
+            if need_normal_state:
+                initial_token_chunk = cast(
+                    torch.Tensor, _to_normal_tensor(initial_token_chunk)
+                )
+            else:
+                initial_token_chunk = initial_token_chunk.detach().clone()
+            new_tokens.append(initial_token_chunk)
+
     # [MODIFIED] Pre-fetch ID for efficiency loop
     im_end_id = model.tokenizer.get_token_id(IM_END_TOKEN)
     do_stream_log = stream_chunk_size is not None
@@ -339,16 +365,22 @@ def decode_n_tokens(
             )[:, 0].clone()
         new_tokens.append(next_token)
 
-        if stream_chunk_size is not None and len(new_tokens) >= stream_chunk_size:
-            chunk_out = torch.cat(new_tokens, dim=1).detach().clone()
-            if do_stream_log:
-                logger.info(
-                    "stream: decode_n_tokens yielding chunk shape={} after iter={}",
-                    chunk_out.shape,
-                    i,
-                )
-            yield chunk_out
-            new_tokens = []
+        if stream_chunk_size is not None:
+            target_chunk_size = (
+                initial_stream_chunk_size if not first_chunk_emitted else stream_chunk_size
+            )
+            if len(new_tokens) >= target_chunk_size:
+                chunk_out = torch.cat(new_tokens, dim=1).detach().clone()
+                if do_stream_log:
+                    logger.info(
+                        "stream: decode_n_tokens yielding chunk shape={} after iter={} target_chunk_size={}",
+                        chunk_out.shape,
+                        i,
+                        target_chunk_size,
+                    )
+                yield chunk_out
+                new_tokens = []
+                first_chunk_emitted = True
 
         if cur_token[0, 0, -1] == im_end_id:
             if do_stream_log:
@@ -470,13 +502,14 @@ def generate(
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
     stream_chunk_size = sampling_kwargs.pop("stream_chunk_size", None)
+    initial_stream_chunk_size = sampling_kwargs.pop("initial_stream_chunk_size", None)
     compile = sampling_kwargs.pop("compile", False)
 
     decode_iter = decode_n_tokens(
         model,
         first_token.view(1, codebook_dim, -1),
         input_pos,
-        max_new_tokens - 1,
+        max(0, max_new_tokens - 1),
         temperature=temperature,
         top_p=top_p,
         top_k=top_k_val,
@@ -485,23 +518,28 @@ def generate(
         audio_parts=audio_parts,
         decode_one_token=decode_one_token,
         stream_chunk_size=stream_chunk_size,
+        initial_stream_chunk_size=initial_stream_chunk_size,
+        initial_token_chunk=first_token.clone() if stream_chunk_size is not None else None,
         compile=compile,
     )
 
     if stream_chunk_size is None:
-        # Non-streaming: single chunk from decode_n_tokens
-        x = next(iter(decode_iter))
+        # Non-streaming: single chunk from decode_n_tokens.
+        # When max_new_tokens == 1, decode_iter yields nothing, so just return the first token.
+        try:
+            x = next(iter(decode_iter))
+        except StopIteration:
+            seq = seq[:, : T + 1]
+            del first_token, prompt, empty, input_pos
+            return seq
         seq = seq[:, : T + 1 + x.size(1)]
         seq[:, T + 1 :] = x
         del first_token, x, prompt, empty, input_pos
         return seq
 
-    # Streaming: return a generator (no yield in this branch so generate() still returns when non-streaming)
-    def _stream():
-        yield first_token
-        yield from decode_iter
-
-    return _stream()
+    # Streaming: do NOT yield the single first token immediately.
+    # decode_n_tokens already buffers it and emits a larger first chunk.
+    return decode_iter
 
 
 def init_model(checkpoint_path, device, precision, compile=False):
@@ -709,7 +747,8 @@ def generate_long(
     prompt_text: Optional[Union[str, list[str]]] = None,
     prompt_tokens: Optional[Union[torch.Tensor, list[torch.Tensor]]] = None,
     stream_tokens: bool = False,
-    stream_chunk_size: int = 20,
+    stream_chunk_size: int = 8,
+    initial_stream_chunk_size: int = 10,
 ):
     assert 0 < top_p <= 1, "top_p must be in (0, 1]"
     assert 0 < temperature < 2, "temperature must be in (0, 2)"
@@ -879,8 +918,9 @@ def generate_long(
             if stream_tokens:
                 # Token-level streaming: yield chunks as they're generated for low TTFA
                 logger.info(
-                    "stream: generate_long starting token stream batch_idx={} stream_chunk_size={}",
+                    "stream: generate_long starting token stream batch_idx={} initial_stream_chunk_size={} stream_chunk_size={}",
                     batch_idx,
+                    initial_stream_chunk_size,
                     stream_chunk_size,
                 )
                 gen = generate(
@@ -894,6 +934,7 @@ def generate_long(
                     top_p=top_p,
                     top_k=top_k,
                     stream_chunk_size=stream_chunk_size,
+                    initial_stream_chunk_size=initial_stream_chunk_size,
                     compile=compile,
                 )
                 codes_list: list[torch.Tensor] = []
@@ -1082,8 +1123,9 @@ def launch_thread_safe_queue(
             put_count = 0
             if stream_tokens:
                 logger.info(
-                    "stream: worker got request req={} stream_chunk_size={}",
+                    "stream: worker got request req={} initial_stream_chunk_size={} stream_chunk_size={}",
                     req_tag,
+                    kwargs.get("initial_stream_chunk_size"),
                     kwargs.get("stream_chunk_size"),
                 )
 

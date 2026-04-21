@@ -97,7 +97,10 @@ class ServeTTSRequest(BaseModel):
     streaming: bool = False
     # When True, stream token chunks (low TTFA) instead of splitting text into batches
     stream_tokens: bool = False
-    stream_chunk_size: Annotated[int, conint(ge=1, le=200, strict=True)] = 20
+    # steady-state chunk size after the first emission
+    stream_chunk_size: Annotated[int, conint(ge=1, le=200, strict=True)] = 8
+    # first chunk is intentionally a bit larger so the browser/player has safer startup buffer
+    initial_stream_chunk_size: Annotated[int, conint(ge=1, le=200, strict=True)] = 10
     max_new_tokens: int = 512
     top_p: Annotated[float, Field(ge=0.1, le=1.0, strict=True)] = 0.8
     repetition_penalty: Annotated[float, Field(ge=0.9, le=2.0, strict=True)] = 1.1

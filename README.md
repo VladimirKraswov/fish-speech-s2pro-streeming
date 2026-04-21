@@ -59,6 +59,7 @@ Here are the official documents for Fish Audio S2, follow the instructions to ge
 - [Command Line Inference](https://speech.fish.audio/inference/#command-line-inference)
 - [WebUI Inference](https://speech.fish.audio/inference/#webui-inference)
 - [Server Inference](https://speech.fish.audio/server/)
+- [Realtime Streaming & Session Mode](docs/REALTIME_STREAMING.md)
 - [Docker Setup](https://speech.fish.audio/install/#docker-setup)
 
 > [!IMPORTANT]

@@ -6,7 +6,8 @@ from kui.asgi import HTTPException
 from fish_speech.inference_engine import TTSInferenceEngine
 from fish_speech.utils.schema import ServeTTSRequest
 
-AMPLITUDE = 32768  # Needs an explaination
+# float аудио в диапазоне [-1.0, 1.0] -> int16 PCM
+AMPLITUDE = 32768
 
 
 def inference_wrapper(req: ServeTTSRequest, engine: TTSInferenceEngine):
@@ -15,6 +16,7 @@ def inference_wrapper(req: ServeTTSRequest, engine: TTSInferenceEngine):
     Used in the API server.
     """
     count = 0
+
     for result in engine.inference(req):
         match result.code:
             case "header":
@@ -37,6 +39,12 @@ def inference_wrapper(req: ServeTTSRequest, engine: TTSInferenceEngine):
                     yield (result.audio[1] * AMPLITUDE).astype(np.int16).tobytes()
 
             case "final":
+                # В streaming-режиме final уже содержит весь звук целиком,
+                # а segment уже были отправлены ранее.
+                # Если отдать final ещё раз, пользователь услышит дубль.
+                if req.streaming:
+                    return None
+
                 count += 1
                 if isinstance(result.audio, tuple):
                     final = result.audio[1]
@@ -44,7 +52,7 @@ def inference_wrapper(req: ServeTTSRequest, engine: TTSInferenceEngine):
                         yield (final * AMPLITUDE).astype(np.int16).tobytes()
                     elif isinstance(final, (bytes, bytearray)):
                         yield bytes(final)
-                return None  # Stop the generator
+                return None
 
     if count == 0:
         raise HTTPException(

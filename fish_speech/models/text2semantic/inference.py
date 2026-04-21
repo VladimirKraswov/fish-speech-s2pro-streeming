@@ -37,6 +37,125 @@ def _to_normal_tensor(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         return t.detach().cpu().clone().to(t.device)
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip() in {"1", "true", "TRUE", "yes", "YES", "on", "ON"}
+
+
+def _normalize_cleanup_mode(cleanup_mode: str | None) -> str:
+    mode = (cleanup_mode or "request_end").strip().lower()
+    aliases = {
+        "default": "request_end",
+        "heavy": "request_end",
+        "request_end": "request_end",
+        "session_close": "request_end",
+        "idle": "session_idle",
+        "light": "session_idle",
+        "session_idle": "session_idle",
+        "keep_warm": "none",
+        "hot": "none",
+        "none": "none",
+    }
+    return aliases.get(mode, mode)
+
+
+def _light_cuda_cleanup() -> None:
+    if not torch.cuda.is_available():
+        return
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def _heavy_cuda_cleanup(
+    model: torch.nn.Module | None = None,
+) -> tuple[float | None, float | None]:
+    before_clear_gb = None
+    after_clear_gb = None
+
+    if torch.cuda.is_available():
+        before_clear_gb = round(torch.cuda.memory_allocated() / (1024**3), 2)
+
+    clear_caches_fn = getattr(model, "clear_caches", None) if model is not None else None
+    if clear_caches_fn is not None:
+        try:
+            clear_caches_fn()
+        except Exception as clear_err:
+            logger.warning("clear_caches failed: {}", clear_err)
+
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
+        after_clear_gb = round(torch.cuda.memory_allocated() / (1024**3), 2)
+
+    return before_clear_gb, after_clear_gb
+
+
+def _run_request_cleanup(
+    *,
+    model: torch.nn.Module,
+    cleanup_mode: str,
+    req_tag: str,
+    reason: str = "request_end",
+) -> None:
+    mode = _normalize_cleanup_mode(cleanup_mode)
+
+    if mode == "request_end":
+        logger.info(
+            "worker: post-request cleanup starting req={} mode={} reason={}",
+            req_tag,
+            mode,
+            reason,
+        )
+        before_clear_gb, after_clear_gb = _heavy_cuda_cleanup(model)
+        if before_clear_gb is not None:
+            logger.info(
+                "worker: clear_caches done alloc before={} GB after={} GB req={}",
+                before_clear_gb,
+                after_clear_gb,
+                req_tag,
+            )
+        return
+
+    if mode == "session_idle":
+        logger.info(
+            "worker: keeping model warm req={} mode={} reason={}",
+            req_tag,
+            mode,
+            reason,
+        )
+        if _env_flag("FISH_LIGHT_CUDA_CLEANUP_ON_SESSION_IDLE", True):
+            _light_cuda_cleanup()
+        return
+
+    if mode == "none":
+        logger.info(
+            "worker: skip cleanup req={} mode={} reason={}",
+            req_tag,
+            mode,
+            reason,
+        )
+        return
+
+    logger.warning(
+        "worker: unknown cleanup_mode='{}' for req={}, fallback to request_end",
+        cleanup_mode,
+        req_tag,
+    )
+    before_clear_gb, after_clear_gb = _heavy_cuda_cleanup(model)
+    if before_clear_gb is not None:
+        logger.info(
+            "worker: clear_caches done alloc before={} GB after={} GB req={}",
+            before_clear_gb,
+            after_clear_gb,
+            req_tag,
+        )
+
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
@@ -74,7 +193,7 @@ def multinomial_sample_one_no_sync(probs_sort):
     return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.int)
 
 
-RAS_WIN_SIZE = 10  # window for Repetition Aware Sampling
+RAS_WIN_SIZE = 10
 RAS_HIGH_TEMP = 1.0
 RAS_HIGH_TOP_P = 0.9
 
@@ -83,7 +202,7 @@ def logits_to_probs(
     logits,
     temperature: torch.Tensor,
     top_p: torch.Tensor,
-    top_k: int,  # 注意: 我看到你传进来的是 int，这很关键
+    top_k: int,
 ) -> torch.Tensor:
     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
     cum_probs = torch.cumsum(torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1)
@@ -91,14 +210,12 @@ def logits_to_probs(
     indices = torch.arange(sorted_logits.shape[-1], device=sorted_logits.device)
     top_k_mask = indices >= top_k
     sorted_indices_to_remove = (cum_probs > top_p) | top_k_mask
-    sorted_indices_to_remove[0] = False  # 单元素修改问题不大，或者写成 | (indices != 0)
+    sorted_indices_to_remove[0] = False
 
     indices_to_remove = sorted_indices_to_remove.scatter(
         dim=-1, index=sorted_indices, src=sorted_indices_to_remove
     )
-    logits = torch.where(
-        indices_to_remove, float("-Inf"), logits
-    )  # 同样替换 masked_fill_ 为 torch.where
+    logits = torch.where(indices_to_remove, float("-Inf"), logits)
     logits = logits / torch.clip(temperature, min=1e-5)
 
     probs = torch.nn.functional.softmax(logits, dim=-1)
@@ -139,18 +256,15 @@ def decode_one_token_ar(
         audio_masks=audio_masks,
         audio_parts=audio_parts,
     )
-    logits = forward_result.logits  # (1, 1, vocab_size)
+    logits = forward_result.logits
     hidden_states = forward_result.hidden_states
 
-    # Apply constrained decoding: only allow semantic tokens + im_end
     biased_logits = logits + semantic_logit_bias
 
-    # Normal sample
     main_token_normal = sample(
         biased_logits, temperature=temperature, top_p=top_p, top_k=top_k
     )[0]
 
-    # RAS: also sample with high temp to use as fallback if token repeats
     high_temp = torch.tensor(
         RAS_HIGH_TEMP, device=temperature.device, dtype=temperature.dtype
     )
@@ -159,10 +273,8 @@ def decode_one_token_ar(
         biased_logits, temperature=high_temp, top_p=high_top_p, top_k=top_k
     )[0]
 
-    # Use high-temp sample if: token is semantic AND token is in previous window
     if previous_tokens is not None:
         in_window = (previous_tokens[0] == main_token_normal).any()
-        # Use tensor ops (&, torch.where) instead of Python (and, if) — torch.compile requires no data-dependent branching
         is_semantic = (main_token_normal >= model.config.semantic_begin_id) & (
             main_token_normal <= model.config.semantic_end_id
         )
@@ -188,9 +300,8 @@ def decode_one_token_ar(
         )
         logits = model.forward_generate_fast(hidden_states, input_pos)
 
-        short_logits = logits  # DualAR predicts config.codebook_size number of tokens
+        short_logits = logits
 
-        # Convert logits to probs (no constrain for fast codebooks)
         a = sample(
             short_logits,
             temperature=temperature,
@@ -203,7 +314,6 @@ def decode_one_token_ar(
 
     codebooks = torch.stack(codebooks, dim=1)
 
-    # Only delete references, let Python GC handle cleanup
     del logits, hidden_states, forward_result
 
     return codebooks.T
@@ -223,23 +333,20 @@ def decode_n_tokens(
     decode_one_token=decode_one_token_ar,
     stream_chunk_size: Optional[int] = None,
     initial_stream_chunk_size: Optional[int] = None,
-    initial_token_chunk: Optional[torch.Tensor] = None,
     compile: bool = False,
 ) -> Iterator[torch.Tensor]:
     """
     Generate tokens autoregressively.
 
-    Non-streaming mode:
-      - yields once with the full tensor (backward compatible)
+    When stream_chunk_size is None, yields once with the full tensor (backward compatible).
+    When stream_chunk_size is set, yields token chunks for low-TTFA streaming.
 
-    Streaming mode:
-      - keeps the very first emitted chunk slightly larger than steady-state chunks,
-        so the browser/player has a safer startup buffer and starts playback earlier
-        without underrun.
+    `initial_stream_chunk_size` controls the very first streamed chunk size together with the
+    prefill token yielded by generate(). Because generate() already emits the first token, the
+    first chunk produced here is `initial_stream_chunk_size - 1`.
     """
+
     need_normal_state = stream_chunk_size is not None
-    # Streaming path: all state must be normal tensors (not inference tensors) so AOT
-    # inplace updates and stateful loop don't explode. Normalize once before loop.
     if need_normal_state:
         cur_token = cast(torch.Tensor, _to_normal_tensor(cur_token))
         input_pos = cast(torch.Tensor, _to_normal_tensor(input_pos))
@@ -251,8 +358,6 @@ def decode_n_tokens(
         if audio_parts is not None:
             audio_parts = _to_normal_tensor(audio_parts)
 
-    # Rolling window for RAS (Repetition Aware Sampling). Streaming: create as normal
-    # so we never do inplace on an inference tensor.
     _prev_zeros = torch.zeros(
         (model.config.num_codebooks + 1, RAS_WIN_SIZE),
         dtype=torch.int,
@@ -263,28 +368,16 @@ def decode_n_tokens(
         if need_normal_state
         else _prev_zeros
     )
-
     new_tokens: list[torch.Tensor] = []
-    first_chunk_emitted = stream_chunk_size is None
-
-    if stream_chunk_size is not None:
-        if initial_stream_chunk_size is None:
-            initial_stream_chunk_size = stream_chunk_size
-        initial_stream_chunk_size = max(1, int(initial_stream_chunk_size))
-        stream_chunk_size = max(1, int(stream_chunk_size))
-
-        if initial_token_chunk is not None:
-            if need_normal_state:
-                initial_token_chunk = cast(
-                    torch.Tensor, _to_normal_tensor(initial_token_chunk)
-                )
-            else:
-                initial_token_chunk = initial_token_chunk.detach().clone()
-            new_tokens.append(initial_token_chunk)
-
-    # [MODIFIED] Pre-fetch ID for efficiency loop
     im_end_id = model.tokenizer.get_token_id(IM_END_TOKEN)
     do_stream_log = stream_chunk_size is not None
+
+    current_stream_chunk_size: Optional[int] = None
+    if stream_chunk_size is not None:
+        if initial_stream_chunk_size is not None and initial_stream_chunk_size > 1:
+            current_stream_chunk_size = max(1, initial_stream_chunk_size - 1)
+        else:
+            current_stream_chunk_size = stream_chunk_size
 
     for i in tqdm(range(num_new_tokens)):
         if do_stream_log and i < 3:
@@ -294,9 +387,8 @@ def decode_n_tokens(
                 cur_token.shape,
                 input_pos.shape,
             )
+
         try:
-            # With torch.compile we must use MATH backend so Inductor can fuse attention kernels.
-            # Without compile, Flash/Triton is faster. FISH_SDPA_MATH=1 forces MATH when not compiling.
             use_math = compile or (
                 os.environ.get("FISH_SDPA_MATH", "").strip()
                 in ("1", "true", "TRUE", "yes", "YES")
@@ -337,9 +429,6 @@ def decode_n_tokens(
             )
             raise
 
-        # Streaming: normalize state before any inplace op (AOT fails on inference tensors).
-        # To debug: log tensor.is_inference() before/after (PyTorch 2.5+).
-        # Non-streaming: plain detach/clone.
         if need_normal_state:
             next_token = cast(torch.Tensor, _to_normal_tensor(next_token))
             input_pos = cast(torch.Tensor, _to_normal_tensor(input_pos + 1))
@@ -349,7 +438,6 @@ def decode_n_tokens(
                     next_token.view(1, model.config.num_codebooks + 1, -1)
                 ),
             )
-            # Normalize previous_tokens before inplace; then assign column.
             previous_tokens = cast(
                 torch.Tensor, _to_normal_tensor(previous_tokens.roll(-1, dims=1))
             )
@@ -363,24 +451,25 @@ def decode_n_tokens(
             previous_tokens[:, -1] = next_token.view(
                 model.config.num_codebooks + 1, -1
             )[:, 0].clone()
+
         new_tokens.append(next_token)
 
-        if stream_chunk_size is not None:
-            target_chunk_size = (
-                initial_stream_chunk_size if not first_chunk_emitted else stream_chunk_size
-            )
-            if len(new_tokens) >= target_chunk_size:
-                chunk_out = torch.cat(new_tokens, dim=1).detach().clone()
-                if do_stream_log:
-                    logger.info(
-                        "stream: decode_n_tokens yielding chunk shape={} after iter={} target_chunk_size={}",
-                        chunk_out.shape,
-                        i,
-                        target_chunk_size,
-                    )
-                yield chunk_out
-                new_tokens = []
-                first_chunk_emitted = True
+        if (
+            stream_chunk_size is not None
+            and current_stream_chunk_size is not None
+            and len(new_tokens) >= current_stream_chunk_size
+        ):
+            chunk_out = torch.cat(new_tokens, dim=1).detach().clone()
+            if do_stream_log:
+                logger.info(
+                    "stream: decode_n_tokens yielding chunk shape={} after iter={} target_chunk_size={}",
+                    chunk_out.shape,
+                    i,
+                    current_stream_chunk_size,
+                )
+            yield chunk_out
+            new_tokens = []
+            current_stream_chunk_size = stream_chunk_size
 
         if cur_token[0, 0, -1] == im_end_id:
             if do_stream_log:
@@ -398,7 +487,6 @@ def decode_n_tokens(
         yield remainder
 
 
-# Only no_grad(); inference_mode() causes AOT copy-back into inference tensors in streaming.
 @torch.no_grad()
 def generate(
     *,
@@ -415,7 +503,6 @@ def generate(
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
     """
 
-    # create an empty tensor of the expected final shape and fill in the current tokens
     T = prompt.size(1)
     prompt = prompt[None].repeat(num_samples, 1, 1)
 
@@ -436,15 +523,12 @@ def generate(
         max_new_tokens = T_new - T
 
     device = prompt.device
-    dtype = next(
-        model.parameters()
-    ).dtype  # model weight dtype (bfloat16), NOT prompt dtype (int32)
+    dtype = next(model.parameters()).dtype
 
-    # Critical fix: Only set up cache on first run or when necessary
     if not hasattr(model, "_cache_setup_done") or not model._cache_setup_done:
         with torch.device(device):
             model.setup_caches(
-                max_batch_size=1,  # Fixed to 1, avoid dynamic changes
+                max_batch_size=1,
                 max_seq_len=cache_len,
                 dtype=next(model.parameters()).dtype,
             )
@@ -452,7 +536,6 @@ def generate(
 
     codebook_dim = 1 + model.config.num_codebooks
 
-    # Create new tensor each time, but try to reuse memory
     input_pos = torch.arange(0, T, device=device, dtype=torch.long)
     empty = torch.empty((codebook_dim, cache_len), dtype=prompt.dtype, device=device)
     empty[:, :T] = prompt
@@ -465,23 +548,18 @@ def generate(
     temperature = torch.tensor(temp_val, device=device, dtype=dtype)
     top_p = torch.tensor(top_p_val, device=device, dtype=dtype)
 
-    # Build semantic logit bias: 0 for semantic tokens + im_end, -inf for all others
     vocab_size = model.config.vocab_size
     semantic_logit_bias = torch.full(
         (1, 1, vocab_size), float("-inf"), device=device, dtype=dtype
     )
 
-    # [MODIFIED] Use config for semantic range
     semantic_logit_bias[
         0, 0, model.config.semantic_begin_id : model.config.semantic_end_id + 1
     ] = 0.0
-
-    # [MODIFIED] Use tokenizer.get_token_id (Wrapper method)
     semantic_logit_bias[0, 0, model.tokenizer.get_token_id(IM_END_TOKEN)] = 0.0
 
     prefill_decode = decode_one_token_ar
 
-    # Mark seq dim dynamic so one compiled graph works for any prompt length (1..cache_len).
     x_prefill = prompt.view(1, codebook_dim, -1)
     if hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "mark_dynamic"):
         torch._dynamo.mark_dynamic(x_prefill, 2, min=1, max=cache_len)
@@ -509,7 +587,7 @@ def generate(
         model,
         first_token.view(1, codebook_dim, -1),
         input_pos,
-        max(0, max_new_tokens - 1),
+        max_new_tokens - 1,
         temperature=temperature,
         top_p=top_p,
         top_k=top_k_val,
@@ -519,54 +597,52 @@ def generate(
         decode_one_token=decode_one_token,
         stream_chunk_size=stream_chunk_size,
         initial_stream_chunk_size=initial_stream_chunk_size,
-        initial_token_chunk=first_token.clone() if stream_chunk_size is not None else None,
         compile=compile,
     )
 
     if stream_chunk_size is None:
-        # Non-streaming: single chunk from decode_n_tokens.
-        # When max_new_tokens == 1, decode_iter yields nothing, so just return the first token.
-        try:
-            x = next(iter(decode_iter))
-        except StopIteration:
-            seq = seq[:, : T + 1]
-            del first_token, prompt, empty, input_pos
-            return seq
+        x = next(iter(decode_iter))
         seq = seq[:, : T + 1 + x.size(1)]
         seq[:, T + 1 :] = x
         del first_token, x, prompt, empty, input_pos
         return seq
 
-    # Streaming: do NOT yield the single first token immediately.
-    # decode_n_tokens already buffers it and emits a larger first chunk.
-    return decode_iter
+    def _stream():
+        if initial_stream_chunk_size is not None and initial_stream_chunk_size > 1:
+            try:
+                first_rest = next(decode_iter)
+            except StopIteration:
+                yield first_token
+                return
+            yield torch.cat([first_token, first_rest], dim=1)
+        else:
+            yield first_token
+
+        yield from decode_iter
+
+    return _stream()
 
 
 def init_model(checkpoint_path, device, precision, compile=False):
     model = DualARTransformer.from_pretrained(checkpoint_path, load_weights=True)
 
     model = model.to(device=device, dtype=precision)
-    logger.info(f"Restored model from checkpoint")
+    logger.info("Restored model from checkpoint")
 
     if isinstance(model, DualARTransformer):
         decode_one_token = decode_one_token_ar
-        # prefill_n_tokens = decode_one_token_ar
         logger.info("Using DualARTransformer")
     else:
         raise ValueError("Unsupported model type")
 
-    # Pre-create fixed parameter tensors to avoid runtime creation
     model.fixed_temperature = torch.tensor(0.7, device=device, dtype=torch.float)
     model.fixed_top_p = torch.tensor(0.7, device=device, dtype=torch.float)
     model.fixed_repetition_penalty = torch.tensor(1.5, device=device, dtype=torch.float)
 
-    # Mark whether cache has been initialized
     model._cache_setup_done = False
 
     if compile:
         logger.info("Compiling function...")
-        # dynamic=True: one graph for variable prompt length (1..200+), avoid recompile on length change.
-        # If compile fails, try without dynamic=True; mark_dynamic() in generate() still helps.
         decode_one_token = torch.compile(
             decode_one_token,
             backend="inductor" if torch.cuda.is_available() else "aot_eager",
@@ -613,21 +689,19 @@ def encode_audio(audio_path, codec, device):
         wav = wav.mean(dim=0, keepdim=True)
     wav = torchaudio.functional.resample(wav.to(device), sr, codec.sample_rate)[0]
 
-    # Match codec model dtype (e.g. bfloat16)
     model_dtype = next(codec.parameters()).dtype
-    audios = wav[None, None].to(dtype=model_dtype)  # (1, 1, T)
+    audios = wav[None, None].to(dtype=model_dtype)
     audio_lengths = torch.tensor([len(wav)], device=device, dtype=torch.long)
 
     indices, feature_lengths = codec.encode(audios, audio_lengths)
-    return indices[0, :, : feature_lengths[0]]  # (num_codebooks, T)
+    return indices[0, :, : feature_lengths[0]]
 
 
 @torch.inference_mode()
 def decode_to_audio(codes, codec):
     """Decode VQ codes to audio waveform."""
-    # codes: (num_codebooks, T) -> (1, num_codebooks, T)
     audio = codec.from_indices(codes[None])
-    return audio[0, 0]  # (T,) mono waveform
+    return audio[0, 0]
 
 
 @dataclass
@@ -682,7 +756,6 @@ def split_text_by_bytes(text: str, max_bytes: int) -> list[str]:
         if len(encoded) <= max_bytes:
             chunks.append(remaining)
             break
-        # Cut at max_bytes; avoid splitting multi-byte UTF-8 codepoints
         cut = max_bytes
         while cut > 0 and (encoded[cut] & 0xC0) == 0x80:
             cut -= 1
@@ -747,8 +820,8 @@ def generate_long(
     prompt_text: Optional[Union[str, list[str]]] = None,
     prompt_tokens: Optional[Union[torch.Tensor, list[torch.Tensor]]] = None,
     stream_tokens: bool = False,
-    stream_chunk_size: int = 8,
-    initial_stream_chunk_size: int = 10,
+    stream_chunk_size: int = 20,
+    initial_stream_chunk_size: Optional[int] = None,
 ):
     assert 0 < top_p <= 1, "top_p must be in (0, 1]"
     assert 0 < temperature < 2, "temperature must be in (0, 2)"
@@ -770,11 +843,9 @@ def generate_long(
     tokenizer = model.tokenizer
     max_length = _cache_max_seq_len(model)
 
-    # Build base conversation with system message
     base_conversation = Conversation()
 
     if use_prompt:
-        # Auto-add speaker tags to prompt texts that don't have them
         tagged_prompt_text = []
         for i, t in enumerate(prompt_text):
             if not re.search(r"<\|speaker:\d+\|>", t):
@@ -793,7 +864,6 @@ def generate_long(
         system_parts.append(TextPart(text="\n\nSpeech:\n", cal_loss=False))
         all_codes = torch.cat([c for c in prompt_tokens], dim=1)
         system_parts.append(VQPart(codes=all_codes, cal_loss=False))
-        # torch.save(all_codes, "debug_vq_codes.pt")
     else:
         system_parts = [
             TextPart(text="convert the provided text to speech", cal_loss=False)
@@ -809,8 +879,6 @@ def generate_long(
         )
     )
 
-    # When stream_tokens=True: single batch (full text), yield token chunks from decode for low TTFA.
-    # Otherwise: split by speaker/chunk_length and run full generate() per batch.
     turns = split_text_by_speaker(text)
     if stream_tokens:
         batches = [text]
@@ -829,8 +897,6 @@ def generate_long(
             torch.cuda.synchronize()
 
         t0 = time.perf_counter()
-
-        # Deep copy base conversation for this sample
         conversation = deepcopy(base_conversation)
 
         for batch_idx, batch_text in enumerate(batches):
@@ -840,7 +906,6 @@ def generate_long(
             )
             logger.info(f"Batch text: {batch_text}")
 
-            # Add user message
             conversation.append(
                 Message(
                     role="user",
@@ -851,7 +916,6 @@ def generate_long(
                 )
             )
 
-            # Deep copy for generation (don't pollute original conversation)
             conversation_gen = deepcopy(conversation)
             conversation_gen.append(
                 Message(
@@ -883,7 +947,6 @@ def generate_long(
                     f"Audio masks non-zero count: {torch.count_nonzero(audio_masks)}"
                 )
 
-            # Prompt + generation must fit in cache (max_length = cache_max_seq_len).
             prompt_len = encoded.size(1)
             if prompt_len > max_length:
                 raise ValueError(
@@ -898,7 +961,7 @@ def generate_long(
                     prompt_len,
                     max_length,
                 )
-            # Optional hard cap for 32 GB VRAM: limit generation length to avoid OOM (e.g. FISH_MAX_NEW_TOKENS_CAP=80 with cache=384).
+
             cap_env = os.environ.get("FISH_MAX_NEW_TOKENS_CAP", "").strip()
             if cap_env:
                 try:
@@ -916,12 +979,11 @@ def generate_long(
             prompt_length = encoded.size(1)
 
             if stream_tokens:
-                # Token-level streaming: yield chunks as they're generated for low TTFA
                 logger.info(
-                    "stream: generate_long starting token stream batch_idx={} initial_stream_chunk_size={} stream_chunk_size={}",
+                    "stream: generate_long starting token stream batch_idx={} stream_chunk_size={} initial_stream_chunk_size={}",
                     batch_idx,
-                    initial_stream_chunk_size,
                     stream_chunk_size,
+                    initial_stream_chunk_size,
                 )
                 gen = generate(
                     model=model,
@@ -940,7 +1002,6 @@ def generate_long(
                 codes_list: list[torch.Tensor] = []
                 chunk_idx = 0
                 for chunk in gen:
-                    # chunk shape [11, K]; decoder expects codes as in current path (rows 1:)
                     codes_chunk = chunk[1:, :].clone()
                     if chunk_idx < 3:
                         logger.info(
@@ -955,11 +1016,13 @@ def generate_long(
                         )
                     codes_list.append(chunk)
                     chunk_idx += 1
+
                 logger.info(
                     "stream: generate_long finished chunk_idx={} total_chunks={}",
                     chunk_idx,
                     len(codes_list),
                 )
+
                 codes = (
                     torch.cat(codes_list, dim=1)[1:, :].clone() if codes_list else None
                 )
@@ -974,14 +1037,17 @@ def generate_long(
                             add_im_end=True,
                         )
                     )
+
                 codes_list.clear()
                 del codes_list
                 if codes is not None:
                     del codes
+
                 if sample_idx == 0 and batch_idx == 0 and compile:
                     logger.info(
                         f"Compilation time: {time.perf_counter() - t0:.2f} seconds"
                     )
+
                 del encoded
             else:
                 y = generate(
@@ -1113,20 +1179,60 @@ def launch_thread_safe_queue(
 
             kwargs = item.request
             req_tag = str(kwargs.pop("req_tag", "na"))
-            ack_queue = kwargs.pop(
-                "ack_queue", None
-            )  # back-pressure: wait for main to finish DAC before next LLM chunk
+            ack_queue = kwargs.pop("ack_queue", None)
             response_queue = item.response_queue
             t_req_start = time.perf_counter()
             t_last_put = t_req_start
             stream_tokens = kwargs.get("stream_tokens", False)
             put_count = 0
+            cleanup_mode = _normalize_cleanup_mode(
+                kwargs.pop("cleanup_mode", "request_end")
+            )
+            control = str(kwargs.pop("control", "")).strip().lower()
+            stream_empty_cache = kwargs.pop("stream_empty_cache", None)
+            if stream_empty_cache is None:
+                stream_empty_cache = _env_flag("FISH_STREAM_EMPTY_CACHE", False)
+            did_run_cleanup = False
+
+            if control == "cleanup":
+                try:
+                    logger.info(
+                        "worker: received control=cleanup req={} cleanup_mode={}",
+                        req_tag,
+                        cleanup_mode,
+                    )
+                    _run_request_cleanup(
+                        model=model,
+                        cleanup_mode="request_end",
+                        req_tag=req_tag,
+                        reason="control_cleanup",
+                    )
+                    did_run_cleanup = True
+                    response_queue.put(
+                        WrappedGenerateResponse(
+                            status="success",
+                            response=GenerateResponse(action="next"),
+                        )
+                    )
+                except Exception as e:
+                    logger.error(
+                        "worker: control cleanup failed req={} err={}",
+                        req_tag,
+                        e,
+                        exc_info=True,
+                    )
+                    response_queue.put(
+                        WrappedGenerateResponse(status="error", response=e)
+                    )
+                continue
+
             if stream_tokens:
                 logger.info(
-                    "stream: worker got request req={} initial_stream_chunk_size={} stream_chunk_size={}",
+                    "stream: worker got request req={} stream_chunk_size={} initial_stream_chunk_size={} cleanup_mode={}",
                     req_tag,
-                    kwargs.get("initial_stream_chunk_size"),
                     kwargs.get("stream_chunk_size"),
+                    kwargs.get("initial_stream_chunk_size"),
+                    cleanup_mode,
                 )
 
             try:
@@ -1161,7 +1267,7 @@ def launch_thread_safe_queue(
                             total_ms,
                             vram_s,
                         )
-                    # Send chunk with codes on CPU so queue/main never hold GPU tensors; avoids 24 GB stuck after request on 32 GB.
+
                     out = chunk
                     codes = getattr(chunk, "codes", None)
                     if codes is not None and codes.is_cuda:
@@ -1173,40 +1279,20 @@ def launch_thread_safe_queue(
                     response_queue.put(
                         WrappedGenerateResponse(status="success", response=out)
                     )
-                    # Back-pressure: wait for main thread to finish DAC decode so we don't run LLM and DAC on GPU at once (OOM on 32 GB).
+
                     if stream_tokens and ack_queue is not None:
                         ack_queue.get()
-                    # During streaming, free cache after each chunk to reduce fragmentation (32 GB often OOMs by mid-stream)
-                    if stream_tokens and torch.cuda.is_available():
+
+                    if stream_tokens and stream_empty_cache and torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
-                # Release KV cache and clear allocator so next request starts near baseline (avoids OOM on 32 GB).
-                logger.info("worker: post-request cleanup starting")
-                if torch.cuda.is_available():
-                    before_clear_gb = round(
-                        torch.cuda.memory_allocated() / (1024**3), 2
-                    )
-                clear_caches_fn = getattr(model, "clear_caches", None)
-                if clear_caches_fn is not None:
-                    try:
-                        clear_caches_fn()
-                        if torch.cuda.is_available():
-                            after_clear_gb = round(
-                                torch.cuda.memory_allocated() / (1024**3), 2
-                            )
-                            logger.info(
-                                "worker: clear_caches done alloc before={} GB after={} GB",
-                                before_clear_gb,
-                                after_clear_gb,
-                            )
-                    except Exception as clear_err:
-                        logger.warning("clear_caches failed: %s", clear_err)
-                if torch.cuda.is_available():
-                    gc.collect()
-                    torch.cuda.synchronize()
-                    torch.cuda.empty_cache()
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                _run_request_cleanup(
+                    model=model,
+                    cleanup_mode=cleanup_mode,
+                    req_tag=req_tag,
+                    reason="request_success",
+                )
+                did_run_cleanup = True
 
             except Exception as e:
                 logger.error(
@@ -1218,9 +1304,23 @@ def launch_thread_safe_queue(
                 )
                 logger.error(traceback.format_exc())
                 response_queue.put(WrappedGenerateResponse(status="error", response=e))
-                # Clear cache on error
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+
+            finally:
+                if not did_run_cleanup:
+                    try:
+                        _run_request_cleanup(
+                            model=model,
+                            cleanup_mode=cleanup_mode,
+                            req_tag=req_tag,
+                            reason="request_finally",
+                        )
+                    except Exception as cleanup_err:
+                        logger.warning(
+                            "worker: cleanup failed req={} cleanup_mode={} err={}",
+                            req_tag,
+                            cleanup_mode,
+                            cleanup_err,
+                        )
 
     threading.Thread(target=worker, daemon=True).start()
     init_event.wait()
@@ -1320,7 +1420,6 @@ def main(
     codec = None
     codec_checkpoint = checkpoint_path / "codec.pth"
 
-    # Handle prompt: --prompt-audio takes priority over --prompt-tokens
     prompt_tokens_list = None
     if prompt_audio:
         logger.info("Loading codec model for audio encoding...")
@@ -1368,7 +1467,6 @@ def main(
                 np.save(codes_npy_path, merged_codes.cpu().numpy())
                 logger.info(f"Saved codes to {codes_npy_path}")
 
-                # Decode to wav if --output is specified
                 if output:
                     if codec is None:
                         logger.info("Loading codec model for audio decoding...")
@@ -1384,7 +1482,7 @@ def main(
                     sf.write(out_path, audio.cpu().float().numpy(), codec.sample_rate)
                     logger.info(f"Saved audio to {out_path}")
 
-            logger.info(f"Next sample")
+            logger.info("Next sample")
             codes = []
             idx += 1
         else:

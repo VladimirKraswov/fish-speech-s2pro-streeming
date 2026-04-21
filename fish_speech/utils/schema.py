@@ -66,11 +66,10 @@ class ServeReferenceAudio(BaseModel):
         audio = values.get("audio")
         if (
             isinstance(audio, str) and len(audio) > 255
-        ):  # Check if audio is a string (Base64)
+        ):
             try:
                 values["audio"] = base64.b64decode(audio)
             except Exception:
-                # If the audio is not a valid base64 string, we will just ignore it and let the server handle it
                 pass
         return values
 
@@ -81,33 +80,59 @@ class ServeReferenceAudio(BaseModel):
 class ServeTTSRequest(BaseModel):
     text: str
     chunk_length: Annotated[int, conint(ge=100, le=300, strict=True)] = 200
+
     # Audio format
     format: Literal["wav", "pcm", "mp3"] = "wav"
+
     # References audios for in-context learning
     references: list[ServeReferenceAudio] = []
+
     # Reference id
     # For example, if you want use https://fish.audio/m/7f92f8afb8ec43bf81429cc1c9199cb1/
     # Just pass 7f92f8afb8ec43bf81429cc1c9199cb1
     reference_id: str | None = None
+
     seed: int | None = None
+
     use_memory_cache: Literal["on", "off"] = "off"
+
     # Normalize text for en & zh, this increase stability for numbers
     normalize: bool = True
+
     # not usually used below
     streaming: bool = False
+
     # When True, stream token chunks (low TTFA) instead of splitting text into batches
     stream_tokens: bool = False
-    # steady-state chunk size after the first emission
-    stream_chunk_size: Annotated[int, conint(ge=1, le=200, strict=True)] = 8
-    # first chunk is intentionally a bit larger so the browser/player has safer startup buffer
-    initial_stream_chunk_size: Annotated[int, conint(ge=1, le=200, strict=True)] = 10
+    stream_chunk_size: Annotated[int, conint(ge=1, le=200, strict=True)] = 20
+
+    # Optional larger first chunk.
+    # Example: initial_stream_chunk_size=10 and stream_chunk_size=8
+    # -> first emitted chunk tries to contain ~10 tokens, then subsequent chunks use 8.
+    initial_stream_chunk_size: int | None = Field(default=None, ge=1, le=200)
+
     max_new_tokens: int = 512
     top_p: Annotated[float, Field(ge=0.1, le=1.0, strict=True)] = 0.8
     repetition_penalty: Annotated[float, Field(ge=0.9, le=2.0, strict=True)] = 1.1
     temperature: Annotated[float, Field(ge=0.1, le=1.0, strict=True)] = 0.8
 
+    # Memory / lifecycle control for real-time session mode.
+    # request_end  -> heavy cleanup after request
+    # session_idle -> keep model hot, only light cleanup
+    # none         -> do not cleanup automatically
+    cleanup_mode: Literal["request_end", "session_idle", "none"] = "request_end"
+
+    # Optional fine-tuning of cleanup behavior during streaming.
+    # None -> use server/env default
+    # True -> call torch.cuda.empty_cache() after each streamed chunk
+    # False -> do not do per-chunk empty_cache
+    stream_empty_cache: bool | None = None
+
+    # Internal/service control command.
+    # Used by session mode to force heavy cleanup without restarting worker.
+    control: Literal["cleanup"] | None = None
+
     class Config:
-        # Allow arbitrary types for pytorch related types
         arbitrary_types_allowed = True
 
 

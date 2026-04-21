@@ -1,0 +1,1800 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Session Mode Stream Demo</title>
+  <style>
+    :root {
+      --bg: #0a1020;
+      --panel: #111a31;
+      --panel-2: #16213d;
+      --panel-3: #0d152b;
+      --border: #28365d;
+      --text: #e8efff;
+      --muted: #9cb0d8;
+      --accent: #7aa2ff;
+      --good: #4ade80;
+      --warn: #fbbf24;
+      --bad: #f87171;
+      --violet: #a78bfa;
+      --cyan: #22d3ee;
+      --pink: #f472b6;
+      --orange: #fb923c;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: linear-gradient(180deg, #0a1020 0%, #0b1226 100%);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    }
+
+    .wrap {
+      max-width: 1540px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: 28px;
+      line-height: 1.2;
+    }
+
+    .sub {
+      color: var(--muted);
+      margin-bottom: 18px;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 430px 1fr;
+      gap: 16px;
+      align-items: start;
+    }
+
+    .card {
+      background: rgba(17, 26, 49, 0.96);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 16px;
+      box-shadow: 0 12px 30px rgba(0, 0, 0, 0.22);
+    }
+
+    .card h2 {
+      margin: 0 0 12px;
+      font-size: 16px;
+      color: #d8e6ff;
+    }
+
+    .left-stack,
+    .right-stack {
+      display: grid;
+      gap: 16px;
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    .row-1 {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    label {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    input, select, textarea, button {
+      width: 100%;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 10px 12px;
+      font: inherit;
+      outline: none;
+    }
+
+    textarea {
+      min-height: 220px;
+      resize: vertical;
+      line-height: 1.45;
+    }
+
+    input:focus, select:focus, textarea:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(122, 162, 255, 0.12);
+    }
+
+    button {
+      cursor: pointer;
+      font-weight: 700;
+      transition: transform .05s ease, border-color .2s ease, opacity .2s ease;
+    }
+
+    button:hover { border-color: var(--accent); }
+    button:active { transform: translateY(1px); }
+
+    .good { background: #12301f; border-color: #1d5a34; }
+    .warn { background: #372c12; border-color: #6b5215; }
+    .bad { background: #3b1518; border-color: #6c2429; }
+    .secondary { background: #16203a; }
+
+    .buttons-3 {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+      margin-top: 10px;
+    }
+
+    .buttons-2 {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 10px;
+      margin-top: 10px;
+    }
+
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #64748b;
+      box-shadow: 0 0 0 4px rgba(100, 116, 139, 0.15);
+    }
+
+    .dot.ok { background: var(--good); box-shadow: 0 0 0 4px rgba(74, 222, 128, .15); }
+    .dot.warn { background: var(--warn); box-shadow: 0 0 0 4px rgba(251, 191, 36, .15); }
+    .dot.bad { background: var(--bad); box-shadow: 0 0 0 4px rgba(248, 113, 113, .15); }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    .stat {
+      border: 1px solid var(--border);
+      background: #121b33;
+      border-radius: 14px;
+      padding: 12px;
+    }
+
+    .stat .k {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .stat .v {
+      font-size: 17px;
+      font-weight: 800;
+    }
+
+    .preview,
+    .buffer-box,
+    .mini-log {
+      white-space: pre-wrap;
+      line-height: 1.5;
+      background: var(--panel-3);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 12px;
+    }
+
+    .preview {
+      min-height: 90px;
+    }
+
+    .buffer-box {
+      min-height: 120px;
+    }
+
+    .mini-log {
+      max-height: 210px;
+      overflow: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+
+    .log {
+      height: 320px;
+      overflow: auto;
+      white-space: pre-wrap;
+      background: #0b1328;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .pill-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    .pill {
+      display: inline-block;
+      padding: 4px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: #0f1730;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .meter {
+      height: 12px;
+      border-radius: 999px;
+      background: #0d1730;
+      border: 1px solid var(--border);
+      overflow: hidden;
+      margin-top: 8px;
+    }
+
+    .meter-fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, var(--cyan), var(--accent), var(--violet));
+      transition: width .12s ease;
+    }
+
+    .meter-labels {
+      margin-top: 6px;
+      display: flex;
+      justify-content: space-between;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .commit-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .commit-list {
+      display: grid;
+      gap: 10px;
+      max-height: 340px;
+      overflow: auto;
+      padding-right: 2px;
+    }
+
+    .commit {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 10px 12px;
+      background: #0f1730;
+    }
+
+    .commit-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 8px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .commit-text {
+      white-space: pre-wrap;
+      line-height: 1.45;
+      color: #dce8ff;
+      font-size: 14px;
+    }
+
+    .tag {
+      display: inline-block;
+      padding: 2px 7px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      border: 1px solid transparent;
+    }
+
+    .tag-punct {
+      color: #dbeafe;
+      background: rgba(34, 211, 238, .12);
+      border-color: rgba(34, 211, 238, .25);
+    }
+
+    .tag-hard {
+      color: #fde68a;
+      background: rgba(251, 191, 36, .12);
+      border-color: rgba(251, 191, 36, .25);
+    }
+
+    .tag-force {
+      color: #e9d5ff;
+      background: rgba(167, 139, 250, .12);
+      border-color: rgba(167, 139, 250, .25);
+    }
+
+    .tag-final {
+      color: #bbf7d0;
+      background: rgba(74, 222, 128, .12);
+      border-color: rgba(74, 222, 128, .25);
+    }
+
+    .muted {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .timeline-wrap {
+      overflow-x: auto;
+      padding-bottom: 4px;
+    }
+
+    .timeline {
+      display: flex;
+      align-items: stretch;
+      gap: 10px;
+      min-height: 120px;
+      min-width: max-content;
+      padding: 4px 2px 6px;
+    }
+
+    .timeline-item {
+      min-width: 160px;
+      max-width: 220px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: #0f1730;
+      padding: 10px 12px;
+      position: relative;
+      flex: 0 0 auto;
+    }
+
+    .timeline-item::after {
+      content: "";
+      position: absolute;
+      top: 50%;
+      right: -11px;
+      width: 12px;
+      height: 2px;
+      background: rgba(122, 162, 255, 0.35);
+      transform: translateY(-50%);
+    }
+
+    .timeline-item:last-child::after {
+      display: none;
+    }
+
+    .timeline-kind {
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: .02em;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }
+
+    .timeline-time {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .timeline-text {
+      font-size: 13px;
+      line-height: 1.4;
+      color: #dbe7ff;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .tk-delta { border-color: rgba(122,162,255,.25); background: rgba(122,162,255,.08); }
+    .tk-delta .timeline-kind { color: var(--accent); }
+
+    .tk-buffer { border-color: rgba(34,211,238,.25); background: rgba(34,211,238,.08); }
+    .tk-buffer .timeline-kind { color: var(--cyan); }
+
+    .tk-mirror_commit { border-color: rgba(167,139,250,.25); background: rgba(167,139,250,.08); }
+    .tk-mirror_commit .timeline-kind { color: var(--violet); }
+
+    .tk-actual_commit { border-color: rgba(251,191,36,.25); background: rgba(251,191,36,.08); }
+    .tk-actual_commit .timeline-kind { color: var(--warn); }
+
+    .tk-tts_started { border-color: rgba(244,114,182,.25); background: rgba(244,114,182,.08); }
+    .tk-tts_started .timeline-kind { color: var(--pink); }
+
+    .tk-first_audio { border-color: rgba(74,222,128,.25); background: rgba(74,222,128,.08); }
+    .tk-first_audio .timeline-kind { color: var(--good); }
+
+    .tk-tts_finished { border-color: rgba(251,146,60,.25); background: rgba(251,146,60,.08); }
+    .tk-tts_finished .timeline-kind { color: var(--orange); }
+
+    .chunk-lanes-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      background: #0b1328;
+      padding: 12px;
+    }
+
+    .chunk-lanes-canvas {
+      min-width: 1100px;
+    }
+
+    .chunk-axis {
+      position: relative;
+      height: 32px;
+      margin-bottom: 8px;
+      border-bottom: 1px dashed rgba(156,176,216,0.25);
+    }
+
+    .chunk-axis-tick {
+      position: absolute;
+      top: 0;
+      transform: translateX(-50%);
+      font-size: 10px;
+      color: var(--muted);
+    }
+
+    .chunk-axis-tick::after {
+      content: "";
+      display: block;
+      width: 1px;
+      height: 14px;
+      background: rgba(156,176,216,0.25);
+      margin: 4px auto 0;
+    }
+
+    .lane {
+      display: grid;
+      grid-template-columns: 280px 1fr;
+      gap: 12px;
+      align-items: stretch;
+      margin-bottom: 14px;
+    }
+
+    .lane:last-child {
+      margin-bottom: 0;
+    }
+
+    .lane-meta {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 10px 12px;
+      background: #0f1730;
+    }
+
+    .lane-id {
+      font-size: 12px;
+      font-weight: 800;
+      margin-bottom: 6px;
+      color: #dce8ff;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .lane-reason {
+      margin-bottom: 8px;
+    }
+
+    .lane-text {
+      font-size: 12px;
+      line-height: 1.45;
+      color: var(--muted);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .lane-track {
+      position: relative;
+      min-height: 86px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.015), rgba(255,255,255,0)),
+        repeating-linear-gradient(
+          to right,
+          transparent 0,
+          transparent 99px,
+          rgba(156,176,216,0.06) 100px
+        );
+      overflow: hidden;
+    }
+
+    .lane-midline {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 50%;
+      height: 2px;
+      background: rgba(122,162,255,0.18);
+      transform: translateY(-50%);
+    }
+
+    .lane-event {
+      position: absolute;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+      pointer-events: none;
+    }
+
+    .lane-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 999px;
+      border: 2px solid rgba(255,255,255,0.15);
+      background: #7c8aa8;
+      box-shadow: 0 0 0 5px rgba(124,138,168,0.08);
+    }
+
+    .lane-label {
+      font-size: 11px;
+      line-height: 1.2;
+      color: #dbe7ff;
+      white-space: nowrap;
+      padding: 4px 7px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(10,16,32,0.88);
+    }
+
+    .lane-event.queued .lane-dot { background: var(--warn); box-shadow: 0 0 0 5px rgba(251,191,36,0.10); }
+    .lane-event.tts_started .lane-dot { background: var(--pink); box-shadow: 0 0 0 5px rgba(244,114,182,0.10); }
+    .lane-event.first_audio .lane-dot { background: var(--good); box-shadow: 0 0 0 5px rgba(74,222,128,0.10); }
+    .lane-event.tts_finished .lane-dot { background: var(--orange); box-shadow: 0 0 0 5px rgba(251,146,60,0.10); }
+
+    @media (max-width: 1160px) {
+      .layout { grid-template-columns: 1fr; }
+      .stats { grid-template-columns: repeat(2, 1fr); }
+      .commit-grid { grid-template-columns: 1fr; }
+      .lane { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Session Mode demo: поток текста, буфер, коммиты и таймлайны по chunk_id</h1>
+    <div class="sub">
+      Эта страница имитирует стриминг текста от LLM, показывает локальное зеркало буфера, реальные коммиты от session_mode и отдельные дорожки для каждого чанка озвучки.
+    </div>
+
+    <div class="layout">
+      <div class="left-stack">
+        <div class="card">
+          <h2>Подключение</h2>
+
+          <div class="row-1">
+            <div>
+              <label for="wsUrl">WebSocket URL</label>
+              <input id="wsUrl" type="text" />
+            </div>
+          </div>
+
+          <div class="row">
+            <div>
+              <label for="ttsBaseUrl">TTS base_url</label>
+              <input id="ttsBaseUrl" type="text" value="http://127.0.0.1:8080" />
+            </div>
+            <div>
+              <label for="cleanupMode">cleanup_mode</label>
+              <select id="cleanupMode">
+                <option value="session_idle" selected>session_idle</option>
+                <option value="request_end">request_end</option>
+                <option value="none">none</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="row">
+            <div>
+              <label for="streamChunkSize">stream_chunk_size</label>
+              <input id="streamChunkSize" type="number" min="1" max="200" value="8" />
+            </div>
+            <div>
+              <label for="minWords">buffer.min_words</label>
+              <input id="minWords" type="number" min="1" max="32" value="3" />
+            </div>
+          </div>
+
+          <div class="row">
+            <div>
+              <label for="softLimit">buffer.soft_limit_chars</label>
+              <input id="softLimit" type="number" min="16" max="2000" value="120" />
+            </div>
+            <div>
+              <label for="hardLimit">buffer.hard_limit_chars</label>
+              <input id="hardLimit" type="number" min="16" max="4000" value="220" />
+            </div>
+          </div>
+
+          <div class="buttons-3">
+            <button id="connectBtn" class="good">Подключить</button>
+            <button id="disconnectBtn" class="secondary">Отключить</button>
+            <button id="cleanupBtn" class="warn">Cleanup</button>
+          </div>
+
+          <div class="muted" style="margin-top:10px;">
+            После подключения страница отправляет <code>start_session</code> и <code>patch_config</code>.
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Имитация LLM</h2>
+
+          <div class="row">
+            <div>
+              <label for="initialMin">Стартовая задержка min, мс</label>
+              <input id="initialMin" type="number" min="0" max="10000" value="180" />
+            </div>
+            <div>
+              <label for="initialMax">Стартовая задержка max, мс</label>
+              <input id="initialMax" type="number" min="0" max="10000" value="450" />
+            </div>
+          </div>
+
+          <div class="row">
+            <div>
+              <label for="deltaMin">Пауза между дельтами min, мс</label>
+              <input id="deltaMin" type="number" min="0" max="3000" value="35" />
+            </div>
+            <div>
+              <label for="deltaMax">Пауза между дельтами max, мс</label>
+              <input id="deltaMax" type="number" min="0" max="3000" value="110" />
+            </div>
+          </div>
+
+          <div class="row">
+            <div>
+              <label for="punctExtraMin">Доп. пауза на пунктуации min, мс</label>
+              <input id="punctExtraMin" type="number" min="0" max="3000" value="60" />
+            </div>
+            <div>
+              <label for="punctExtraMax">Доп. пауза на пунктуации max, мс</label>
+              <input id="punctExtraMax" type="number" min="0" max="3000" value="180" />
+            </div>
+          </div>
+
+          <div class="row">
+            <div>
+              <label for="chunkMinWords">Слов в одной дельте min</label>
+              <input id="chunkMinWords" type="number" min="1" max="20" value="1" />
+            </div>
+            <div>
+              <label for="chunkMaxWords">Слов в одной дельте max</label>
+              <input id="chunkMaxWords" type="number" min="1" max="20" value="3" />
+            </div>
+          </div>
+
+          <div class="buttons-2">
+            <button id="startBtn" class="good">Старт симуляции</button>
+            <button id="stopBtn" class="bad">Стоп</button>
+          </div>
+
+          <div class="buttons-2">
+            <button id="flushBtn" class="secondary">Flush</button>
+            <button id="clearLogBtn" class="secondary">Очистить лог</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="right-stack">
+        <div class="card">
+          <div class="status">
+            <span id="statusDot" class="dot"></span>
+            <span id="statusText">Не подключено</span>
+          </div>
+
+          <div class="stats">
+            <div class="stat">
+              <div class="k">Session ID</div>
+              <div id="sessionId" class="v" style="font-size:13px;">—</div>
+            </div>
+            <div class="stat">
+              <div class="k">Дельт отправлено</div>
+              <div id="sentDeltas" class="v">0</div>
+            </div>
+            <div class="stat">
+              <div class="k">Actual commits</div>
+              <div id="actualCommitsCount" class="v">0</div>
+            </div>
+            <div class="stat">
+              <div class="k">Аудио чанков</div>
+              <div id="audioChunks" class="v">0</div>
+            </div>
+            <div class="stat">
+              <div class="k">TTFA</div>
+              <div id="ttfa" class="v">—</div>
+            </div>
+          </div>
+
+          <div class="pill-row">
+            <span class="pill" id="audioInfo">audio: —</span>
+            <span class="pill" id="queueInfo">scheduled: 0.000s</span>
+            <span class="pill" id="simInfo">sim: idle</span>
+            <span class="pill" id="mirrorInfo">mirror buffer: 0 chars</span>
+          </div>
+
+          <div class="row-1">
+            <div>
+              <label for="sourceText">Текст, который “генерирует LLM”</label>
+              <textarea id="sourceText">Привет. Сейчас мы имитируем поток текста от языковой модели. Текст будет идти небольшими случайными дельтами, как будто большая модель постепенно размышляет и печатает ответ. А session_mode будет накапливать буфер, коммитить готовые куски и сразу же отправлять их в TTS. Поэтому здесь особенно важно визуально видеть не только сам поток текста, но и текущий буфер, и момент, когда он превращается в отдельный commit для озвучивания. Это помогает быстро подобрать правильные границы чанков и уменьшить ощущение задержки в живом диалоге.</textarea>
+            </div>
+          </div>
+
+          <div class="row">
+            <div>
+              <label>Что уже “сгенерировал LLM”</label>
+              <div id="preview" class="preview"></div>
+            </div>
+            <div>
+              <label>Локальное зеркало буфера</label>
+              <div id="bufferBox" class="buffer-box"></div>
+              <div class="meter">
+                <div id="bufferFill" class="meter-fill"></div>
+              </div>
+              <div class="meter-labels">
+                <span id="bufferMeterLeft">0 chars</span>
+                <span id="bufferMeterRight">hard limit 220</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="row-1">
+            <div>
+              <label>Общий таймлайн событий</label>
+              <div class="timeline-wrap">
+                <div id="timeline" class="timeline"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="row-1">
+            <div>
+              <label>Chunk lanes</label>
+              <div class="chunk-lanes-wrap">
+                <div id="chunkLanesCanvas" class="chunk-lanes-canvas"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="commit-grid">
+            <div>
+              <label>Mirror commits в браузере</label>
+              <div id="mirrorCommits" class="commit-list"></div>
+            </div>
+            <div>
+              <label>Actual commits от session_mode</label>
+              <div id="actualCommits" class="commit-list"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Лог</h2>
+          <div id="log" class="log"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function defaultWsUrl() {
+      if (location.protocol === "https:") {
+        return `wss://${location.hostname}:8765/ws`;
+      }
+      return `ws://${location.hostname}:8765/ws`;
+    }
+
+    const els = {
+      wsUrl: document.getElementById("wsUrl"),
+      ttsBaseUrl: document.getElementById("ttsBaseUrl"),
+      cleanupMode: document.getElementById("cleanupMode"),
+      streamChunkSize: document.getElementById("streamChunkSize"),
+      minWords: document.getElementById("minWords"),
+      softLimit: document.getElementById("softLimit"),
+      hardLimit: document.getElementById("hardLimit"),
+
+      initialMin: document.getElementById("initialMin"),
+      initialMax: document.getElementById("initialMax"),
+      deltaMin: document.getElementById("deltaMin"),
+      deltaMax: document.getElementById("deltaMax"),
+      punctExtraMin: document.getElementById("punctExtraMin"),
+      punctExtraMax: document.getElementById("punctExtraMax"),
+      chunkMinWords: document.getElementById("chunkMinWords"),
+      chunkMaxWords: document.getElementById("chunkMaxWords"),
+
+      sourceText: document.getElementById("sourceText"),
+      preview: document.getElementById("preview"),
+      bufferBox: document.getElementById("bufferBox"),
+      bufferFill: document.getElementById("bufferFill"),
+      bufferMeterLeft: document.getElementById("bufferMeterLeft"),
+      bufferMeterRight: document.getElementById("bufferMeterRight"),
+      mirrorCommits: document.getElementById("mirrorCommits"),
+      actualCommits: document.getElementById("actualCommits"),
+      timeline: document.getElementById("timeline"),
+      chunkLanesCanvas: document.getElementById("chunkLanesCanvas"),
+
+      connectBtn: document.getElementById("connectBtn"),
+      disconnectBtn: document.getElementById("disconnectBtn"),
+      cleanupBtn: document.getElementById("cleanupBtn"),
+      startBtn: document.getElementById("startBtn"),
+      stopBtn: document.getElementById("stopBtn"),
+      flushBtn: document.getElementById("flushBtn"),
+      clearLogBtn: document.getElementById("clearLogBtn"),
+
+      statusDot: document.getElementById("statusDot"),
+      statusText: document.getElementById("statusText"),
+      sessionId: document.getElementById("sessionId"),
+      sentDeltas: document.getElementById("sentDeltas"),
+      actualCommitsCount: document.getElementById("actualCommitsCount"),
+      audioChunks: document.getElementById("audioChunks"),
+      ttfa: document.getElementById("ttfa"),
+      audioInfo: document.getElementById("audioInfo"),
+      queueInfo: document.getElementById("queueInfo"),
+      simInfo: document.getElementById("simInfo"),
+      mirrorInfo: document.getElementById("mirrorInfo"),
+      log: document.getElementById("log"),
+    };
+
+    els.wsUrl.value = defaultWsUrl();
+
+    const state = {
+      ws: null,
+      connected: false,
+      sessionId: null,
+
+      audioCtx: null,
+      playback: {
+        nextStartTime: 0
+      },
+
+      simRunning: false,
+      stopRequested: false,
+
+      sentDeltas: 0,
+      audioChunks: 0,
+      actualCommitsCount: 0,
+
+      firstDeltaSentAt: 0,
+      firstAudioAt: 0,
+
+      audioMeta: {
+        sampleRate: 44100,
+        channels: 1,
+        format: "pcm"
+      },
+
+      previewText: "",
+      mirror: {
+        buffer: "",
+        commits: []
+      },
+
+      actualCommits: [],
+      timeline: [],
+
+      pendingAudioEvent: null,
+      chunkLanes: new Map()
+    };
+
+    function nowMs() {
+      return performance.now();
+    }
+
+    function randInt(min, max) {
+      min = Number(min);
+      max = Number(max);
+      if (max < min) [min, max] = [max, min];
+      return Math.floor(min + Math.random() * (max - min + 1));
+    }
+
+    function sleep(ms) {
+      return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    function log(line) {
+      const ts = new Date().toLocaleTimeString("ru-RU", { hour12: false });
+      els.log.textContent += `[${ts}] ${line}\n`;
+      els.log.scrollTop = els.log.scrollHeight;
+    }
+
+    function truncate(s, n) {
+      return s.length > n ? s.slice(0, n) + "…" : s;
+    }
+
+    function setStatus(kind, text) {
+      els.statusDot.className = `dot ${kind}`;
+      els.statusText.textContent = text;
+    }
+
+    function refreshStats() {
+      els.sessionId.textContent = state.sessionId || "—";
+      els.sentDeltas.textContent = String(state.sentDeltas);
+      els.audioChunks.textContent = String(state.audioChunks);
+      els.actualCommitsCount.textContent = String(state.actualCommitsCount);
+      els.audioInfo.textContent =
+        `audio: ${state.audioMeta.format} ${state.audioMeta.sampleRate}Hz ch=${state.audioMeta.channels}`;
+
+      const ctx = state.audioCtx;
+      if (ctx) {
+        const scheduled = Math.max(0, state.playback.nextStartTime - ctx.currentTime);
+        els.queueInfo.textContent = `scheduled: ${scheduled.toFixed(3)}s`;
+      } else {
+        els.queueInfo.textContent = "scheduled: 0.000s";
+      }
+
+      const hardLimit = Number(els.hardLimit.value);
+      const chars = state.mirror.buffer.length;
+      const pct = Math.max(0, Math.min(100, (chars / Math.max(1, hardLimit)) * 100));
+      els.bufferFill.style.width = `${pct}%`;
+      els.bufferMeterLeft.textContent = `${chars} chars`;
+      els.bufferMeterRight.textContent = `hard limit ${hardLimit}`;
+      els.mirrorInfo.textContent = `mirror buffer: ${chars} chars`;
+    }
+
+    function resetRunMetrics() {
+      state.sentDeltas = 0;
+      state.audioChunks = 0;
+      state.actualCommitsCount = 0;
+      state.firstDeltaSentAt = 0;
+      state.firstAudioAt = 0;
+      state.previewText = "";
+      state.mirror.buffer = "";
+      state.mirror.commits = [];
+      state.actualCommits = [];
+      state.timeline = [];
+      state.chunkLanes = new Map();
+      state.pendingAudioEvent = null;
+      state.playback.nextStartTime = state.audioCtx ? state.audioCtx.currentTime : 0;
+      els.ttfa.textContent = "—";
+      renderPreview();
+      renderBuffer();
+      renderMirrorCommits();
+      renderActualCommits();
+      renderTimeline();
+      renderChunkLanes();
+      refreshStats();
+    }
+
+    function renderPreview() {
+      els.preview.textContent = state.previewText;
+    }
+
+    function renderBuffer() {
+      els.bufferBox.textContent = state.mirror.buffer || "—";
+      refreshStats();
+    }
+
+    function tagClass(reason) {
+      if (reason === "punct") return "tag tag-punct";
+      if (reason === "hard_limit") return "tag tag-hard";
+      if (reason === "force") return "tag tag-force";
+      if (reason === "final") return "tag tag-final";
+      return "tag";
+    }
+
+    function commitCardHTML(item) {
+      return `
+        <div class="commit">
+          <div class="commit-head">
+            <span class="${tagClass(item.reason)}">${item.reason}</span>
+            <span>${item.chars} chars · ${item.words} words</span>
+          </div>
+          <div class="commit-text">${escapeHtml(item.text)}</div>
+        </div>
+      `;
+    }
+
+    function renderMirrorCommits() {
+      els.mirrorCommits.innerHTML =
+        state.mirror.commits.length
+          ? state.mirror.commits.slice().reverse().map(commitCardHTML).join("")
+          : `<div class="mini-log">Пока нет mirror commits.</div>`;
+    }
+
+    function renderActualCommits() {
+      els.actualCommits.innerHTML =
+        state.actualCommits.length
+          ? state.actualCommits.slice().reverse().map(commitCardHTML).join("")
+          : `<div class="mini-log">Пока нет actual commits от session_mode.</div>`;
+    }
+
+    function renderTimeline() {
+      if (!state.timeline.length) {
+        els.timeline.innerHTML = `<div class="mini-log" style="min-width:320px;">Таймлайн пока пуст.</div>`;
+        return;
+      }
+
+      els.timeline.innerHTML = state.timeline.map(item => `
+        <div class="timeline-item tk-${escapeHtml(item.kind)}">
+          <div class="timeline-kind">${escapeHtml(item.kind)}</div>
+          <div class="timeline-time">+${item.t.toFixed(0)} ms</div>
+          <div class="timeline-text">${escapeHtml(item.text)}</div>
+        </div>
+      `).join("");
+
+      els.timeline.parentElement.scrollLeft = els.timeline.parentElement.scrollWidth;
+    }
+
+    function renderChunkLanes() {
+      if (!state.chunkLanes.size) {
+        els.chunkLanesCanvas.innerHTML = `<div class="mini-log">Пока нет chunk дорожек.</div>`;
+        return;
+      }
+
+      const lanes = [...state.chunkLanes.values()];
+      const maxT = Math.max(
+        1000,
+        ...lanes.flatMap(l => l.events.map(e => e.t))
+      );
+
+      const widthPx = Math.max(1100, maxT * 0.22);
+      const tickStep = pickTickStep(maxT);
+
+      let axisHtml = `<div class="chunk-axis" style="width:${widthPx}px;">`;
+      for (let t = 0; t <= maxT; t += tickStep) {
+        const left = (t / maxT) * widthPx;
+        axisHtml += `
+          <div class="chunk-axis-tick" style="left:${left}px;">
+            ${Math.round(t)} ms
+          </div>
+        `;
+      }
+      axisHtml += `</div>`;
+
+      const lanesHtml = lanes.map(lane => {
+        const eventsHtml = lane.events.map(ev => {
+          const left = (ev.t / maxT) * widthPx;
+          return `
+            <div class="lane-event ${escapeHtml(ev.kind)}" style="left:${left}px;">
+              <div class="lane-dot"></div>
+              <div class="lane-label">${escapeHtml(ev.kind)} · ${Math.round(ev.t)}ms</div>
+            </div>
+          `;
+        }).join("");
+
+        return `
+          <div class="lane">
+            <div class="lane-meta">
+              <div class="lane-id">${escapeHtml(lane.chunkId)}</div>
+              <div class="lane-reason">
+                <span class="${tagClass(lane.reason || "force")}">${escapeHtml(lane.reason || "-")}</span>
+              </div>
+              <div class="lane-text">${escapeHtml(lane.text || "")}</div>
+            </div>
+            <div class="lane-track" style="width:${widthPx}px;">
+              <div class="lane-midline"></div>
+              ${eventsHtml}
+            </div>
+          </div>
+        `;
+      }).join("");
+
+      els.chunkLanesCanvas.innerHTML = axisHtml + lanesHtml;
+    }
+
+    function pickTickStep(maxT) {
+      if (maxT <= 1500) return 200;
+      if (maxT <= 3000) return 500;
+      if (maxT <= 8000) return 1000;
+      if (maxT <= 15000) return 2000;
+      return 5000;
+    }
+
+    function pushTimeline(kind, text) {
+      const base = state.firstDeltaSentAt || nowMs();
+      state.timeline.push({
+        kind,
+        text: truncate(text, 120),
+        t: nowMs() - base
+      });
+
+      if (state.timeline.length > 80) {
+        state.timeline = state.timeline.slice(-80);
+      }
+
+      renderTimeline();
+    }
+
+    function ensureChunkLane(chunkId, extra = {}) {
+      if (!chunkId) return null;
+
+      if (!state.chunkLanes.has(chunkId)) {
+        state.chunkLanes.set(chunkId, {
+          chunkId,
+          text: extra.text || "",
+          reason: extra.reason || "",
+          traceId: extra.traceId || null,
+          events: []
+        });
+      }
+
+      const lane = state.chunkLanes.get(chunkId);
+      if (extra.text && !lane.text) lane.text = extra.text;
+      if (extra.reason && !lane.reason) lane.reason = extra.reason;
+      if (extra.traceId && !lane.traceId) lane.traceId = extra.traceId;
+      return lane;
+    }
+
+    function pushChunkEvent(chunkId, kind, label, extra = {}) {
+      const lane = ensureChunkLane(chunkId, extra);
+      if (!lane) return;
+
+      const base = state.firstDeltaSentAt || nowMs();
+      if (kind === "first_audio" && lane.events.some(e => e.kind === "first_audio")) {
+        return;
+      }
+
+      lane.events.push({
+        kind,
+        label,
+        t: nowMs() - base
+      });
+
+      lane.events.sort((a, b) => a.t - b.t);
+      renderChunkLanes();
+    }
+
+    function escapeHtml(s) {
+      return String(s)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;");
+    }
+
+    async function ensureAudio() {
+      if (!state.audioCtx) {
+        state.audioCtx = new (window.AudioContext || window.webkitAudioContext)({
+          latencyHint: "interactive"
+        });
+      }
+      if (state.audioCtx.state !== "running") {
+        await state.audioCtx.resume();
+      }
+      refreshStats();
+    }
+
+    function countWords(text) {
+      const cleaned = text.replace(/<\|speaker:\d+\|>/g, " ");
+      const m = cleaned.match(/\S+/g);
+      return m ? m.length : 0;
+    }
+
+    function trimLeft(text) {
+      return text.replace(/^\s+/, "");
+    }
+
+    function trimRight(text) {
+      return text.replace(/\s+$/, "");
+    }
+
+    function smartJoin(left, right) {
+      if (!left) return right;
+      if (!right) return left;
+      if (/\s$/.test(left) || /^\s/.test(right)) return left + right;
+      if (/^[,.!?;:)\]}]/.test(right)) return left + right;
+      if (/[([{]$/.test(left)) return left + right;
+      return left + " " + right;
+    }
+
+    function findLastRegexBefore(regex, text, limit) {
+      const sub = text.slice(0, limit);
+      let last = null;
+      regex.lastIndex = 0;
+      let match;
+      while ((match = regex.exec(sub)) !== null) {
+        last = match.index + match[0].length;
+      }
+      return last;
+    }
+
+    function findLastWhitespaceBefore(text, limit) {
+      let last = null;
+      for (let i = 0; i < Math.min(limit, text.length); i++) {
+        if (/\s/.test(text[i])) last = i + 1;
+      }
+      return last;
+    }
+
+    function extractChunkFromBuffer(text, opts) {
+      const { minWords, softLimitChars, hardLimitChars, force, final } = opts;
+
+      if (!text || !text.trim()) {
+        return { chunk: null, remaining: "", reason: null };
+      }
+
+      const raw = text;
+      const words = countWords(raw);
+      const chars = raw.length;
+
+      if (!force && !final) {
+        if (words < minWords && chars < softLimitChars) {
+          return { chunk: null, remaining: raw, reason: null };
+        }
+      }
+
+      const stripped = raw.replace(/\s+$/, "");
+      if (final) {
+        return { chunk: stripped, remaining: "", reason: "final" };
+      }
+
+      const preferredLimit = Math.min(chars, hardLimitChars);
+
+      const preferredPunct = /[.!?…;\n]/g;
+      const punctCut = findLastRegexBefore(preferredPunct, raw, preferredLimit);
+      if (punctCut !== null) {
+        const chunk = trimRight(raw.slice(0, punctCut));
+        const rest = trimLeft(raw.slice(punctCut));
+        if (chunk && (countWords(chunk) >= minWords || force)) {
+          return { chunk, remaining: rest, reason: "punct" };
+        }
+      }
+
+      const secondaryPunct = /[,:]/g;
+      const secondaryCut = findLastRegexBefore(secondaryPunct, raw, preferredLimit);
+      if (secondaryCut !== null && chars >= softLimitChars) {
+        const chunk = trimRight(raw.slice(0, secondaryCut));
+        const rest = trimLeft(raw.slice(secondaryCut));
+        if (chunk && (countWords(chunk) >= minWords || force)) {
+          return { chunk, remaining: rest, reason: "punct" };
+        }
+      }
+
+      if (force && stripped) {
+        return { chunk: stripped, remaining: "", reason: "force" };
+      }
+
+      if (chars >= hardLimitChars) {
+        const wsCut = findLastWhitespaceBefore(raw, hardLimitChars);
+        const cut = wsCut || hardLimitChars;
+        const chunk = trimRight(raw.slice(0, cut));
+        const rest = trimLeft(raw.slice(cut));
+        if (chunk) {
+          return { chunk, remaining: rest, reason: "hard_limit" };
+        }
+      }
+
+      if (stripped && /[.!?…;:]$/.test(stripped) && countWords(stripped) >= minWords) {
+        return { chunk: stripped, remaining: "", reason: "punct" };
+      }
+
+      if (chars >= softLimitChars) {
+        const wsCut = findLastWhitespaceBefore(raw, Math.min(chars, softLimitChars));
+        if (wsCut !== null) {
+          const chunk = trimRight(raw.slice(0, wsCut));
+          const rest = trimLeft(raw.slice(wsCut));
+          if (chunk && (countWords(chunk) >= minWords || force)) {
+            return { chunk, remaining: rest, reason: "force" };
+          }
+        }
+      }
+
+      return { chunk: null, remaining: raw, reason: null };
+    }
+
+    function applyMirrorDelta(text, final) {
+      state.mirror.buffer = smartJoin(state.mirror.buffer, text);
+      pushTimeline("buffer", `buffer = ${state.mirror.buffer.length} chars`);
+
+      const optsBase = {
+        minWords: Number(els.minWords.value),
+        softLimitChars: Number(els.softLimit.value),
+        hardLimitChars: Number(els.hardLimit.value)
+      };
+
+      let keepLooping = true;
+      while (keepLooping) {
+        const res = extractChunkFromBuffer(state.mirror.buffer, {
+          ...optsBase,
+          force: false,
+          final: false
+        });
+
+        if (!res.chunk || !res.reason) {
+          keepLooping = false;
+        } else {
+          state.mirror.buffer = res.remaining;
+          state.mirror.commits.push({
+            text: res.chunk,
+            reason: res.reason,
+            chars: res.chunk.length,
+            words: countWords(res.chunk)
+          });
+          pushTimeline("mirror_commit", `${res.reason}: ${res.chunk}`);
+        }
+      }
+
+      if (final) {
+        while (true) {
+          const res = extractChunkFromBuffer(state.mirror.buffer, {
+            ...optsBase,
+            force: true,
+            final: !state.mirror.buffer.trim() ? false : true
+          });
+
+          if (!res.chunk || !res.reason) break;
+
+          state.mirror.buffer = res.remaining;
+          state.mirror.commits.push({
+            text: res.chunk,
+            reason: res.reason,
+            chars: res.chunk.length,
+            words: countWords(res.chunk)
+          });
+          pushTimeline("mirror_commit", `${res.reason}: ${res.chunk}`);
+
+          if (!state.mirror.buffer.trim()) break;
+        }
+      }
+
+      renderBuffer();
+      renderMirrorCommits();
+    }
+
+    async function connect() {
+      if (state.ws && (state.ws.readyState === WebSocket.OPEN || state.ws.readyState === WebSocket.CONNECTING)) {
+        return;
+      }
+
+      await ensureAudio();
+
+      return new Promise((resolve, reject) => {
+        const ws = new WebSocket(els.wsUrl.value.trim());
+        ws.binaryType = "arraybuffer";
+
+        ws.onopen = () => {
+          state.ws = ws;
+          state.connected = true;
+          setStatus("ok", "Подключено");
+          log(`WS connected: ${els.wsUrl.value.trim()}`);
+
+          try {
+            ws.send(JSON.stringify({ type: "start_session" }));
+            ws.send(JSON.stringify({
+              type: "patch_config",
+              patch: {
+                tts: {
+                  base_url: els.ttsBaseUrl.value.trim(),
+                  format: "pcm",
+                  streaming: true,
+                  stream_tokens: true,
+                  stream_chunk_size: Number(els.streamChunkSize.value),
+                  cleanup_mode: els.cleanupMode.value,
+                  use_memory_cache: "off",
+                  normalize: true
+                },
+                buffer: {
+                  min_words: Number(els.minWords.value),
+                  soft_limit_chars: Number(els.softLimit.value),
+                  hard_limit_chars: Number(els.hardLimit.value)
+                },
+                policy: {
+                  force_flush_after_sec: 0.30,
+                  cleanup_after_idle_sec: 2.0,
+                  session_idle_timeout_sec: 15.0,
+                  close_tts_stream_on_new_text: false
+                }
+              }
+            }));
+            resolve();
+          } catch (err) {
+            reject(err);
+          }
+        };
+
+        ws.onmessage = async (event) => {
+          try {
+            if (typeof event.data === "string") {
+              handleServerEvent(JSON.parse(event.data));
+            } else {
+              const arrayBuffer = event.data instanceof ArrayBuffer
+                ? event.data
+                : await event.data.arrayBuffer();
+              handleAudioBytes(arrayBuffer);
+            }
+          } catch (err) {
+            log(`message parse error: ${err.message || err}`);
+          }
+        };
+
+        ws.onerror = () => {
+          setStatus("bad", "Ошибка WebSocket");
+          log("WS error");
+        };
+
+        ws.onclose = (ev) => {
+          state.connected = false;
+          state.ws = null;
+          state.sessionId = null;
+          setStatus("bad", `Отключено (${ev.code})`);
+          log(`WS closed code=${ev.code} reason=${ev.reason || "-"}`);
+          refreshStats();
+        };
+      });
+    }
+
+    function disconnect() {
+      state.stopRequested = true;
+      state.simRunning = false;
+      els.simInfo.textContent = "sim: stopped";
+
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        try {
+          state.ws.send(JSON.stringify({ type: "close_session", reason: "user_disconnect" }));
+        } catch (_) {}
+        state.ws.close();
+      }
+    }
+
+    function sendJson(obj) {
+      if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+        throw new Error("WebSocket is not connected");
+      }
+      state.ws.send(JSON.stringify(obj));
+    }
+
+    function handleServerEvent(msg) {
+      const type = msg.event || msg.type || "unknown";
+
+      switch (type) {
+        case "session_started":
+          state.sessionId = msg.session_id || null;
+          setStatus("ok", "Сессия запущена");
+          log(`session_started session_id=${state.sessionId}`);
+          break;
+
+        case "config_patched":
+          log("config_patched");
+          break;
+
+        case "chunk_queued": {
+          state.actualCommitsCount += 1;
+          if (msg.chunk) {
+            const item = {
+              chunkId: msg.chunk.chunk_id || "",
+              text: msg.chunk.text || "",
+              reason: msg.chunk.reason || "unknown",
+              chars: Number(msg.chunk.chars || (msg.chunk.text || "").length),
+              words: Number(msg.chunk.words || countWords(msg.chunk.text || ""))
+            };
+            state.actualCommits.push(item);
+            ensureChunkLane(item.chunkId, {
+              text: item.text,
+              reason: item.reason
+            });
+            pushChunkEvent(item.chunkId, "queued", "queued", {
+              text: item.text,
+              reason: item.reason
+            });
+            pushTimeline("actual_commit", `${item.reason}: ${item.text}`);
+          }
+          renderActualCommits();
+          log(`chunk_queued reason=${msg.chunk?.reason || "-"} text="${truncate(msg.chunk?.text || "", 90)}"`);
+          break;
+        }
+
+        case "tts_started":
+          pushTimeline("tts_started", msg.text || "");
+          pushChunkEvent(msg.chunk_id, "tts_started", "tts_started", {
+            text: msg.text || ""
+          });
+          log(`tts_started chunk_id=${msg.chunk_id} text="${truncate(msg.text || "", 90)}"`);
+          break;
+
+        case "audio_meta":
+          state.audioMeta.sampleRate = Number(msg.meta?.sample_rate || 44100);
+          state.audioMeta.channels = Number(msg.meta?.channels || 1);
+          state.audioMeta.format = String(msg.meta?.format || "pcm");
+          break;
+
+        case "audio_chunk":
+          state.pendingAudioEvent = msg;
+          break;
+
+        case "tts_finished":
+          pushTimeline("tts_finished", `chunk=${msg.chunk_id} bytes=${msg.total_bytes}`);
+          pushChunkEvent(msg.chunk_id, "tts_finished", "tts_finished");
+          log(`tts_finished chunk_id=${msg.chunk_id} chunks=${msg.total_chunks} bytes=${msg.total_bytes}`);
+          break;
+
+        case "cleanup_done":
+          log(`cleanup_done reason=${msg.reason || "-"}`);
+          break;
+
+        case "buffer_cleared":
+          log(`buffer_cleared reason=${msg.reason || "-"}`);
+          break;
+
+        case "session_closed":
+          log(`session_closed reason=${msg.reason || "-"}`);
+          break;
+
+        case "error":
+          log(`ERROR code=${msg.code} message=${msg.message}`);
+          break;
+
+        default:
+          break;
+      }
+
+      refreshStats();
+    }
+
+    function handleAudioBytes(arrayBuffer) {
+      state.audioChunks += 1;
+
+      const audioEvent = state.pendingAudioEvent;
+      state.pendingAudioEvent = null;
+
+      if (!state.firstAudioAt && state.firstDeltaSentAt) {
+        state.firstAudioAt = nowMs();
+        const ttfa = Math.round(state.firstAudioAt - state.firstDeltaSentAt);
+        els.ttfa.textContent = `${ttfa} ms`;
+        pushTimeline("first_audio", `TTFA ${ttfa} ms`);
+        log(`FIRST_AUDIBLE_MS=${ttfa}`);
+      }
+
+      if (audioEvent && Number(audioEvent.seq) === 1) {
+        pushChunkEvent(audioEvent.chunk_id, "first_audio", "first_audio");
+      }
+
+      if (state.audioMeta.format === "pcm") {
+        schedulePcmChunk(arrayBuffer, state.audioMeta.sampleRate, state.audioMeta.channels);
+      } else {
+        scheduleWavChunk(arrayBuffer);
+      }
+
+      refreshStats();
+    }
+
+    function schedulePcmChunk(arrayBuffer, sampleRate, channels) {
+      if (!state.audioCtx) return;
+
+      const ctx = state.audioCtx;
+      const bytes = new Uint8Array(arrayBuffer);
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const bytesPerSample = 2;
+      const frameCount = Math.floor(bytes.byteLength / (bytesPerSample * channels));
+      if (frameCount <= 0) return;
+
+      const audioBuffer = ctx.createBuffer(channels, frameCount, sampleRate);
+
+      for (let ch = 0; ch < channels; ch++) {
+        const out = audioBuffer.getChannelData(ch);
+        for (let i = 0; i < frameCount; i++) {
+          const offset = (i * channels + ch) * 2;
+          const sample = view.getInt16(offset, true);
+          out[i] = Math.max(-1, Math.min(1, sample / 32768));
+        }
+      }
+
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(ctx.destination);
+
+      const lead = 0.015;
+      const startAt = Math.max(ctx.currentTime + lead, state.playback.nextStartTime || 0);
+      source.start(startAt);
+      state.playback.nextStartTime = startAt + audioBuffer.duration;
+    }
+
+    async function scheduleWavChunk(arrayBuffer) {
+      if (!state.audioCtx) return;
+
+      try {
+        const ctx = state.audioCtx;
+        const decoded = await ctx.decodeAudioData(arrayBuffer.slice(0));
+        const source = ctx.createBufferSource();
+        source.buffer = decoded;
+        source.connect(ctx.destination);
+
+        const lead = 0.015;
+        const startAt = Math.max(ctx.currentTime + lead, state.playback.nextStartTime || 0);
+        source.start(startAt);
+        state.playback.nextStartTime = startAt + decoded.duration;
+      } catch (err) {
+        log(`wav decode error: ${err.message || err}`);
+      }
+    }
+
+    function tokenizeForDemo(text) {
+      return text.match(/\S+\s*/g) || [];
+    }
+
+    function endsWithStrongPunct(s) {
+      return /[.!?…;:]\s*$/.test(s);
+    }
+
+    async function startSimulation() {
+      await connect();
+      await ensureAudio();
+
+      resetRunMetrics();
+
+      const fullText = els.sourceText.value;
+      const tokens = tokenizeForDemo(fullText);
+      if (!tokens.length) {
+        log("Нет текста для симуляции");
+        return;
+      }
+
+      state.stopRequested = false;
+      state.simRunning = true;
+      els.simInfo.textContent = "sim: running";
+
+      const initialPause = randInt(els.initialMin.value, els.initialMax.value);
+      log(`simulation initial think delay = ${initialPause} ms`);
+      await sleep(initialPause);
+
+      let i = 0;
+
+      while (i < tokens.length && !state.stopRequested) {
+        const n = randInt(els.chunkMinWords.value, els.chunkMaxWords.value);
+        const slice = tokens.slice(i, i + n);
+        i += slice.length;
+
+        const delta = slice.join("");
+        const final = i >= tokens.length;
+
+        if (!state.firstDeltaSentAt) {
+          state.firstDeltaSentAt = nowMs();
+        }
+
+        sendJson({
+          type: "text_delta",
+          text: delta,
+          final
+        });
+
+        state.sentDeltas += 1;
+        state.previewText += delta;
+        renderPreview();
+        pushTimeline("delta", delta);
+
+        applyMirrorDelta(delta, final);
+
+        log(`send delta #${state.sentDeltas}: "${truncate(delta.replace(/\n/g, "\\n"), 100)}"${final ? " [final]" : ""}`);
+        refreshStats();
+
+        if (final) break;
+
+        let delay = randInt(els.deltaMin.value, els.deltaMax.value);
+        if (endsWithStrongPunct(delta)) {
+          delay += randInt(els.punctExtraMin.value, els.punctExtraMax.value);
+        }
+        await sleep(delay);
+      }
+
+      if (!state.stopRequested) {
+        try {
+          sendJson({ type: "flush", final: true, reason: "demo_completed" });
+        } catch (_) {}
+        log("simulation completed");
+      } else {
+        try {
+          sendJson({ type: "flush", final: false, reason: "demo_stopped" });
+        } catch (_) {}
+        log("simulation stopped by user");
+      }
+
+      state.simRunning = false;
+      els.simInfo.textContent = state.stopRequested ? "sim: stopped" : "sim: idle";
+    }
+
+    els.connectBtn.addEventListener("click", async () => {
+      try {
+        await connect();
+      } catch (err) {
+        log(`connect failed: ${err.message || err}`);
+      }
+    });
+
+    els.disconnectBtn.addEventListener("click", () => {
+      disconnect();
+    });
+
+    els.cleanupBtn.addEventListener("click", () => {
+      try {
+        sendJson({ type: "cleanup", reason: "manual_from_ui" });
+      } catch (err) {
+        log(`cleanup failed: ${err.message || err}`);
+      }
+    });
+
+    els.flushBtn.addEventListener("click", () => {
+      try {
+        sendJson({ type: "flush", final: false, reason: "manual_flush" });
+
+        while (true) {
+          const res = extractChunkFromBuffer(state.mirror.buffer, {
+            minWords: Number(els.minWords.value),
+            softLimitChars: Number(els.softLimit.value),
+            hardLimitChars: Number(els.hardLimit.value),
+            force: true,
+            final: false
+          });
+
+          if (!res.chunk || !res.reason) break;
+
+          state.mirror.buffer = res.remaining;
+          state.mirror.commits.push({
+            text: res.chunk,
+            reason: res.reason,
+            chars: res.chunk.length,
+            words: countWords(res.chunk)
+          });
+          pushTimeline("mirror_commit", `${res.reason}: ${res.chunk}`);
+
+          if (!state.mirror.buffer.trim()) break;
+        }
+
+        renderBuffer();
+        renderMirrorCommits();
+      } catch (err) {
+        log(`flush failed: ${err.message || err}`);
+      }
+    });
+
+    els.startBtn.addEventListener("click", async () => {
+      if (state.simRunning) {
+        log("Симуляция уже идет");
+        return;
+      }
+      try {
+        await startSimulation();
+      } catch (err) {
+        state.simRunning = false;
+        els.simInfo.textContent = "sim: error";
+        log(`simulation failed: ${err.message || err}`);
+      }
+    });
+
+    els.stopBtn.addEventListener("click", () => {
+      state.stopRequested = true;
+    });
+
+    els.clearLogBtn.addEventListener("click", () => {
+      els.log.textContent = "";
+    });
+
+    window.addEventListener("beforeunload", () => {
+      try { disconnect(); } catch (_) {}
+    });
+
+    els.wsUrl.value = defaultWsUrl();
+    setStatus("warn", "Готово к подключению");
+    renderPreview();
+    renderBuffer();
+    renderMirrorCommits();
+    renderActualCommits();
+    renderTimeline();
+    renderChunkLanes();
+    refreshStats();
+  </script>
+</body>
+</html>

@@ -16,6 +16,7 @@ from torch.distributed import get_rank, get_world_size, is_initialized
 from torch.utils.data import DataLoader, Dataset, IterableDataset, get_worker_info
 
 from fish_speech.content_sequence import ContentSequence, TextPart, VQPart
+from fish_speech.conversation import Conversation, Message
 
 CODEBOOK_PAD_TOKEN_ID = 0
 
@@ -30,9 +31,6 @@ log = RankedLogger(__name__, rank_zero_only=True)
 
 
 def split_by_rank_worker(files):
-    # We need to know the total number of devices
-    # to split the data properly
-
     total_devices = 1
     if is_initialized():
         total_devices = get_world_size()
@@ -42,14 +40,11 @@ def split_by_rank_worker(files):
         total_devices *= worker_info.num_workers
 
     if len(files) < total_devices:
-        # Repeat the files N times to match the number of devices
         files = files * (total_devices // len(files) + 1)
 
-    # DDP
     if is_initialized():
         files = files[get_rank() :: get_world_size()]
 
-    # Split by worker
     if worker_info is not None:
         files = files[worker_info.id :: worker_info.num_workers]
 
@@ -82,19 +77,6 @@ class AutoTextSemanticInstructionIterableDataset(IterableDataset):
         num_codebooks: Optional[int] = None,
         skip_text_prob: float = 0.0,
     ):
-        """
-        Args:
-            proto_files: proto buf files if using local data
-            seed: random seed
-            interactive_prob: probability to use interactive mode
-            max_length: max length of the text
-            tokenizer: tokenizer
-            use_speaker: include speaker information in the prompt
-            causal: use causal sampling when using local data, disable will lead to random sampling
-            num_codebooks: number of codebooks, if None, it will be automatically detected
-            skip_text_prob: probability to skip the text (audio only), this only applies to interactive mode
-        """
-
         super().__init__()
 
         assert 0 <= interactive_prob <= 1, "interactive_prob must be in [0, 1]"
@@ -119,7 +101,6 @@ class AutoTextSemanticInstructionIterableDataset(IterableDataset):
         if self.groups is not None:
             return
 
-        # Expand the proto files
         expanded_proto_files = []
         for filename in self.proto_files:
             for i in braceexpand(filename):
@@ -150,7 +131,6 @@ class AutoTextSemanticInstructionIterableDataset(IterableDataset):
 
         log.info(f"Read total {count} groups of data")
 
-        # Shuffle the lines
         Random(self.seed).shuffle(self.groups)
         self.group_weights = [len(i.sentences) for i in self.groups]
 
@@ -158,14 +138,10 @@ class AutoTextSemanticInstructionIterableDataset(IterableDataset):
         if self.groups is None:
             self.init_mock_data_server()
 
-        # Shuffle unique lines, estimate that each sample is at least 20 tokens
         num_samples = self.max_length // 20
-
-        # choice group based on their number of samples
         group = random.choices(self.groups, weights=self.group_weights, k=1)[0]
 
         if self.causal:
-            # Sample in order
             if num_samples >= len(group.sentences):
                 samples = group.sentences
             else:
@@ -186,15 +162,12 @@ class AutoTextSemanticInstructionIterableDataset(IterableDataset):
         self,
         sentences: list[str],
         semantics: list,
-        # speaker: Optional[str] = None, # speaker is now handled by tokens
         skip_text: bool = False,
     ):
-
         seq = ContentSequence()
 
         seq.append(TextPart(text="Speak out the provided text."))
 
-        # User's turn
         cated_sentences = " ".join(sentences)
         if skip_text:
             cated_sentences = "<|skip_text|>"
@@ -204,14 +177,10 @@ class AutoTextSemanticInstructionIterableDataset(IterableDataset):
             add_end=True,
         )
 
-        # Assistant's turn
         vq_codes = [x.values for x in semantics[0]]
         vq_codes_tensor = torch.tensor(vq_codes).to(torch.int32)
-
-        # 将 cal_loss=True 直接关联到 VQPart 上，这比之前更精确
         vq_part = VQPart(codes=vq_codes_tensor, cal_loss=True)
 
-        # 将多个 parts 一起添加，最后也加上 <|im_end|>
         seq.append(
             [TextPart(text="<|speaker:assistant|> <|voice|>"), vq_part],
             add_end=True,
@@ -243,7 +212,6 @@ class AutoTextSemanticInstructionIterableDataset(IterableDataset):
         tokens = tokens.long()
         labels = labels.long()
 
-        # Verify the padding is correct, and the last token is eos
         assert (tokens[1:, ~(encoded.vq_mask_tokens)] == CODEBOOK_PAD_TOKEN_ID).all()
         assert (labels[1:, -1:] == CODEBOOK_PAD_TOKEN_ID).all()
 
@@ -252,7 +220,6 @@ class AutoTextSemanticInstructionIterableDataset(IterableDataset):
     def augment(self):
         response = self.sample_data()
         if len(response.samples) == 0:
-            # Invalid group
             return None
 
         samples = list(response.samples)
@@ -265,7 +232,6 @@ class AutoTextSemanticInstructionIterableDataset(IterableDataset):
             tokens, labels = self.pack_sentences(
                 sentences=[text],
                 semantics=[sentence.semantics],
-                # speaker=response.name if use_speaker else None,
                 skip_text=random.random() < self.skip_text_prob,
             )
 
@@ -275,7 +241,6 @@ class AutoTextSemanticInstructionIterableDataset(IterableDataset):
         tokens = torch.cat(all_tokens, dim=1)
         labels = torch.cat(all_labels, dim=1)
 
-        # Verify that the length is correct
         assert tokens.size(1) == labels.size(1), f"{tokens.size(1)} != {labels.size(1)}"
 
         data = {"tokens": tokens, "labels": labels}
@@ -289,12 +254,6 @@ class AutoTextSemanticInstructionDataset(Dataset):
 
     1. Random concatenate multiple sentences from the same speaker to form a longer sentence
     2. Automatically normalize the text
-
-    For interactive mode, we use the following format (multiple sequences):
-    <s> [INST] [SPK: speaker] text [/INST] ... [INST] text [/INST] </s>
-
-    For non-interactive mode, we use the following format (one long sequence):
-    <s> [INST] text [/INST] ... </s>
     """
 
     def __init__(
@@ -309,18 +268,6 @@ class AutoTextSemanticInstructionDataset(Dataset):
         num_codebooks: Optional[int] = None,
         skip_text_prob: float = 0.0,
     ):
-        """
-        Args:
-            proto_files: proto buf files if using local data
-            seed: random seed
-            interactive_prob: probability to use interactive mode
-            max_length: max length of the text
-            tokenizer: tokenizer
-            use_speaker: include speaker information in the prompt
-            causal: use causal sampling when using local data, disable will lead to random sampling
-            num_codebooks: number of codebooks, if None, it will be automatically detected
-            skip_text_prob: probability to skip the text (audio only), this only applies to interactive mode
-        """
         super().__init__()
 
         assert 0 <= interactive_prob <= 1, "interactive_prob must be in [0, 1]"
@@ -479,14 +426,12 @@ class InterleaveDataset(IterableDataset):
         dataset_iterators = [iter(dataset) for dataset in self.datasets]
 
         while True:
-            # Random choice one
             dataset_idx = rng.choice(len(self.datasets), p=self.probabilities)
             dataset_iterator = dataset_iterators[dataset_idx]
 
             try:
                 yield next(dataset_iterator)
             except StopIteration:
-                # Exhausted, create a new iterator
                 dataset_iterators[dataset_idx] = iter(self.datasets[dataset_idx])
                 yield next(dataset_iterators[dataset_idx])
 
@@ -497,7 +442,7 @@ class TextDataCollator:
     max_length: int = 1024
 
     def __call__(self, examples):
-        if "negative_tokens" in examples:
+        if examples and isinstance(examples[0], dict) and "negative_tokens" in examples[0]:
             positive_examples = []
             negative_examples = []
 
@@ -522,7 +467,6 @@ class TextDataCollator:
     def batchify(self, examples, tokens_key="tokens", labels_key="labels"):
         tokens, attention_masks, labels = [], [], []
 
-        # Calculate the max length
         max_tokens_length = 0
         for example in examples:
             max_tokens_length = max(max_tokens_length, example[tokens_key].size(1))
@@ -623,5 +567,4 @@ if __name__ == "__main__":
     )
 
     for i in range(100):
-        # Please uncomment line 235 to visualize the tokenized message
         print(ds[i])

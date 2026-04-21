@@ -46,7 +46,6 @@ class Conversation:
         """
         all_parts = []
         for message in self.messages:
-            # Add im_start
             if message.add_im_start:
                 modality_token = (
                     MODALITY_TOKENS[message.modality] if message.modality else ""
@@ -58,9 +57,7 @@ class Conversation:
                     )
                 )
 
-            # Add message parts
             for part in message.parts:
-                # Inherit cal_loss from message if not set at part level
                 if not hasattr(part, "cal_loss") or part.cal_loss is False:
                     new_part = deepcopy(part)
                     new_part.cal_loss = message.cal_loss
@@ -68,7 +65,6 @@ class Conversation:
                 else:
                     all_parts.append(part)
 
-            # Add im_end
             if message.add_im_end:
                 all_parts.append(
                     TextPart(text=IM_END_TOKEN + "\n", cal_loss=message.cal_loss)
@@ -84,13 +80,13 @@ class Conversation:
         metadata: dict | None = None,
         max_length: int | None = None,
     ) -> EncodedMessage:
-        # Build ContentSequence from messages
+        # max_length kept for backward compatibility with older call sites.
+        # ContentSequence.encode currently does not accept max_length.
         content_seq = self._build_content_sequence(metadata=metadata)
         return content_seq.encode(
             tokenizer,
             add_shift=add_shift,
             ignore_loss_tokens=ignore_loss_tokens,
-            max_length=max_length,
         )
 
     def encode_for_inference(
@@ -114,7 +110,6 @@ class Conversation:
         Visualize the encoded sequence with color-coded tokens.
         Blue/cyan tokens contribute to loss, green tokens do not.
         """
-        # Build ContentSequence from messages and use its visualize method
         content_seq = self._build_content_sequence()
         content_seq.visualize(
             tokenizer,
@@ -145,7 +140,6 @@ class Conversation:
 
 
 if __name__ == "__main__":
-    # Test the new implementation with the same API
     message0 = Message(
         role="user",
         parts=[
@@ -163,7 +157,6 @@ if __name__ == "__main__":
     conversation = Conversation([message0, message1])
     tokenizer = PreTrainedTokenizerFast.from_pretrained("checkpoints/agent-0.6b-debug")
 
-    # Test with enhanced visualization from ContentSequence
     print("Basic visualization:")
     conversation.visualize(tokenizer)
 

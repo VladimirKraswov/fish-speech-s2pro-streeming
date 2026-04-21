@@ -4,46 +4,162 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-MODEL_PORT="${MODEL_PORT:-8080}"
+IMAGE="${IMAGE:-fish-speech-webui:cu129}"
+CONTAINER="${CONTAINER:-fish-speech}"
+PORT="${PORT:-8080}"
 PROXY_PORT="${PROXY_PORT:-9000}"
-CHECKPOINTS_DIR="${CHECKPOINTS_DIR:-checkpoints/s2-pro}"
+
 COMPILE="${COMPILE:-1}"
+BUILD_IMAGE="${BUILD_IMAGE:-0}"
+START_PROXY="${START_PROXY:-1}"
+EXTRA_WARMUP="${EXTRA_WARMUP:-1}"
 
+CUDA_VER="${CUDA_VER:-12.9.0}"
+UV_EXTRA="${UV_EXTRA:-cu129}"
+CHECKPOINTS_DIR="${CHECKPOINTS_DIR:-checkpoints/s2-pro}"
+
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+FISH_CACHE_MAX_SEQ_LEN="${FISH_CACHE_MAX_SEQ_LEN:-320}"
+FISH_MAX_NEW_TOKENS_CAP="${FISH_MAX_NEW_TOKENS_CAP:-64}"
+
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-1800}"
 LOG_DIR="$REPO_ROOT/logs"
-RUN_DIR="$REPO_ROOT/run"
-MODEL_LOG="$LOG_DIR/model.log"
-MODEL_BOOT_LOG="$LOG_DIR/model_boot.log"
-MODEL_TAIL_PID="$RUN_DIR/model_logs.pid"
+mkdir -p "$LOG_DIR"
 
-mkdir -p "$LOG_DIR" "$RUN_DIR"
+docker_cmd() {
+  if [[ "${DOCKER_USE_SUDO:-0}" == "1" ]]; then
+    sudo docker "$@"
+  else
+    docker "$@"
+  fi
+}
 
-: > "$MODEL_LOG"
-: > "$MODEL_BOOT_LOG"
+echo "=== Fish Speech full startup (RTX 5090) ==="
+echo "  REPO_ROOT=$REPO_ROOT"
+echo "  IMAGE=$IMAGE"
+echo "  CONTAINER=$CONTAINER"
+echo "  PORT=$PORT"
+echo "  PROXY_PORT=$PROXY_PORT"
+echo "  COMPILE=$COMPILE"
+echo "  CHECKPOINTS_DIR=$CHECKPOINTS_DIR"
+echo
 
-sudo -v
+if [[ ! -d "$CHECKPOINTS_DIR" ]] || [[ -z "$(ls -A "$CHECKPOINTS_DIR" 2>/dev/null)" ]]; then
+  echo "ERROR: checkpoints not found in $CHECKPOINTS_DIR" >&2
+  exit 1
+fi
 
-bash "$REPO_ROOT/scripts/down_5090.sh" || true
+if [[ "$BUILD_IMAGE" == "1" ]] || ! docker_cmd image inspect "$IMAGE" >/dev/null 2>&1; then
+  echo "[1/5] Building Docker image..."
+  docker_cmd build \
+    --platform linux/amd64 \
+    -f docker/Dockerfile \
+    --build-arg BACKEND=cuda \
+    --build-arg CUDA_VER="$CUDA_VER" \
+    --build-arg UV_EXTRA="$UV_EXTRA" \
+    --target webui \
+    -t "$IMAGE" .
+else
+  echo "[1/5] Using existing image: $IMAGE"
+fi
 
-echo "[1/4] Starting model container"
-COMPILE="$COMPILE" PORT="$MODEL_PORT" CHECKPOINTS_DIR="$CHECKPOINTS_DIR" \
-  bash "$REPO_ROOT/scripts/run_server_32gb.sh" | tee -a "$MODEL_BOOT_LOG"
+echo "[2/5] Stopping previous processes..."
+DOCKER_USE_SUDO="${DOCKER_USE_SUDO:-0}" bash "$REPO_ROOT/scripts/down_5090.sh"
 
-echo "[2/4] Starting model log follower"
-rm -f "$MODEL_TAIL_PID"
-nohup sudo docker logs -f fish-speech >> "$MODEL_LOG" 2>&1 &
-echo $! > "$MODEL_TAIL_PID"
+echo "[3/5] Starting model container..."
+CID="$(
+  docker_cmd run -d --rm \
+    --name "$CONTAINER" \
+    -p "$PORT:8080" \
+    --gpus all \
+    -e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF" \
+    -e FISH_CACHE_MAX_SEQ_LEN="$FISH_CACHE_MAX_SEQ_LEN" \
+    -e FISH_MAX_NEW_TOKENS_CAP="$FISH_MAX_NEW_TOKENS_CAP" \
+    -e PYTHONPATH=/workspace \
+    -v "$REPO_ROOT":/workspace \
+    -w /workspace \
+    --entrypoint /app/.venv/bin/python \
+    "$IMAGE" \
+    /workspace/tools/api_server.py \
+    --listen 0.0.0.0:8080 \
+    --device cuda \
+    --llama-checkpoint-path "/workspace/$CHECKPOINTS_DIR" \
+    --decoder-checkpoint-path "/workspace/$CHECKPOINTS_DIR/codec.pth" \
+    $([[ "$COMPILE" == "1" ]] && echo --compile || true)
+)"
 
-sleep 2
+echo "Container started: $CID"
+echo
 
-echo "[3/4] Waiting for compile warmup"
-MODEL_PORT="$MODEL_PORT" bash "$REPO_ROOT/scripts/warmup_5090.sh"
+echo "[4/5] Waiting for model health..."
+START_TS="$(date +%s)"
 
-echo "[4/4] Starting proxy"
-PROXY_PORT="$PROXY_PORT" bash "$REPO_ROOT/scripts/run_proxy.sh"
+while true; do
+  if curl -sf "http://127.0.0.1:${PORT}/v1/health" >/dev/null 2>&1; then
+    break
+  fi
+
+  if ! docker_cmd ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+    echo "ERROR: container exited during startup" >&2
+    echo
+    echo "Last model logs:"
+    docker_cmd logs --tail 200 "$CONTAINER" 2>&1 || true
+    exit 1
+  fi
+
+  NOW_TS="$(date +%s)"
+  ELAPSED="$((NOW_TS - START_TS))"
+
+  if (( ELAPSED % 30 == 0 )); then
+    echo "Still warming up... ${ELAPSED}s"
+  fi
+
+  if [[ "$ELAPSED" -ge "$HEALTH_TIMEOUT" ]]; then
+    echo "ERROR: model did not become healthy within ${HEALTH_TIMEOUT}s" >&2
+    echo
+    echo "Last model logs:"
+    docker_cmd logs --tail 200 "$CONTAINER" 2>&1 || true
+    exit 1
+  fi
+
+  sleep 5
+done
+
+echo "Model is healthy after $(( $(date +%s) - START_TS ))s"
+
+if [[ "$EXTRA_WARMUP" == "1" ]]; then
+  echo "Sending one extra warmup streaming request..."
+  BASE_URL="http://127.0.0.1:${PORT}" \
+    bash "$REPO_ROOT/scripts/warmup_5090.sh"
+fi
+
+echo "Current model memory:"
+curl -sf "http://127.0.0.1:${PORT}/v1/debug/memory" || true
+echo
+echo
+
+if [[ "$START_PROXY" == "1" ]]; then
+  echo "[5/5] Starting proxy..."
+  PROXY_PORT="$PROXY_PORT" bash "$REPO_ROOT/scripts/run_proxy.sh"
+
+  echo "Checking proxy health..."
+  sleep 1
+  curl -sf "http://127.0.0.1:${PROXY_PORT}/health" >/dev/null
+  echo "Proxy is healthy"
+fi
 
 echo
-echo "All services are up"
-echo "  model health: curl http://127.0.0.1:${MODEL_PORT}/v1/health"
-echo "  proxy health: curl http://127.0.0.1:${PROXY_PORT}/health"
-echo "  model logs:   tail -f $MODEL_LOG"
-echo "  proxy logs:   tail -f $LOG_DIR/proxy.log"
+echo "=== READY ==="
+echo "Model health:  http://127.0.0.1:${PORT}/v1/health"
+echo "Model memory:  http://127.0.0.1:${PORT}/v1/debug/memory"
+echo "Proxy health:  http://127.0.0.1:${PROXY_PORT}/health"
+echo "Proxy stream:  http://127.0.0.1:${PROXY_PORT}/pcm-stream?text=Привет"
+echo
+echo "Live logs:"
+echo "  DOCKER_USE_SUDO=${DOCKER_USE_SUDO:-0} bash scripts/logs_5090.sh"
+echo
+echo "Stop all:"
+echo "  DOCKER_USE_SUDO=${DOCKER_USE_SUDO:-0} bash scripts/down_5090.sh"
+echo
+echo "Restart all:"
+echo "  DOCKER_USE_SUDO=${DOCKER_USE_SUDO:-0} bash scripts/restart_5090.sh"

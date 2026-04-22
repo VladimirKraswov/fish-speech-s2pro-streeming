@@ -36,10 +36,25 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
     def inference(self, req: ServeTTSRequest) -> Generator[InferenceResult, None, None]:
         """
-        Main inference function:
-        - Loads the reference audio and text.
-        - Calls the LLAMA model for inference.
-        - Decodes the VQ tokens to audio.
+        Основной inference-пайплайн:
+        - загружаем reference
+        - отправляем запрос в LLM worker
+        - получаем semantic/VQ chunk'и
+        - декодируем их в аудио
+
+        Важное изменение:
+        здесь включён ЖЁСТКИЙ backpressure для streaming-режима.
+
+        Раньше worker мог начать генерировать следующий chunk ещё до того,
+        как текущий chunk:
+        1) был декодирован DAC'ом
+        2) был реально отдан наружу через HTTP/WebSocket поток
+
+        На 32 GB VRAM это легко приводит к накоплению промежуточных буферов,
+        скачкам памяти, смене поведения/голоса на длинной сессии и OOM.
+
+        Теперь следующий chunk разрешается только после того,
+        как текущий chunk уже обработан до конца.
         """
 
         profile = os.getenv("FISH_PROFILE_INFERENCE", "0") in {
@@ -83,6 +98,22 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                 details,
             )
 
+        def _ack_worker_once() -> None:
+            """
+            Подтверждение worker'у, что текущий chunk уже можно считать
+            полностью обработанным.
+
+            Очередь подтверждений имеет maxsize=1, поэтому используем put_nowait().
+            Если там уже лежит ack — значит логика где-то дала двойное подтверждение,
+            но блокироваться тут нельзя.
+            """
+            if ack_queue is None:
+                return
+            try:
+                ack_queue.put_nowait(None)
+            except queue.Full:
+                logger.warning("stream: ack queue already full req={}", req_tag)
+
         ref_id = req.reference_id
         prompt_tokens, prompt_texts = [], []
 
@@ -103,9 +134,11 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
         stream_tokens = getattr(req, "stream_tokens", False) or req.streaming
 
-        # Worker waits for ack after each chunk so DAC decode and LLM token generation
-        # do not overlap aggressively on GPU.
-        ack_queue = queue.Queue() if stream_tokens else None
+        # В streaming-режиме используем очередь подтверждений размером 1.
+        # Это делает пайплайн строго пошаговым:
+        # worker -> response_queue -> decode -> yield -> ack -> следующий chunk.
+        ack_queue = queue.Queue(maxsize=1) if stream_tokens else None
+
         response_queue = self.send_Llama_request(
             req,
             prompt_tokens,
@@ -117,7 +150,8 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
         if stream_tokens:
             logger.info(
-                "stream: inference started (token streaming), req={}", req_tag
+                "stream: inference started (strict backpressure mode), req={}",
+                req_tag,
             )
 
         if hasattr(self.decoder_model, "spec_transform"):
@@ -170,8 +204,9 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                     req_tag,
                     wrapped_result.response,
                 )
-                if ack_queue is not None:
-                    ack_queue.put(None)
+
+                # Освобождаем worker, если он ждёт подтверждение.
+                _ack_worker_once()
 
                 _mark("yield_error")
                 yield InferenceResult(
@@ -186,8 +221,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                 break
 
             if not isinstance(wrapped_result.response, GenerateResponse):
-                if ack_queue is not None:
-                    ack_queue.put(None)
+                _ack_worker_once()
                 raise TypeError(
                     f"Expected GenerateResponse, got {type(wrapped_result.response).__name__}"
                 )
@@ -195,45 +229,55 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             result = wrapped_result.response
 
             if result.action != "next":
+                if result.codes is None:
+                    failed = True
+                    err = RuntimeError(
+                        "Worker returned action='sample' but codes is None"
+                    )
+                    logger.error("stream: invalid worker result req={} err={}", req_tag, err)
+                    _ack_worker_once()
+                    yield InferenceResult(
+                        code="error",
+                        audio=None,
+                        error=err,
+                    )
+                    break
+
                 if stream_tokens:
                     logger.info(
                         "stream: decoding segment seg_idx={} codes_shape={} req={}",
                         seg_idx + 1,
-                        result.codes.shape if result.codes is not None else None,
+                        result.codes.shape,
                         req_tag,
                     )
 
                 _mark(
                     "decode_vq_start",
                     segment_idx=seg_idx + 1,
-                    codes_frames=(
-                        result.codes.shape[1] if result.codes is not None else 0
-                    ),
+                    codes_frames=result.codes.shape[1],
                 )
 
-                if result.codes is not None and not result.codes.is_cuda:
-                    result = GenerateResponse(
-                        result.action,
-                        result.codes.to(self.decoder_model.device),
-                        getattr(result, "text", None),
-                    )
-
-                # Ack before decoding to allow LLM generation to overlap with DAC decode.
-                if ack_queue is not None:
-                    ack_queue.put(None)
+                # В response_queue chunk'и держим на CPU, чтобы не копить VRAM.
+                # Непосредственно перед DAC decode переносим текущий chunk на GPU.
+                codes = result.codes
+                if not codes.is_cuda:
+                    codes = codes.to(self.decoder_model.device)
 
                 try:
-                    segment = self.get_audio_segment(result)
+                    segment = self.get_audio_segment(codes)
                 except Exception as seg_err:
                     if stream_tokens:
                         logger.exception(
                             "stream: get_audio_segment FAILED seg_idx={} codes_shape={} req={}: {}",
                             seg_idx + 1,
-                            result.codes.shape if result.codes is not None else None,
+                            result.codes.shape,
                             req_tag,
                             seg_err,
                         )
                     raise
+                finally:
+                    # Важно удалить временный GPU tensor как можно раньше.
+                    del codes
 
                 seg_idx += 1
                 produced_segments += 1
@@ -250,13 +294,20 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
                 if req.streaming:
                     _mark("yield_segment", segment_idx=seg_idx)
+
+                    # Критично:
+                    # ack отправляем НЕ ДО decode и НЕ ДО yield,
+                    # а только после того, как chunk реально отдан наружу.
                     yield InferenceResult(
                         code="segment",
                         audio=(sample_rate, segment),
                         error=None,
                     )
+
+                    _ack_worker_once()
                 else:
                     segments.append(segment)
+                    _ack_worker_once()
             else:
                 if stream_tokens:
                     logger.info(
@@ -265,9 +316,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                         req_tag,
                     )
 
-                if ack_queue is not None:
-                    ack_queue.put(None)
-
+                _ack_worker_once()
                 _mark("got_next")
                 break
 
@@ -285,10 +334,8 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             )
             return None
 
-        # Important:
-        # - in streaming mode we must NOT emit full final audio again, otherwise
-        #   upper layers may replay the whole answer a second time;
-        # - in non-streaming mode we still return the complete waveform.
+        # В streaming-режиме итоговый final не должен ещё раз возвращать всё аудио целиком,
+        # иначе верхний слой может воспроизвести ответ повторно.
         if req.streaming:
             _mark("yield_final_stream")
             yield InferenceResult(
@@ -316,7 +363,12 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         ack_queue: queue.Queue | None = None,
     ) -> queue.Queue:
         """
-        Send a request to the LLAMA model to generate the symbolic tokens.
+        Отправка запроса в LLM worker.
+
+        Важное изменение:
+        response_queue теперь ограниченная.
+        Для streaming-режима нам не нужна длинная очередь ответов —
+        нужен максимум один chunk "в полёте".
         """
 
         stream_tokens = getattr(req, "stream_tokens", False) or req.streaming
@@ -343,7 +395,9 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             control=getattr(req, "control", None),
         )
 
-        response_queue = queue.Queue()
+        # Для stream достаточно одной ячейки.
+        # Это дополнительная страховка от накопления chunk'ов.
+        response_queue = queue.Queue(maxsize=1 if stream_tokens else 2)
 
         self.llama_queue.put(
             GenerateRequest(
@@ -354,14 +408,13 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
         return response_queue
 
-    def get_audio_segment(self, result: GenerateResponse) -> np.ndarray:
+    def get_audio_segment(self, codes: torch.Tensor) -> np.ndarray:
         """
-        Decode the VQ tokens to audio.
+        Декодирование одного VQ chunk в PCM waveform.
         """
-
         with autocast_exclude_mps(
             device_type=self.decoder_model.device.type, dtype=self.precision
         ):
-            segment = self.decode_vq_tokens(codes=result.codes)
+            segment = self.decode_vq_tokens(codes=codes)
 
         return segment.float().detach().cpu().numpy()

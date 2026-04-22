@@ -44,6 +44,26 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.strip() in {"1", "true", "TRUE", "yes", "YES", "on", "ON"}
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw.strip())
+    except Exception:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw.strip())
+    except Exception:
+        return default
+
+
 def _normalize_cleanup_mode(cleanup_mode: str | None) -> str:
     mode = (cleanup_mode or "request_end").strip().lower()
     aliases = {
@@ -1134,9 +1154,16 @@ def launch_thread_safe_queue(
     memory_info: dict | None = None,
 ):
     """
-    memory_info: optional shared dict; worker will set llama_param_gb, llama_param_count after load.
+    Создаёт один worker-поток для LLM.
+
+    Важные изменения:
+    1. input_queue теперь ограниченная по размеру
+       -> backend не будет бесконечно принимать новые запросы в хвост.
+    2. в stream-режиме worker ждёт ack с timeout
+       -> если клиент оборвал соединение, worker не зависнет навсегда.
     """
-    input_queue = queue.Queue()
+    request_queue_maxsize = max(1, _env_int("FISH_LLM_REQUEST_QUEUE_MAXSIZE", 1))
+    input_queue = queue.Queue(maxsize=request_queue_maxsize)
     init_event = threading.Event()
 
     def worker():
@@ -1190,6 +1217,10 @@ def launch_thread_safe_queue(
             if stream_empty_cache is None:
                 stream_empty_cache = _env_flag("FISH_STREAM_EMPTY_CACHE", False)
             did_run_cleanup = False
+
+            # Таймаут ожидания подтверждения от consumer'а стрима.
+            # Если HTTP/WebSocket клиент исчез, worker не должен висеть бесконечно.
+            ack_timeout_sec = _env_float("FISH_STREAM_ACK_TIMEOUT_SEC", 15.0)
 
             if control == "cleanup":
                 try:
@@ -1274,12 +1305,22 @@ def launch_thread_safe_queue(
                             codes=codes.cpu(),
                             text=getattr(chunk, "text", None),
                         )
+
+                    # response_queue ограниченная.
+                    # Это ещё одна страховка, чтобы промежуточные chunk'и не копились пачкой.
                     response_queue.put(
                         WrappedGenerateResponse(status="success", response=out)
                     )
 
+                    # В streaming-режиме ждём подтверждение,
+                    # что предыдущий chunk действительно обработан до конца.
                     if stream_tokens and ack_queue is not None:
-                        ack_queue.get()
+                        try:
+                            ack_queue.get(timeout=ack_timeout_sec)
+                        except queue.Empty:
+                            raise TimeoutError(
+                                f"Timed out waiting for stream ack after {ack_timeout_sec:.1f}s for req={req_tag}"
+                            )
 
                     if stream_tokens and stream_empty_cache and torch.cuda.is_available():
                         torch.cuda.empty_cache()

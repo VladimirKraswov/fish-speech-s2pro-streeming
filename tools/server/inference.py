@@ -11,7 +11,7 @@ from fish_speech.utils.schema import ServeTTSRequest
 AMPLITUDE = 32768
 
 
-def _float_audio_to_pcm16_bytes(audio: np.ndarray) -> bytes:
+def float_audio_to_pcm16_bytes(audio: np.ndarray) -> bytes:
     audio = np.asarray(audio)
     audio = np.clip(audio, -1.0, 1.0 - (1.0 / AMPLITUDE))
     return (audio * AMPLITUDE).astype(np.int16, copy=False).tobytes()
@@ -59,7 +59,7 @@ def inference_wrapper(req: ServeTTSRequest, engine: TTSInferenceEngine):
                 if isinstance(result.audio, tuple):
                     audio = result.audio[1]
                     if isinstance(audio, np.ndarray):
-                        yield _float_audio_to_pcm16_bytes(audio)
+                        yield float_audio_to_pcm16_bytes(audio)
                     elif isinstance(audio, (bytes, bytearray)):
                         yield bytes(audio)
 
@@ -72,7 +72,7 @@ def inference_wrapper(req: ServeTTSRequest, engine: TTSInferenceEngine):
                 if isinstance(result.audio, tuple):
                     final = result.audio[1]
                     if isinstance(final, np.ndarray):
-                        yield _float_audio_to_pcm16_bytes(final)
+                        yield float_audio_to_pcm16_bytes(final)
                     elif isinstance(final, (bytes, bytearray)):
                         yield bytes(final)
                 return None

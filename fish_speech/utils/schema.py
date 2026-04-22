@@ -78,7 +78,7 @@ class ServeReferenceAudio(BaseModel):
 
 
 class ServeTTSRequest(BaseModel):
-    text: str
+    text: str = ""
     chunk_length: Annotated[int, conint(ge=100, le=300, strict=True)] = 200
 
     # Audio format

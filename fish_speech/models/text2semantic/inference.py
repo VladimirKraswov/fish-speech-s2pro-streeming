@@ -24,7 +24,9 @@ from fish_speech.content_sequence import (
 from fish_speech.conversation import Conversation, Message
 from fish_speech.tokenizer import IM_END_TOKEN
 
-# Явные ack-команды между consumer (inference loop) и producer (worker).
+# Явные ack-команды между pipeline producer и LLM worker.
+# Теперь ack означает, что chunk безопасно принят bounded CPU pipeline,
+# а не то, что DAC уже закончил decode.
 ACK_CONTINUE = "continue"
 ACK_ABORT = "abort"
 
@@ -268,6 +270,50 @@ def _maybe_force_cleanup_before_request(
         req_tag=req_tag,
         reason="pre_request_low_free_vram",
     )
+
+
+def _queue_put_with_cancel(
+    target_queue: queue.Queue,
+    item,
+    *,
+    cancel_event: threading.Event | None,
+    timeout_sec: float = 0.1,
+) -> bool:
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+        try:
+            target_queue.put(item, timeout=timeout_sec)
+            return True
+        except queue.Full:
+            if cancel_event is not None and cancel_event.is_set():
+                return False
+
+
+def _wait_for_consumer_ack(
+    ack_queue: queue.Queue,
+    *,
+    cancel_event: threading.Event | None,
+    ack_timeout_sec: float,
+) -> str:
+    deadline = time.perf_counter() + ack_timeout_sec
+    poll_sec = min(0.25, ack_timeout_sec)
+
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            return ACK_ABORT
+
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Timed out waiting for pipeline ack after {ack_timeout_sec:.1f}s"
+            )
+
+        try:
+            return ack_queue.get(timeout=min(poll_sec, remaining))
+        except queue.Empty:
+            if cancel_event is not None and cancel_event.is_set():
+                return ACK_ABORT
 
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -1291,6 +1337,7 @@ def launch_thread_safe_queue(
             kwargs = item.request
             req_tag = str(kwargs.pop("req_tag", "na"))
             ack_queue = kwargs.pop("ack_queue", None)
+            cancel_event = kwargs.pop("cancel_event", None)
             response_queue = item.response_queue
             t_req_start = time.perf_counter()
             t_last_put = t_req_start
@@ -1324,11 +1371,13 @@ def launch_thread_safe_queue(
                         reason="control_cleanup",
                     )
                     did_run_cleanup = True
-                    response_queue.put(
+                    _queue_put_with_cancel(
+                        response_queue,
                         WrappedGenerateResponse(
                             status="success",
                             response=GenerateResponse(action="next"),
-                        )
+                        ),
+                        cancel_event=cancel_event,
                     )
                 except Exception as e:
                     logger.error(
@@ -1337,8 +1386,10 @@ def launch_thread_safe_queue(
                         e,
                         exc_info=True,
                     )
-                    response_queue.put(
-                        WrappedGenerateResponse(status="error", response=e)
+                    _queue_put_with_cancel(
+                        response_queue,
+                        WrappedGenerateResponse(status="error", response=e),
+                        cancel_event=cancel_event,
                     )
                 continue
 
@@ -1363,6 +1414,15 @@ def launch_thread_safe_queue(
                 for chunk in generate_long(
                     model=model, decode_one_token=decode_one_token, **kwargs
                 ):
+                    if cancel_event is not None and cancel_event.is_set():
+                        abort_requested = True
+                        logger.info(
+                            "worker: cancel_event observed before queue_put req={} put_count={}",
+                            req_tag,
+                            put_count,
+                        )
+                        break
+
                     if stream_tokens and put_count < 5:
                         logger.info(
                             "stream: worker putting chunk put_count={} action={} req={}",
@@ -1403,30 +1463,39 @@ def launch_thread_safe_queue(
                             text=getattr(chunk, "text", None),
                         )
 
-                    response_queue.put(
-                        WrappedGenerateResponse(status="success", response=out)
+                    queued = _queue_put_with_cancel(
+                        response_queue,
+                        WrappedGenerateResponse(status="success", response=out),
+                        cancel_event=cancel_event,
                     )
+                    if not queued:
+                        abort_requested = True
+                        logger.info(
+                            "worker: response_queue put cancelled req={} put_count={}",
+                            req_tag,
+                            put_count,
+                        )
+                        break
 
-                    # Strict backpressure:
-                    # ждём подтверждение от inference loop после DAC decode.
-                    if stream_tokens and ack_queue is not None:
-                        try:
-                            ack = ack_queue.get(timeout=ack_timeout_sec)
-                        except queue.Empty:
-                            raise TimeoutError(
-                                f"Timed out waiting for stream ack after {ack_timeout_sec:.1f}s for req={req_tag}"
-                            )
+                    # Bounded pipeline backpressure:
+                    # ждём подтверждение, что chunk принят CPU pipeline.
+                    if ack_queue is not None:
+                        ack = _wait_for_consumer_ack(
+                            ack_queue,
+                            cancel_event=cancel_event,
+                            ack_timeout_sec=ack_timeout_sec,
+                        )
 
                         if ack == ACK_ABORT:
                             abort_requested = True
                             logger.warning(
-                                "stream: worker got abort ack req={} put_count={}",
+                                "worker: got abort ack req={} put_count={}",
                                 req_tag,
                                 put_count,
                             )
                             break
 
-                    if stream_tokens and stream_empty_cache and torch.cuda.is_available():
+                    if ack_queue is not None and stream_empty_cache and torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
                 if abort_requested:
@@ -1434,7 +1503,7 @@ def launch_thread_safe_queue(
                         model=model,
                         cleanup_mode=cleanup_mode,
                         req_tag=req_tag,
-                        reason="consumer_abort",
+                        reason="pipeline_abort",
                     )
                 else:
                     _run_request_cleanup(
@@ -1456,8 +1525,12 @@ def launch_thread_safe_queue(
                 logger.error(traceback.format_exc())
 
                 # Если consumer уже попросил abort, не надо ещё раз слать ошибку наружу.
-                if not abort_requested:
-                    response_queue.put(WrappedGenerateResponse(status="error", response=e))
+                if not abort_requested and not (cancel_event and cancel_event.is_set()):
+                    _queue_put_with_cancel(
+                        response_queue,
+                        WrappedGenerateResponse(status="error", response=e),
+                        cancel_event=cancel_event,
+                    )
 
             finally:
                 if not did_run_cleanup:

@@ -44,7 +44,10 @@ from tools.server.api_utils import (
     get_content_type,
     inference_async,
 )
-from tools.server.inference import inference_wrapper as inference
+from tools.server.inference import (
+    float_audio_to_pcm16_bytes,
+    inference_wrapper as inference,
+)
 from tools.server.model_manager import ModelManager
 from tools.server.model_utils import (
     batch_vqgan_decode,
@@ -356,16 +359,20 @@ async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
             )
         else:
             fake_audios = _collect_non_streaming_audio(engine, req)
-            buffer = io.BytesIO()
-            sf.write(
-                buffer,
-                fake_audios,
-                sample_rate,
-                format=req.format,
-            )
+            if req.format == "pcm":
+                buffer = float_audio_to_pcm16_bytes(fake_audios)
+            else:
+                wav_buffer = io.BytesIO()
+                sf.write(
+                    wav_buffer,
+                    fake_audios,
+                    sample_rate,
+                    format=req.format,
+                )
+                buffer = wav_buffer.getvalue()
 
             return StreamResponse(
-                iterable=buffer_to_async_generator(buffer.getvalue()),
+                iterable=buffer_to_async_generator(buffer),
                 headers={
                     "Content-Disposition": f"attachment; filename=audio.{req.format}",
                 },

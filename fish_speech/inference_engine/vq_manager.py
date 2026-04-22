@@ -1,3 +1,5 @@
+import gc
+import os
 from typing import Callable
 
 import torch
@@ -6,33 +8,244 @@ from loguru import logger
 from fish_speech.models.dac.modded_dac import DAC
 
 
-class VQManager:
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
 
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+class VQManager:
     def __init__(self):
-        # Make Pylance happy (attribut/method not defined...)
+        # Make Pylance happy
         self.decoder_model: DAC
         self.load_audio: Callable
 
-    def decode_vq_tokens(self, codes):
-        chunk_len = codes.shape[1] if codes.dim() >= 2 else 0
+    def _cuda_index(self, device: torch.device | str | None = None) -> int | None:
+        if not torch.cuda.is_available():
+            return None
+
+        if device is None:
+            return torch.cuda.current_device()
+
+        if isinstance(device, str):
+            device = torch.device(device)
+
+        if device.type != "cuda":
+            return None
+
+        return torch.cuda.current_device() if device.index is None else device.index
+
+    def _cuda_free_gb(self, device: torch.device | str | None = None) -> float | None:
+        """
+        Грубая оценка "свободной" памяти с точки зрения текущего процесса.
+        Берём максимум из allocated/reserved, чтобы быть консервативными.
+        """
+        cuda_idx = self._cuda_index(device)
+        if cuda_idx is None:
+            return None
+
+        props = torch.cuda.get_device_properties(cuda_idx)
+        total_bytes = props.total_memory
+        reserved_bytes = torch.cuda.memory_reserved(cuda_idx)
+        allocated_bytes = torch.cuda.memory_allocated(cuda_idx)
+        used_bytes = max(reserved_bytes, allocated_bytes)
+
+        free_bytes = max(0, total_bytes - used_bytes)
+        return free_bytes / (1024**3)
+
+    def _light_cuda_cleanup(self) -> None:
+        if not torch.cuda.is_available():
+            return
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def _maybe_cleanup_before_decode(
+        self,
+        *,
+        device: torch.device | str | None,
+        chunk_len: int,
+        reason: str,
+    ) -> None:
+        """
+        Перед декодированием проверяем запас VRAM.
+        Если запас слишком маленький — делаем лёгкую очистку.
+        Это не так дорого, как полный clear_caches, но часто спасает
+        от падения на мелкой дополнительной аллокации внутри DAC.
+        """
+        min_free_gb = _env_float("FISH_DAC_MIN_FREE_GB", 1.0)
+        free_before = self._cuda_free_gb(device)
+        if free_before is None or free_before >= min_free_gb:
+            return
+
+        logger.warning(
+            "DAC pre-decode cleanup: low free VRAM {:.2f} GB < {:.2f} GB "
+            "(chunk_len={}, reason={})",
+            free_before,
+            min_free_gb,
+            chunk_len,
+            reason,
+        )
+
+        cuda_idx = self._cuda_index(device)
+        if cuda_idx is not None:
+            try:
+                torch.cuda.synchronize(cuda_idx)
+            except Exception:
+                pass
+
+        self._light_cuda_cleanup()
+
+        free_after = self._cuda_free_gb(device)
+        if free_after is not None:
+            logger.info(
+                "DAC pre-decode cleanup done: free VRAM {:.2f} -> {:.2f} GB",
+                free_before,
+                free_after,
+            )
+
+    def _decode_codes_chunk(
+        self,
+        codes: torch.Tensor,
+        *,
+        depth: int = 0,
+    ) -> torch.Tensor:
+        """
+        Декодирует один кусок кодов.
+        Если даже этот кусок ловит OOM — режем его пополам и пытаемся
+        декодировать рекурсивно. Это даёт "аварийный" режим вместо падения
+        всего процесса.
+        """
+        if codes.ndim != 2:
+            raise ValueError(f"Expected codes with shape [num_codebooks, time], got {codes.shape}")
+
+        chunk_len = int(codes.shape[1])
+        if chunk_len == 0:
+            return torch.empty(0, dtype=torch.float32)
+
+        device = getattr(self.decoder_model, "device", None)
+        if device is None:
+            device = codes.device if codes.is_cuda else torch.device("cpu")
+        elif isinstance(device, str):
+            device = torch.device(device)
+
+        self._maybe_cleanup_before_decode(
+            device=device,
+            chunk_len=chunk_len,
+            reason=f"decode_chunk_depth_{depth}",
+        )
+
+        try:
+            # Важно: кодируем на GPU, но результат сразу выносим на CPU,
+            # чтобы не держать уже готовый аудиофрагмент в VRAM.
+            audio = self.decoder_model.from_indices(
+                codes.to(device=device, dtype=torch.long, non_blocking=True)[None]
+            )[0].squeeze()
+
+            return audio.detach().cpu()
+
+        except RuntimeError as e:
+            oom = "out of memory" in str(e).lower()
+            if not oom or chunk_len <= 1:
+                raise
+
+            # Если даже этот кусок не влез — очищаем кеш и режем пополам.
+            logger.warning(
+                "DAC chunk decode OOM at depth={} chunk_len={}, split and retry",
+                depth,
+                chunk_len,
+            )
+            self._light_cuda_cleanup()
+
+            mid = chunk_len // 2
+            left = self._decode_codes_chunk(codes[:, :mid], depth=depth + 1)
+            right = self._decode_codes_chunk(codes[:, mid:], depth=depth + 1)
+            return torch.cat([left, right], dim=-1)
+
+    def decode_vq_tokens(self, codes: torch.Tensor) -> torch.Tensor:
+        """
+        Декодирует VQ-коды в waveform.
+
+        Ключевая идея:
+        - не пихать в DAC слишком длинный кусок за один раз;
+        - при OOM уметь автоматически дробить кусок ещё сильнее;
+        - переносить уже готовые аудиочасти на CPU как можно раньше.
+        """
+        if not isinstance(codes, torch.Tensor):
+            raise TypeError(f"codes must be a torch.Tensor, got {type(codes)}")
+
+        if codes.ndim != 2:
+            raise ValueError(
+                f"Expected codes shape [num_codebooks, time], got {codes.shape}"
+            )
+
+        chunk_len = int(codes.shape[1])
         logger.info("VQ features: {} (stream chunk={})", codes.shape, chunk_len)
 
-        if isinstance(self.decoder_model, DAC):
-            return self.decoder_model.from_indices(codes[None])[0].squeeze()
+        if not isinstance(self.decoder_model, DAC):
+            raise ValueError(f"Unknown model type: {type(self.decoder_model)}")
 
-        raise ValueError(f"Unknown model type: {type(self.decoder_model)}")
+        if chunk_len == 0:
+            return torch.empty(0, dtype=torch.float32)
+
+        # Сколько semantic-кадров DAC пытаемся декодировать за один вызов.
+        # 4 — хороший старт для стабильности на почти забитой 5090.
+        max_codes_per_step = max(1, _env_int("FISH_DAC_MAX_CODES_PER_STEP", 4))
+
+        if chunk_len <= max_codes_per_step:
+            return self._decode_codes_chunk(codes)
+
+        audio_parts: list[torch.Tensor] = []
+        empty_between_microchunks = os.environ.get(
+            "FISH_DAC_EMPTY_CACHE_BETWEEN_MICROCHUNKS", ""
+        ).strip() in {"1", "true", "TRUE", "yes", "YES", "on", "ON"}
+
+        for start in range(0, chunk_len, max_codes_per_step):
+            end = min(chunk_len, start + max_codes_per_step)
+            sub_codes = codes[:, start:end]
+
+            logger.info(
+                "DAC micro-decode: frames {}:{} / {}",
+                start,
+                end,
+                chunk_len,
+            )
+
+            audio_part = self._decode_codes_chunk(sub_codes)
+            audio_parts.append(audio_part)
+
+            if empty_between_microchunks and torch.cuda.is_available():
+                self._light_cuda_cleanup()
+
+        if len(audio_parts) == 1:
+            return audio_parts[0]
+
+        return torch.cat(audio_parts, dim=-1)
 
     def encode_reference(self, reference_audio, enable_reference_audio):
         if enable_reference_audio and reference_audio is not None:
-            # Load audios, and prepare basic info here
+            # Загружаем референс на CPU.
             if hasattr(self.decoder_model, "spec_transform"):
                 sample_rate = self.decoder_model.spec_transform.sample_rate
             else:
                 sample_rate = self.decoder_model.sample_rate
+
             reference_audio_content = self.load_audio(reference_audio, sample_rate)
 
-            # Keep audio on CPU; run encoder on CPU to avoid OOM (encoder on long ref
-            # can use ~14+ GB GPU and we're already near 16 GB after warmup).
+            # Референс тоже держим максимально "дешёвым" по VRAM.
             audios = torch.from_numpy(reference_audio_content)[None, None, :]
             audio_lengths = torch.tensor([audios.shape[2]], dtype=torch.long)
             logger.info(
@@ -42,7 +255,11 @@ class VQManager:
             if isinstance(self.decoder_model, DAC):
                 device = getattr(self.decoder_model, "device", None)
                 on_cuda = device is not None and str(device).startswith("cuda")
+
                 if on_cuda:
+                    # На длинном референсе энкодер может скушать очень много VRAM.
+                    # Поэтому временно выносим DAC на CPU, кодируем референс там,
+                    # а потом возвращаем модель обратно.
                     torch.cuda.empty_cache()
                     self.decoder_model.to("cpu")
                     try:
@@ -55,6 +272,7 @@ class VQManager:
                     prompt_tokens = self.decoder_model.encode(audios, audio_lengths)[0][
                         0
                     ]
+
                 logger.info("Encoded prompt: {}", prompt_tokens.shape)
             else:
                 raise ValueError(f"Unknown model type: {type(self.decoder_model)}")

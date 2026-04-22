@@ -24,6 +24,10 @@ from fish_speech.content_sequence import (
 from fish_speech.conversation import Conversation, Message
 from fish_speech.tokenizer import IM_END_TOKEN
 
+# Явные ack-команды между consumer (inference loop) и producer (worker).
+ACK_CONTINUE = "continue"
+ACK_ABORT = "abort"
+
 
 def _to_normal_tensor(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     """
@@ -44,23 +48,13 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.strip() in {"1", "true", "TRUE", "yes", "YES", "on", "ON"}
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw.strip())
-    except Exception:
-        return default
-
-
 def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if raw is None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
         return default
     try:
-        return float(raw.strip())
-    except Exception:
+        return float(raw)
+    except ValueError:
         return default
 
 
@@ -79,6 +73,36 @@ def _normalize_cleanup_mode(cleanup_mode: str | None) -> str:
         "none": "none",
     }
     return aliases.get(mode, mode)
+
+
+def _cuda_index(device: torch.device | str | None = None) -> int | None:
+    if not torch.cuda.is_available():
+        return None
+
+    if device is None:
+        return torch.cuda.current_device()
+
+    if isinstance(device, str):
+        device = torch.device(device)
+
+    if device.type != "cuda":
+        return None
+
+    return torch.cuda.current_device() if device.index is None else device.index
+
+
+def _cuda_free_gb(device: torch.device | str | None = None) -> float | None:
+    cuda_idx = _cuda_index(device)
+    if cuda_idx is None:
+        return None
+
+    props = torch.cuda.get_device_properties(cuda_idx)
+    total_bytes = props.total_memory
+    reserved_bytes = torch.cuda.memory_reserved(cuda_idx)
+    allocated_bytes = torch.cuda.memory_allocated(cuda_idx)
+    used_bytes = max(reserved_bytes, allocated_bytes)
+    free_bytes = max(0, total_bytes - used_bytes)
+    return free_bytes / (1024**3)
 
 
 def _light_cuda_cleanup() -> None:
@@ -174,6 +198,41 @@ def _run_request_cleanup(
             after_clear_gb,
             req_tag,
         )
+
+
+def _maybe_force_cleanup_before_request(
+    *,
+    model: torch.nn.Module,
+    req_tag: str,
+    cleanup_mode: str,
+) -> None:
+    """
+    Если мы живём в session_idle режиме, но VRAM уже почти не осталось,
+    лучше один раз сделать heavy cleanup до старта нового запроса,
+    чем уронить процесс посередине DAC decode.
+    """
+    if _normalize_cleanup_mode(cleanup_mode) != "session_idle":
+        return
+
+    min_free_gb = _env_float("FISH_SESSION_IDLE_MIN_FREE_GB", 1.5)
+    device = next(model.parameters()).device
+    free_gb = _cuda_free_gb(device)
+    if free_gb is None or free_gb >= min_free_gb:
+        return
+
+    logger.warning(
+        "worker: low free VRAM before request req={} free={:.2f} GB < {:.2f} GB, "
+        "forcing heavy cleanup before generation",
+        req_tag,
+        free_gb,
+        min_free_gb,
+    )
+    _run_request_cleanup(
+        model=model,
+        cleanup_mode="request_end",
+        req_tag=req_tag,
+        reason="pre_request_low_free_vram",
+    )
 
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -1154,16 +1213,9 @@ def launch_thread_safe_queue(
     memory_info: dict | None = None,
 ):
     """
-    Создаёт один worker-поток для LLM.
-
-    Важные изменения:
-    1. input_queue теперь ограниченная по размеру
-       -> backend не будет бесконечно принимать новые запросы в хвост.
-    2. в stream-режиме worker ждёт ack с timeout
-       -> если клиент оборвал соединение, worker не зависнет навсегда.
+    memory_info: optional shared dict; worker will set llama_param_gb, llama_param_count after load.
     """
-    request_queue_maxsize = max(1, _env_int("FISH_LLM_REQUEST_QUEUE_MAXSIZE", 1))
-    input_queue = queue.Queue(maxsize=request_queue_maxsize)
+    input_queue = queue.Queue()
     init_event = threading.Event()
 
     def worker():
@@ -1216,11 +1268,12 @@ def launch_thread_safe_queue(
             stream_empty_cache = kwargs.pop("stream_empty_cache", None)
             if stream_empty_cache is None:
                 stream_empty_cache = _env_flag("FISH_STREAM_EMPTY_CACHE", False)
-            did_run_cleanup = False
 
-            # Таймаут ожидания подтверждения от consumer'а стрима.
-            # Если HTTP/WebSocket клиент исчез, worker не должен висеть бесконечно.
-            ack_timeout_sec = _env_float("FISH_STREAM_ACK_TIMEOUT_SEC", 15.0)
+            ack_timeout_sec = max(
+                0.1, _env_float("FISH_STREAM_ACK_TIMEOUT_SEC", 15.0)
+            )
+            did_run_cleanup = False
+            abort_requested = False
 
             if control == "cleanup":
                 try:
@@ -1254,6 +1307,14 @@ def launch_thread_safe_queue(
                     )
                 continue
 
+            # В режиме session_idle не делаем heavy cleanup всегда,
+            # но если VRAM уже опасно мала — чистим до старта запроса.
+            _maybe_force_cleanup_before_request(
+                model=model,
+                req_tag=req_tag,
+                cleanup_mode=cleanup_mode,
+            )
+
             if stream_tokens:
                 logger.info(
                     "stream: worker got request req={} stream_chunk_size={} initial_stream_chunk_size={} cleanup_mode={}",
@@ -1275,6 +1336,7 @@ def launch_thread_safe_queue(
                             req_tag,
                         )
                     put_count += 1
+
                     if profile_cadence:
                         now = time.perf_counter()
                         delta_ms = (now - t_last_put) * 1000.0
@@ -1306,31 +1368,46 @@ def launch_thread_safe_queue(
                             text=getattr(chunk, "text", None),
                         )
 
-                    # response_queue ограниченная.
-                    # Это ещё одна страховка, чтобы промежуточные chunk'и не копились пачкой.
                     response_queue.put(
                         WrappedGenerateResponse(status="success", response=out)
                     )
 
-                    # В streaming-режиме ждём подтверждение,
-                    # что предыдущий chunk действительно обработан до конца.
+                    # Strict backpressure:
+                    # ждём подтверждение от inference loop после DAC decode.
                     if stream_tokens and ack_queue is not None:
                         try:
-                            ack_queue.get(timeout=ack_timeout_sec)
+                            ack = ack_queue.get(timeout=ack_timeout_sec)
                         except queue.Empty:
                             raise TimeoutError(
                                 f"Timed out waiting for stream ack after {ack_timeout_sec:.1f}s for req={req_tag}"
                             )
 
+                        if ack == ACK_ABORT:
+                            abort_requested = True
+                            logger.warning(
+                                "stream: worker got abort ack req={} put_count={}",
+                                req_tag,
+                                put_count,
+                            )
+                            break
+
                     if stream_tokens and stream_empty_cache and torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
-                _run_request_cleanup(
-                    model=model,
-                    cleanup_mode=cleanup_mode,
-                    req_tag=req_tag,
-                    reason="request_success",
-                )
+                if abort_requested:
+                    _run_request_cleanup(
+                        model=model,
+                        cleanup_mode=cleanup_mode,
+                        req_tag=req_tag,
+                        reason="consumer_abort",
+                    )
+                else:
+                    _run_request_cleanup(
+                        model=model,
+                        cleanup_mode=cleanup_mode,
+                        req_tag=req_tag,
+                        reason="request_success",
+                    )
                 did_run_cleanup = True
 
             except Exception as e:
@@ -1342,7 +1419,10 @@ def launch_thread_safe_queue(
                     exc_info=True,
                 )
                 logger.error(traceback.format_exc())
-                response_queue.put(WrappedGenerateResponse(status="error", response=e))
+
+                # Если consumer уже попросил abort, не надо ещё раз слать ошибку наружу.
+                if not abort_requested:
+                    response_queue.put(WrappedGenerateResponse(status="error", response=e))
 
             finally:
                 if not did_run_cleanup:

@@ -96,6 +96,13 @@ def _cuda_free_gb(device: torch.device | str | None = None) -> float | None:
     if cuda_idx is None:
         return None
 
+    if hasattr(torch.cuda, "mem_get_info"):
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(cuda_idx)
+            return free_bytes / (1024**3)
+        except Exception:
+            pass    
+
     props = torch.cuda.get_device_properties(cuda_idx)
     total_bytes = props.total_memory
     reserved_bytes = torch.cuda.memory_reserved(cuda_idx)
@@ -166,6 +173,34 @@ def _run_request_cleanup(
         return
 
     if mode == "session_idle":
+        try:
+            device = next(model.parameters()).device
+        except StopIteration:
+            device = None
+
+        free_gb = _cuda_free_gb(device)
+        force_heavy_below_gb = _env_float(
+            "FISH_SESSION_IDLE_FORCE_HEAVY_BELOW_GB", 3.0
+        )
+
+        if free_gb is not None and free_gb < force_heavy_below_gb:
+            logger.warning(
+                "worker: session_idle fallback to heavy cleanup req={} free={:.2f} GB < {:.2f} GB reason={}",
+                req_tag,
+                free_gb,
+                force_heavy_below_gb,
+                reason,
+            )
+            before_clear_gb, after_clear_gb = _heavy_cuda_cleanup(model)
+            if before_clear_gb is not None:
+                logger.info(
+                    "worker: clear_caches done alloc before={} GB after={} GB req={}",
+                    before_clear_gb,
+                    after_clear_gb,
+                    req_tag,
+                )
+            return
+        
         logger.info(
             "worker: keeping model warm req={} mode={} reason={}",
             req_tag,
@@ -214,7 +249,7 @@ def _maybe_force_cleanup_before_request(
     if _normalize_cleanup_mode(cleanup_mode) != "session_idle":
         return
 
-    min_free_gb = _env_float("FISH_SESSION_IDLE_MIN_FREE_GB", 1.5)
+    min_free_gb = _env_float("FISH_SESSION_IDLE_MIN_FREE_GB", 4.0)
     device = next(model.parameters()).device
     free_gb = _cuda_free_gb(device)
     if free_gb is None or free_gb >= min_free_gb:

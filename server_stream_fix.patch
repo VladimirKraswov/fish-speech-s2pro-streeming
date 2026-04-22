@@ -1,0 +1,215 @@
+diff --git a/tools/server/inference.py b/tools/server/inference.py
+--- a/tools/server/inference.py
++++ b/tools/server/inference.py
+@@ -1,18 +1,27 @@
+ from http import HTTPStatus
+ 
+ import numpy as np
+ from kui.asgi import HTTPException
++from loguru import logger
+ 
+ from fish_speech.inference_engine import TTSInferenceEngine
+ from fish_speech.utils.schema import ServeTTSRequest
+ 
+ # float аудио в диапазоне [-1.0, 1.0] -> int16 PCM
+ AMPLITUDE = 32768
+ 
+ 
++def _float_audio_to_pcm16_bytes(audio: np.ndarray) -> bytes:
++    audio = np.asarray(audio)
++    audio = np.clip(audio, -1.0, 1.0 - (1.0 / AMPLITUDE))
++    return (audio * AMPLITUDE).astype(np.int16, copy=False).tobytes()
++
++
+ def inference_wrapper(req: ServeTTSRequest, engine: TTSInferenceEngine):
+     """
+-    Wrapper for the inference function.
+-    Used in the API server.
++    Wrapper for streaming inference in API server.
++
++    Если стрим уже начался, HTTPException бросать нельзя:
++    клиент получит incomplete chunked read.
+     """
+     count = 0
++    header_sent = False
+ 
+     for result in engine.inference(req):
+         match result.code:
+@@ -20,34 +29,56 @@ def inference_wrapper(req: ServeTTSRequest, engine: TTSInferenceEngine):
+                 if isinstance(result.audio, tuple):
+                     header = result.audio[1]
+                     if isinstance(header, np.ndarray):
++                        header_sent = True
+                         yield header.tobytes()
+                     elif isinstance(header, (bytes, bytearray)):
++                        header_sent = True
+                         yield bytes(header)
+ 
+             case "error":
++                err = result.error or RuntimeError("Unknown TTS inference error")
++
++                if req.streaming and (header_sent or count > 0):
++                    logger.error(
++                        "Streaming TTS aborted after response start: {}",
++                        err,
++                    )
++                    return None
++
+                 raise HTTPException(
+                     HTTPStatus.INTERNAL_SERVER_ERROR,
+-                    content=str(result.error),
++                    content=str(err),
+                 )
+ 
+             case "segment":
+                 count += 1
+                 if isinstance(result.audio, tuple):
+-                    yield (result.audio[1] * AMPLITUDE).astype(np.int16).tobytes()
++                    audio = result.audio[1]
++                    if isinstance(audio, np.ndarray):
++                        yield _float_audio_to_pcm16_bytes(audio)
++                    elif isinstance(audio, (bytes, bytearray)):
++                        yield bytes(audio)
+ 
+             case "final":
+-                # В streaming-режиме final уже содержит весь звук целиком,
+-                # а segment уже были отправлены ранее.
+-                # Если отдать final ещё раз, пользователь услышит дубль.
++                # В streaming-режиме final не должен отправляться повторно.
+                 if req.streaming:
+                     return None
+ 
+                 count += 1
+                 if isinstance(result.audio, tuple):
+                     final = result.audio[1]
+                     if isinstance(final, np.ndarray):
+-                        yield (final * AMPLITUDE).astype(np.int16).tobytes()
++                        yield _float_audio_to_pcm16_bytes(final)
+                     elif isinstance(final, (bytes, bytearray)):
+                         yield bytes(final)
+                 return None
+ 
+     if count == 0:
++        if req.streaming and header_sent:
++            logger.warning("Streaming TTS finished without audio body after WAV header")
++            return None
++
+         raise HTTPException(
+             HTTPStatus.INTERNAL_SERVER_ERROR,
+             content="No audio generated, please check the input text.",
+diff --git a/tools/server/api_utils.py b/tools/server/api_utils.py
+--- a/tools/server/api_utils.py
++++ b/tools/server/api_utils.py
+@@ -54,10 +54,9 @@ class MsgPackRequest(HttpRequest):
+ 
+ 
+ async def inference_async(req: ServeTTSRequest, engine: TTSInferenceEngine):
+     for chunk in inference(req, engine):
+-        print("Got chunk")
+-        if isinstance(chunk, bytes):
+-            yield chunk
++        if isinstance(chunk, (bytes, bytearray, memoryview)):
++            yield bytes(chunk)
+ 
+ 
+ async def buffer_to_async_generator(buffer):
+     yield buffer
+diff --git a/tools/server/views.py b/tools/server/views.py
+--- a/tools/server/views.py
++++ b/tools/server/views.py
+@@ -128,6 +128,35 @@ def _dump_memory_snapshot(out_dir: str = "/workspace") -> tuple[str | None, str
+         return (
+             None,
+             f"Dump failed: {e!r} (need PyTorch built with CUDA memory snapshot support?)",
+         )
++
++
++def _is_no_audio_generated_error(exc: Exception | str | None) -> bool:
++    if exc is None:
++        return False
++    return "No audio generated, please check the input text." in str(exc)
++
++
++def _collect_non_streaming_audio(engine, req) -> np.ndarray:
++    """
++    Собирает аудио из engine.inference(req) для non-streaming режима.
++
++    Если есть final с полным буфером — используем его.
++    Иначе собираем segment-части.
++    """
++    segments = []
++    final_audio = None
++
++    for result in engine.inference(req):
++        if result.code == "error" and result.error:
++            raise RuntimeError(str(result.error))
++
++        if result.code == "segment" and isinstance(result.audio, tuple):
++            segments.append(result.audio[1])
++        elif result.code == "final" and isinstance(result.audio, tuple):
++            final_audio = result.audio[1]
++
++    if isinstance(final_audio, np.ndarray):
++        return final_audio
++    if segments:
++        return np.concatenate(segments, axis=0)
++    raise RuntimeError("No audio generated, please check the input text.")
+ 
+ 
+ @routes.http.get("/v1/debug/memory")
+ async def debug_memory():
+@@ -261,6 +290,28 @@ async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
+             raise HTTPException(
+                 HTTPStatus.BAD_REQUEST,
+                 content="Streaming only supports WAV and PCM formats",
+             )
++
++        # Специальный control-запрос для cleanup.
++        # Он не обязан генерировать аудио и не должен превращаться в 500
++        # только из-за "No audio generated".
++        if req.control == "cleanup":
++            try:
++                for result in engine.inference(req):
++                    if result.code == "error" and result.error:
++                        raise RuntimeError(str(result.error))
++                return Response(status_code=204)
++            except RuntimeError as e:
++                if _is_no_audio_generated_error(e):
++                    logger.info("TTS cleanup completed without audio generation")
++                    return Response(status_code=204)
++                raise HTTPException(
++                    HTTPStatus.INTERNAL_SERVER_ERROR,
++                    content=f"Cleanup failed: {e}",
++                )
++            except Exception as e:
++                logger.error(f"Error in TTS cleanup: {e}", exc_info=True)
++                raise HTTPException(
++                    HTTPStatus.INTERNAL_SERVER_ERROR,
++                    content="Failed to cleanup TTS backend",
++                )
+ 
+         # Perform TTS
+         if req.streaming:
+@@ -273,18 +324,7 @@ async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
+                 },
+                 content_type=get_content_type(req.format),
+             )
+         else:
+-            chunks = []
+-            for result in engine.inference(req):
+-                if result.code == "error" and result.error:
+-                    raise RuntimeError(str(result.error))
+-                if result.code in ("segment", "final") and isinstance(
+-                    result.audio, tuple
+-                ):
+-                    chunks.append(result.audio[1])
+-            if not chunks:
+-                raise HTTPException(
+-                    HTTPStatus.INTERNAL_SERVER_ERROR,
+-                    content="No audio generated, please check the input text.",
+-                )
+-            fake_audios = np.concatenate(chunks, axis=0)
++            fake_audios = _collect_non_streaming_audio(engine, req)
+             buffer = io.BytesIO()
+             sf.write(
+                 buffer,

@@ -859,6 +859,33 @@ class DAC(BaseModel, CodecMixin):
         self.delay = self.get_delay()
 
         self.frame_length = self.hop_length * 4
+        self._weight_norm_removed = False
+
+    def _remove_weight_norm_parametrizations(self) -> int:
+        removed = 0
+        for module in self.modules():
+            parametrizations = getattr(module, "parametrizations", None)
+            if parametrizations is None:
+                continue
+            try:
+                has_weight = "weight" in parametrizations
+            except TypeError:
+                has_weight = hasattr(parametrizations, "weight")
+            if not has_weight:
+                continue
+            try:
+                remove_parametrizations(module, "weight", leave_parametrized=True)
+                removed += 1
+            except ValueError:
+                continue
+        return removed
+
+    def optimize_for_inference(self, remove_weight_norm: bool = True) -> int:
+        if not remove_weight_norm or self._weight_norm_removed:
+            return 0
+        removed = self._remove_weight_norm_parametrizations()
+        self._weight_norm_removed = True
+        return removed
 
     def preprocess(self, audio_data, sample_rate):
         if sample_rate is None:

@@ -355,7 +355,20 @@ async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
                 content_type=get_content_type(req.format),
             )
         else:
-            fake_audios = _collect_non_streaming_audio(engine, req)
+            chunks = []
+            for result in engine.inference(req):
+                if result.code == "error" and result.error:
+                    raise RuntimeError(str(result.error))
+                if result.code in ("segment", "final") and isinstance(
+                    result.audio, tuple
+                ):
+                    chunks.append(result.audio[1])
+            if not chunks:
+                raise HTTPException(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    content="No audio generated, please check the input text.",
+                )
+            fake_audios = np.concatenate(chunks, axis=0)
             buffer = io.BytesIO()
             sf.write(
                 buffer,

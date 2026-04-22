@@ -34,6 +34,21 @@ class VQManager:
         self.decoder_model: DAC
         self.load_audio: Callable
 
+    def _decoder_device(self) -> torch.device:
+        device = getattr(self.decoder_model, "device", None)
+        if device is not None:
+            return torch.device(device)
+
+        try:
+            return next(self.decoder_model.parameters()).device
+        except StopIteration:
+            return torch.device("cpu")
+
+    def _decoder_dtype(self) -> torch.dtype:
+        try:
+            return next(self.decoder_model.parameters()).dtype
+        except StopIteration:
+            return torch.float32
     def _cuda_index(self, device: torch.device | str | None = None) -> int | None:
         if not torch.cuda.is_available():
             return None
@@ -50,13 +65,16 @@ class VQManager:
         return torch.cuda.current_device() if device.index is None else device.index
 
     def _cuda_free_gb(self, device: torch.device | str | None = None) -> float | None:
-        """
-        Грубая оценка "свободной" памяти с точки зрения текущего процесса.
-        Берём максимум из allocated/reserved, чтобы быть консервативными.
-        """
         cuda_idx = self._cuda_index(device)
         if cuda_idx is None:
             return None
+        
+        if hasattr(torch.cuda, "mem_get_info"):
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info(cuda_idx)
+                return free_bytes / (1024**3)
+            except Exception:
+                pass        
 
         props = torch.cuda.get_device_properties(cuda_idx)
         total_bytes = props.total_memory
@@ -67,8 +85,37 @@ class VQManager:
         free_bytes = max(0, total_bytes - used_bytes)
         return free_bytes / (1024**3)
 
-    def _light_cuda_cleanup(self) -> None:
-        if not torch.cuda.is_available():
+    def _light_cuda_cleanup(self, device: torch.device | str | None = None) -> None:
+        cuda_idx = self._cuda_index(device)
+        if cuda_idx is None:
+             return
+        try:
+            torch.cuda.synchronize(cuda_idx)
+        except Exception:
+            pass
+         gc.collect()
+         torch.cuda.empty_cache()
+
+    def _decode_codes_chunk_cpu_fallback(self, codes: torch.Tensor) -> torch.Tensor:
+        original_device = self._decoder_device()
+        original_dtype = self._decoder_dtype()
+
+        logger.warning(
+            "DAC emergency CPU fallback activated chunk_len={} original_device={}",
+            int(codes.shape[1]),
+            original_device,
+        )
+
+        try:
+            self.decoder_model.to(device="cpu", dtype=original_dtype)
+            with torch.inference_mode():
+                audio = self.decoder_model.from_indices(
+                    codes.to(device="cpu", dtype=torch.long, non_blocking=False)[None]
+                )[0].squeeze()
+            return audio.detach().cpu()
+        finally:
+            self.decoder_model.to(device=original_device, dtype=original_dtype)
+            self._light_cuda_cleanup(original_device)
             return
         gc.collect()
         torch.cuda.empty_cache()
@@ -107,7 +154,12 @@ class VQManager:
             except Exception:
                 pass
 
-        self._light_cuda_cleanup()
+            self._light_cuda_cleanup(device)
+
+            if chunk_len <= 1 and os.environ.get(
+                "FISH_DAC_CPU_FALLBACK_ON_OOM", ""
+            ).strip() in {"1", "true", "TRUE", "yes", "YES", "on", "ON"}:
+                return self._decode_codes_chunk_cpu_fallback(codes)
 
         free_after = self._cuda_free_gb(device)
         if free_after is not None:
@@ -204,6 +256,23 @@ class VQManager:
         # Сколько semantic-кадров DAC пытаемся декодировать за один вызов.
         # 4 — хороший старт для стабильности на почти забитой 5090.
         max_codes_per_step = max(1, _env_int("FISH_DAC_MAX_CODES_PER_STEP", 4))
+
+        decoder_device = self._decoder_device()
+        free_gb = self._cuda_free_gb(decoder_device)
+        low_free_gb = _env_float("FISH_DAC_LOW_FREE_GB", 2.5)
+        critical_free_gb = _env_float("FISH_DAC_CRITICAL_FREE_GB", 1.25)
+
+        if free_gb is not None:
+            if free_gb < critical_free_gb:
+                max_codes_per_step = 1
+            elif free_gb < low_free_gb:
+                max_codes_per_step = min(max_codes_per_step, 2)
+
+            logger.info(
+                "DAC decode budget: free_vram_gb={:.2f} max_codes_per_step={}",
+                free_gb,
+                max_codes_per_step,
+            )
 
         if chunk_len <= max_codes_per_step:
             return self._decode_codes_chunk(codes)

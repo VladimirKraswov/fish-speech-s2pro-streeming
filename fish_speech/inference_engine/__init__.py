@@ -39,6 +39,17 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         self.precision = precision
         self.compile = compile
 
+        optimize_for_inference = getattr(self.decoder_model, "optimize_for_inference", None)
+        if callable(optimize_for_inference):
+            try:
+                removed = optimize_for_inference(remove_weight_norm=True)
+                logger.info(
+                    "DAC inference optimization enabled: removed_weight_norm_layers={}",
+                    removed,
+                )
+            except Exception as opt_err:
+                logger.warning("DAC inference optimization skipped: {}", opt_err)
+
     def inference(self, req: ServeTTSRequest) -> Generator[InferenceResult, None, None]:
         """
         Главный inference pipeline:
@@ -396,10 +407,11 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         Декодирует VQ коды в numpy waveform.
         """
 
-        with autocast_exclude_mps(
-            device_type=self.decoder_model.device.type,
-            dtype=self.precision,
-        ):
-            segment = self.decode_vq_tokens(codes=codes)
+        with torch.inference_mode():
+            with autocast_exclude_mps(
+                device_type=self.decoder_model.device.type,
+                dtype=self.precision,
+            ):
+                segment = self.decode_vq_tokens(codes=codes)
 
         return segment.float().detach().cpu().numpy()

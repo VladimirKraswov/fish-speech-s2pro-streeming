@@ -2,7 +2,6 @@
 import asyncio
 import base64
 import json
-import os
 import logging
 import struct
 import time
@@ -16,7 +15,6 @@ from fastapi.responses import StreamingResponse
 
 UPSTREAM_TTS_URL = "http://127.0.0.1:8080/v1/tts"
 UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=None)
-DEFAULT_REFERENCE_ID = os.environ.get("DEFAULT_REFERENCE_ID", "ref")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -110,17 +108,11 @@ async def pcm_stream(
     reference_id: str | None = Query(default=None),
 ):
     req_id = uuid.uuid4().hex[:8]
-    effective_reference_id = (reference_id or DEFAULT_REFERENCE_ID).strip()
-    payload = {"text": text, "streaming": True, "reference_id": effective_reference_id}
+    payload = {"text": text, "streaming": True}
+    if reference_id:
+        payload["reference_id"] = reference_id
 
-    logger.info(
-        "REQ %s start text_len=%s reference_id=%s (query=%s default=%s)",
-        req_id,
-        len(text),
-        effective_reference_id,
-        reference_id,
-        DEFAULT_REFERENCE_ID,
-    )
+    logger.info("REQ %s start text_len=%s reference_id=%s", req_id, len(text), reference_id)
 
     async def emit(obj: dict) -> bytes:
         return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")

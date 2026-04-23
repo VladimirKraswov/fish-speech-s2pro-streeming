@@ -18,7 +18,6 @@ CONNECT_TIMEOUT = float(os.environ.get("PROXY_CONNECT_TIMEOUT", "10"))
 WRITE_TIMEOUT = float(os.environ.get("PROXY_WRITE_TIMEOUT", "30"))
 # read=None because upstream is a stream
 REQUEST_TIMEOUT = httpx.Timeout(connect=CONNECT_TIMEOUT, read=None, write=WRITE_TIMEOUT, pool=None)
-DEFAULT_REFERENCE_ID = os.environ.get("DEFAULT_REFERENCE_ID", "ref")
 
 
 @asynccontextmanager
@@ -83,13 +82,13 @@ async def stream(
     text: str = Query(..., min_length=1, max_length=500),
     reference_id: str | None = Query(None),
 ) -> StreamingResponse:
-    effective_reference_id = (reference_id or DEFAULT_REFERENCE_ID).strip()
     payload: dict[str, object] = {
         "text": text,
         "streaming": True,
         "format": "wav",
-        "reference_id": effective_reference_id,
     }
+    if reference_id:
+        payload["reference_id"] = reference_id
 
     request = app.state.client.build_request(
         "POST",
@@ -139,13 +138,13 @@ async def stream_segments(
     """
     import base64
 
-    effective_reference_id = (reference_id or DEFAULT_REFERENCE_ID).strip()
     payload: dict[str, object] = {
         "text": text,
         "streaming": True,
         "format": "wav",
-        "reference_id": effective_reference_id,
     }
+    if reference_id:
+        payload["reference_id"] = reference_id
 
     request = app.state.client.build_request(
         "POST",

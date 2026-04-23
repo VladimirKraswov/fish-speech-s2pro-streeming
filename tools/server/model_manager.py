@@ -56,7 +56,6 @@ class ModelManager:
 
         self.precision = torch.half if half else torch.bfloat16
 
-        # Check if MPS or CUDA is available
         if torch.backends.mps.is_available():
             self.device = "mps"
             logger.info("mps is available, running on mps.")
@@ -64,9 +63,7 @@ class ModelManager:
             self.device = "cpu"
             logger.info("CUDA is not available, running on CPU.")
 
-        # Shared dict for worker to report LLM param memory (see /v1/debug/memory).
         self._worker_memory_info = {}
-        # Load the TTS models
         self.load_llama_model(
             llama_checkpoint_path, self.device, self.precision, self.compile, self.mode
         )
@@ -80,7 +77,6 @@ class ModelManager:
             compile=self.compile,
         )
 
-        # Optional: record CUDA alloc/free history for debugging (dump via GET /v1/debug/memory?dump=1).
         if torch.cuda.is_available() and os.environ.get(
             "FISH_RECORD_MEMORY_HISTORY", ""
         ).strip() in ("1", "true", "True"):
@@ -96,7 +92,6 @@ class ModelManager:
             except Exception as e:
                 logger.warning("Could not enable CUDA memory history recording: %s", e)
 
-        # When --compile: run warmup before accepting requests so /v1/health "ready" = compiled.
         if self.mode == "tts" and self.compile:
             logger.warning(
                 "torch.compile enabled — running warmup now (Inductor compiles kernels; typically 2–10 min). "
@@ -131,9 +126,6 @@ class ModelManager:
         logger.info("Decoder model loaded.")
 
     def warm_up(self, tts_inference_engine, *, compile: bool = False) -> None:
-        # Compilation is per input shape: short prompt (warmup) compiles one graph; first
-        # request with long prompt (e.g. reference) compiles another → second delay.
-        # Use small max_new_tokens on warmup to reduce peak VRAM (fits ~32 GB with compile).
         if compile:
             logger.info(
                 "Warmup: first inference (triggers torch.compile/Inductor; "
@@ -143,7 +135,7 @@ class ModelManager:
             text="Hello world.",
             references=[],
             reference_id=None,
-            max_new_tokens=64,  # was 1024; lower = less VRAM during compile, still triggers graph
+            max_new_tokens=64,
             chunk_length=200,
             top_p=0.7,
             repetition_penalty=1.2,
@@ -152,17 +144,21 @@ class ModelManager:
         )
         list(inference(request, tts_inference_engine))
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()  # free cached VRAM so first request with reference fits in 32 GB
+            torch.cuda.empty_cache()
         logger.info("Warmup: first inference done.")
 
-        # Streaming hits a different hot path than the oneshot warmup above:
-        # prefill may be compiled already, but iterative token decode and bounded
-        # streaming pipeline can still compile lazily on the first user request.
+        # Для session mode нужен тот же low-latency streaming путь,
+        # который будет использоваться на реальных запросах.
+        stream_chunk_size = max(1, _env_int("FISH_STREAM_CHUNK_SIZE", 1))
+        initial_stream_chunk_size = _env_optional_int(
+            "FISH_INITIAL_STREAM_CHUNK_SIZE"
+        )
+        if initial_stream_chunk_size is None:
+            initial_stream_chunk_size = stream_chunk_size
+        else:
+            initial_stream_chunk_size = max(1, initial_stream_chunk_size)
+
         if compile and _env_flag("FISH_WARMUP_STREAMING", True):
-            stream_chunk_size = max(1, _env_int("FISH_STREAM_CHUNK_SIZE", 8))
-            initial_stream_chunk_size = _env_optional_int(
-                "FISH_INITIAL_STREAM_CHUNK_SIZE"
-            )
             logger.info(
                 "Warmup: streaming inference (compile iterative decode path) chunk_size={} initial_chunk_size={}",
                 stream_chunk_size,
@@ -190,14 +186,8 @@ class ModelManager:
                 torch.cuda.empty_cache()
             logger.info("Warmup: streaming inference done.")
 
-        # Optional: compile the long-prompt + streaming path so first real request is fast.
-        # Set FISH_WARMUP_REFERENCE_ID to a valid reference id (e.g. en) to run one
-        # streaming request with that reference at startup. Use ~50 word text so the
-        # compiled graph covers typical range (Hello world .. 50 words) and avoids
-        # recompile on first user request.
         warmup_ref = os.environ.get("FISH_WARMUP_REFERENCE_ID", "").strip()
         if compile and warmup_ref:
-            # Text ~50 words so prompt length is in "typical long" range; one compile covers short..long.
             warmup_long_text = (
                 "Hello, this is a longer warmup so the compiled graph covers prompts from a few words "
                 "to about fifty. We run this once at startup to avoid recompiling on the first real request."

@@ -207,6 +207,43 @@ def _effective_token_budget(requested: int) -> tuple[int, str | None]:
     return min(requested, cap), cap_env
 
 
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return max(1, default)
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return max(1, default)
+
+
+def _normalize_streaming_request(req: ServeTTSRequest) -> tuple[int, int]:
+    """
+    Жёстко выставляем low-latency streaming defaults на сервере,
+    даже если клиент session_mode их не передал явно.
+    """
+    stream_chunk_size = getattr(req, "stream_chunk_size", None)
+    if stream_chunk_size is None or int(stream_chunk_size) < 1:
+        stream_chunk_size = _env_positive_int("FISH_STREAM_CHUNK_SIZE", 1)
+        req.stream_chunk_size = stream_chunk_size
+    else:
+        stream_chunk_size = max(1, int(stream_chunk_size))
+        req.stream_chunk_size = stream_chunk_size
+
+    initial_stream_chunk_size = getattr(req, "initial_stream_chunk_size", None)
+    if initial_stream_chunk_size is None or int(initial_stream_chunk_size) < 1:
+        initial_stream_chunk_size = _env_positive_int(
+            "FISH_INITIAL_STREAM_CHUNK_SIZE",
+            stream_chunk_size,
+        )
+        req.initial_stream_chunk_size = initial_stream_chunk_size
+    else:
+        initial_stream_chunk_size = max(1, int(initial_stream_chunk_size))
+        req.initial_stream_chunk_size = initial_stream_chunk_size
+
+    return stream_chunk_size, initial_stream_chunk_size
+
+
 def _collect_non_streaming_audio(engine, req) -> np.ndarray:
     """
     Собирает аудио из engine.inference(req) для non-streaming режима.
@@ -269,18 +306,15 @@ async def vqgan_encode(req: Annotated[ServeVQGANEncodeRequest, Body(exclusive=Tr
     Encode audio using VQGAN model.
     """
     try:
-        # Get the model from the app
         model_manager: ModelManager = request.app.state.model_manager
         decoder_model = model_manager.decoder_model
 
-        # Encode the audio
         start_time = time.time()
         tokens = cached_vqgan_batch_encode(decoder_model, req.audios)
         logger.info(
             f"[EXEC] VQGAN encode time: {(time.time() - start_time) * 1000:.2f}ms"
         )
 
-        # Return the response
         return ormsgpack.packb(
             ServeVQGANEncodeResponse(tokens=[i.tolist() for i in tokens]),
             option=ormsgpack.OPT_SERIALIZE_PYDANTIC,
@@ -298,11 +332,9 @@ async def vqgan_decode(req: Annotated[ServeVQGANDecodeRequest, Body(exclusive=Tr
     Decode tokens to audio using VQGAN model.
     """
     try:
-        # Get the model from the app
         model_manager: ModelManager = request.app.state.model_manager
         decoder_model = model_manager.decoder_model
 
-        # Decode the audio
         tokens = [torch.tensor(token, dtype=torch.int) for token in req.tokens]
         start_time = time.time()
         audios = batch_vqgan_decode(decoder_model, tokens)
@@ -311,7 +343,6 @@ async def vqgan_decode(req: Annotated[ServeVQGANDecodeRequest, Body(exclusive=Tr
         )
         audios = [audio.astype(np.float16).tobytes() for audio in audios]
 
-        # Return the response
         return ormsgpack.packb(
             ServeVQGANDecodeResponse(audios=audios),
             option=ormsgpack.OPT_SERIALIZE_PYDANTIC,
@@ -330,12 +361,21 @@ async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
     """
     try:
         req_id = hex(id(req))[-6:]
-        # Get the model from the app
         app_state = request.app.state
         model_manager: ModelManager = app_state.model_manager
         engine = model_manager.tts_inference_engine
         sample_rate = engine.decoder_model.sample_rate
         effective_budget, cap_env = _effective_token_budget(req.max_new_tokens)
+
+        effective_stream_chunk_size = getattr(req, "stream_chunk_size", None)
+        effective_initial_stream_chunk_size = getattr(
+            req, "initial_stream_chunk_size", None
+        )
+
+        if req.streaming:
+            effective_stream_chunk_size, effective_initial_stream_chunk_size = (
+                _normalize_streaming_request(req)
+            )
 
         logger.info(
             "tts_request_started req={} control={} streaming={} format={} stream_tokens={} chars={} words={} stream_chunk_size={} initial_stream_chunk_size={} cleanup_mode={} original_text=\"{}\" normalized_text=\"{}\"",
@@ -346,8 +386,8 @@ async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
             req.stream_tokens,
             len(req.text),
             _log_word_count(req.text),
-            req.stream_chunk_size,
-            req.initial_stream_chunk_size,
+            effective_stream_chunk_size,
+            effective_initial_stream_chunk_size,
             req.cleanup_mode,
             _log_preview(req.text),
             _log_preview(req.text),
@@ -360,23 +400,18 @@ async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
             cap_env,
         )
 
-        # Check if the text is too long
         if app_state.max_text_length > 0 and len(req.text) > app_state.max_text_length:
             raise HTTPException(
                 HTTPStatus.BAD_REQUEST,
                 content=f"Text is too long, max length is {app_state.max_text_length}",
             )
 
-        # Check if streaming is enabled
         if req.streaming and req.format not in ("wav", "pcm"):
             raise HTTPException(
                 HTTPStatus.BAD_REQUEST,
                 content="Streaming only supports WAV and PCM formats",
             )
 
-        # Специальный control-запрос для cleanup.
-        # Он не обязан генерировать аудио и не должен превращаться в 500
-        # только из-за "No audio generated".
         if req.control == "cleanup":
             try:
                 for result in engine.inference(req):
@@ -398,7 +433,6 @@ async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
                     content="Failed to cleanup TTS backend",
                 )
 
-        # Perform TTS
         if req.streaming:
             return StreamResponse(
                 iterable=inference_async(req, engine),
@@ -429,7 +463,6 @@ async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
                 content_type=get_content_type(req.format),
             )
     except HTTPException:
-        # Re-raise HTTP exceptions as they are already properly formatted
         raise
     except Exception as e:
         logger.error(f"Error in TTS generation: {e}", exc_info=True)
@@ -448,29 +481,24 @@ async def add_reference(
     temp_file_path = None
 
     try:
-        # Validate input parameters
         if not id or not id.strip():
             raise ValueError("Reference ID cannot be empty")
 
         if not text or not text.strip():
             raise ValueError("Reference text cannot be empty")
 
-        # Get the model manager to access the reference loader
         app_state = request.app.state
         model_manager: ModelManager = app_state.model_manager
         engine = model_manager.tts_inference_engine
 
-        # Read the uploaded audio file
         audio_content = audio.read()
         if not audio_content:
             raise ValueError("Audio file is empty or could not be read")
 
-        # Create a temporary file for the audio data
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
             temp_file.write(audio_content)
             temp_file_path = temp_file.name
 
-        # Add the reference using the engine's reference loader
         engine.add_reference(id, temp_file_path, text)
 
         response = AddReferenceResponse(
@@ -509,7 +537,6 @@ async def add_reference(
         return format_response(response, status_code=500)
 
     finally:
-        # Clean up temporary file
         if temp_file_path and os.path.exists(temp_file_path):
             try:
                 os.unlink(temp_file_path)

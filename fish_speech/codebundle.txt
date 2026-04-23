@@ -1,7 +1,7 @@
 === CODE BUNDLE ===
 root: /Volumes/Extend/work/fish-speech-s2pro-streeming/fish_speech
 ignore: .codebundleignore
-generated: 2026-04-21T19:13:53.944Z
+generated: 2026-04-23T20:08:55.720Z
 
 
 
@@ -641,12 +641,15 @@ callbacks:
 path: /content_sequence.py
 ----------------------------------------
 from dataclasses import dataclass, field
-from typing import List, Literal, Union
+from typing import Literal, Union
 
 import numpy as np
 import torch
 
 from fish_speech.tokenizer import (
+    AUDIO_EMBED_TOKEN,
+    AUDIO_END_TOKEN,
+    AUDIO_START_TOKEN,
     IM_END_TOKEN,
     MODALITY_TOKENS,
     FishTokenizer,
@@ -677,6 +680,12 @@ class VQPart(BasePart):
     def __post_init__(self: "VQPart"):
         self.type = "vq"
         self.codes = restore_ndarray(self.codes, to_tensor=True)
+        if not isinstance(self.codes, torch.Tensor):
+            raise TypeError("VQPart.codes must be a torch.Tensor")
+        if self.codes.ndim != 2:
+            raise ValueError(
+                f"VQPart.codes must have shape [num_codebooks, time], got {self.codes.shape}"
+            )
 
 
 @dataclass(kw_only=True)
@@ -699,6 +708,12 @@ class AudioPart(BasePart):
     def __post_init__(self: "AudioPart"):
         self.type = "audio"
         self.features = restore_ndarray(self.features, to_tensor=True)
+        if not isinstance(self.features, torch.Tensor):
+            raise TypeError("AudioPart.features must be a torch.Tensor")
+        if self.features.ndim != 2:
+            raise ValueError(
+                f"AudioPart.features must have shape [time, dim], got {self.features.shape}"
+            )
 
 
 @dataclass(kw_only=True)
@@ -707,9 +722,9 @@ class EncodedMessage:
     labels: torch.Tensor
     vq_mask_tokens: torch.Tensor | None = None
     vq_mask_labels: torch.Tensor | None = None
-    vq_parts: list[torch.Tensor]
+    vq_parts: list[torch.Tensor] = field(default_factory=list)
     vq_require_losses: torch.Tensor | None = None
-    audio_parts: list[torch.Tensor]
+    audio_parts: list[torch.Tensor] = field(default_factory=list)
     audio_masks: torch.Tensor | None = None
     metadata: dict | None = None
 
@@ -718,7 +733,8 @@ class EncodedMessage:
 class ContentSequence:
     """
     Flexible sequence of content parts that supports interleaved multimodal format.
-    Example format: <|interleave|><|speaker:1|> TEXT AUDIO <|im_end|><|speaker:2|> TEXT AUDIO <|im_end|>
+    Example format:
+    <|interleave|><|speaker:1|> TEXT AUDIO <|im_end|><|speaker:2|> TEXT AUDIO <|im_end|>
     """
 
     parts: list[BasePart] = field(default_factory=list)
@@ -749,10 +765,8 @@ class ContentSequence:
 
         self.parts = fixed_parts
 
-        # If modality is specified, add it at the beginning if it's not already there
         if self.modality and not (
             len(self.parts) > 0
-            and isinstance(self.parts[0], dict) is False
             and isinstance(self.parts[0], TextPart)
             and self.parts[0].text is not None
             and self.parts[0].text.startswith(MODALITY_TOKENS[self.modality])
@@ -762,7 +776,7 @@ class ContentSequence:
 
     def append(
         self: "ContentSequence",
-        part_or_parts: Union[BasePart, List[BasePart]],
+        part_or_parts: Union[BasePart, list[BasePart]],
         add_end: bool = False,
         speaker: Union[str, int] | None = None,
     ):
@@ -774,24 +788,63 @@ class ContentSequence:
             add_end: Whether to add the IM_END_TOKEN after these parts
             speaker: Optional speaker identifier (name or ID) to add before the parts
         """
-        # Convert single part to list
         parts_to_add = (
             [part_or_parts] if not isinstance(part_or_parts, list) else part_or_parts
         )
 
-        # Add speaker token if specified
         if speaker is not None:
             speaker_token = f"<|speaker:{speaker}|>"
             self.parts.append(TextPart(text=speaker_token))
 
-        # Add all the parts
         self.parts.extend(parts_to_add)
 
-        # Add end token if requested
         if add_end:
             self.parts.append(
                 TextPart(text=IM_END_TOKEN, cal_loss=self.parts[-1].cal_loss)
             )
+
+    @staticmethod
+    def _require_token_id(tokenizer: FishTokenizer, token: str) -> int:
+        token_id = tokenizer.get_token_id(token)
+        if token_id is None or token_id < 0:
+            raise ValueError(f"Tokenizer does not contain required token: {token}")
+        return int(token_id)
+
+    @staticmethod
+    def _map_semantic_codes_to_token_ids(
+        tokenizer: FishTokenizer,
+        codes: torch.Tensor,
+    ) -> torch.Tensor:
+        if codes.ndim != 1:
+            raise ValueError(f"Expected 1D semantic code tensor, got shape {codes.shape}")
+
+        codes = codes.to(dtype=torch.long, device="cpu")
+
+        if codes.numel() == 0:
+            return torch.empty(0, dtype=torch.long)
+
+        if torch.any(codes < 0) or torch.any(codes >= 4096):
+            bad_min = int(codes.min().item())
+            bad_max = int(codes.max().item())
+            raise ValueError(
+                f"Semantic code ids must be in [0, 4095], got range [{bad_min}, {bad_max}]"
+            )
+
+        if hasattr(tokenizer, "semantic_id_to_token_id"):
+            unique_codes = torch.unique(codes).tolist()
+            missing = [
+                int(code)
+                for code in unique_codes
+                if int(code) not in tokenizer.semantic_id_to_token_id
+            ]
+            if missing:
+                preview = ", ".join(map(str, missing[:8]))
+                raise ValueError(
+                    f"Tokenizer is missing semantic token ids for codes: {preview}"
+                )
+
+        mapping = tokenizer.semantic_map_tensor.to(device="cpu")
+        return mapping[codes]
 
     def encode(
         self: "ContentSequence",
@@ -810,101 +863,104 @@ class ContentSequence:
         Returns:
             EncodedMessage with tensors ready for the model
         """
-        all_tokens = []
-        all_labels = []
+        all_tokens: list[torch.Tensor] = []
+        all_labels: list[torch.Tensor] = []
 
-        # Multi-modal elements
-        vq_parts = []
-        vq_masks = []
-        vq_require_losses = []
+        vq_parts: list[torch.Tensor] = []
+        vq_masks: list[torch.Tensor] = []
+        vq_require_losses: list[bool] = []
 
-        audio_parts = []
-        audio_masks = []
+        audio_parts: list[torch.Tensor] = []
+        audio_masks: list[torch.Tensor] = []
 
-        # Optimization: Batch conversion for ignore tokens
         ignore_loss_token_ids = []
         if ignore_loss_tokens:
-            # Use the wrapper method which uses convert_tokens_to_ids
             ignore_loss_token_ids = [
                 tokenizer.get_token_id(i) for i in ignore_loss_tokens
             ]
+
+        audio_start_id = self._require_token_id(tokenizer, AUDIO_START_TOKEN)
+        audio_embed_id = self._require_token_id(tokenizer, AUDIO_EMBED_TOKEN)
+        audio_end_id = self._require_token_id(tokenizer, AUDIO_END_TOKEN)
 
         for part in self.parts:
             if isinstance(part, TextPart):
                 if part.tokens is None:
                     assert part.text is not None
-                    # Optimization: Explicitly disable special tokens (BOS/EOS)
-                    # because we are constructing the sequence manually
                     tokens = tokenizer.encode(part.text, add_special_tokens=False)
                 else:
                     tokens = part.tokens
 
-                tokens = torch.tensor(tokens, dtype=torch.long)
+                tokens_tensor = torch.tensor(tokens, dtype=torch.long, device="cpu")
+
+                vq_masks.append(torch.zeros_like(tokens_tensor, dtype=torch.bool))
+                audio_masks.append(torch.zeros_like(tokens_tensor, dtype=torch.bool))
+
             elif isinstance(part, VQPart):
-                # Critical Optimization: Vectorized mapping
-                # Instead of loop lookup: [tokenizer.semantic_id_to_token_id[i] for i in codes]
-                # We use arithmetic offset: code + semantic_begin_id
-                # This assumes semantic tokens are contiguous in the vocab (DualAR requirement)
-                curr_codes = part.codes.clone().to(torch.int)
+                curr_codes = part.codes.clone().to(dtype=torch.long, device="cpu")
+                semantic_tokens = self._map_semantic_codes_to_token_ids(
+                    tokenizer, curr_codes[0]
+                )
 
-                # Use int64 (long) for token IDs to avoid overflow or type mismatch in embedding
-                tokens = (curr_codes[0] + tokenizer.semantic_begin_id).to(torch.long)
-
+                tokens_tensor = semantic_tokens
                 vq_parts.append(curr_codes)
                 vq_require_losses.append(part.cal_loss)
+
+                vq_masks.append(torch.ones_like(tokens_tensor, dtype=torch.bool))
+                audio_masks.append(torch.zeros_like(tokens_tensor, dtype=torch.bool))
+
+            elif isinstance(part, AudioPart):
+                features = part.features.clone().to(device="cpu")
+                frame_count = int(features.shape[0])
+
+                tokens_tensor = torch.tensor(
+                    [audio_start_id, *([audio_embed_id] * frame_count), audio_end_id],
+                    dtype=torch.long,
+                    device="cpu",
+                )
+
+                audio_mask = torch.zeros_like(tokens_tensor, dtype=torch.bool)
+                if frame_count > 0:
+                    audio_mask[1:-1] = True
+
+                vq_masks.append(torch.zeros_like(tokens_tensor, dtype=torch.bool))
+                audio_masks.append(audio_mask)
+                audio_parts.append(features)
+
             else:
                 raise ValueError(f"Unsupported part type: {type(part)}")
 
-            all_tokens.append(tokens)
+            all_tokens.append(tokens_tensor)
 
-            # Set masks for different part types
-            if isinstance(part, VQPart):
-                vq_masks.append(torch.ones_like(tokens, dtype=torch.bool))
-                audio_masks.append(torch.zeros_like(tokens, dtype=torch.bool))
-            elif isinstance(part, AudioPart):
-                vq_masks.append(torch.zeros_like(tokens, dtype=torch.bool))
-                audio_mask = torch.ones_like(tokens, dtype=torch.bool)
-                audio_mask[0] = False  # Skip start token
-                audio_mask[-1] = False  # Skip end token
-                audio_masks.append(audio_mask)
-            else:
-                vq_masks.append(torch.zeros_like(tokens, dtype=torch.bool))
-                audio_masks.append(torch.zeros_like(tokens, dtype=torch.bool))
-
-            # Set labels based on whether we want to calculate loss for this part
             if part.cal_loss and not isinstance(part, AudioPart):
-                all_labels.append(tokens.clone())
+                all_labels.append(tokens_tensor.clone())
             else:
-                all_labels.append(torch.full_like(tokens, -100))
+                all_labels.append(torch.full_like(tokens_tensor, -100))
 
-        # Concatenate all tensors
         if not all_tokens:
-            # Handle empty case safely
             tokens = torch.empty(0, dtype=torch.long)
             labels = torch.empty(0, dtype=torch.long)
-            vq_masks = torch.empty(0, dtype=torch.bool)
-            audio_masks = torch.empty(0, dtype=torch.bool)
+            vq_masks_tensor = torch.empty(0, dtype=torch.bool)
+            audio_masks_tensor = torch.empty(0, dtype=torch.bool)
         else:
             tokens = torch.cat(all_tokens, dim=0)
             labels = torch.cat(all_labels, dim=0)
-            vq_masks = torch.cat(vq_masks, dim=0)
-            audio_masks = torch.cat(audio_masks, dim=0)
+            vq_masks_tensor = torch.cat(vq_masks, dim=0)
+            audio_masks_tensor = torch.cat(audio_masks, dim=0)
 
-        vq_require_losses = torch.tensor(vq_require_losses, dtype=torch.bool)
+        vq_require_losses_tensor = torch.tensor(vq_require_losses, dtype=torch.bool)
 
-        # Apply shift if needed for next-token prediction
-        vq_mask_tokens = vq_masks
-        vq_mask_labels = vq_masks
+        vq_mask_tokens = vq_masks_tensor
+        vq_mask_labels = vq_masks_tensor
 
         if add_shift and len(tokens) > 0:
             tokens = tokens[:-1]
             labels = labels[1:]
-            vq_masks = vq_masks[:-1]
+            vq_masks_tensor = vq_masks_tensor[:-1]
             vq_mask_tokens = vq_mask_tokens[:-1]
             vq_mask_labels = vq_mask_labels[1:]
-            audio_masks = audio_masks[:-1]
+            audio_masks_tensor = audio_masks_tensor[:-1]
 
-        # Ignore specified tokens
         for i in ignore_loss_token_ids:
             if i is not None:
                 labels[labels == i] = -100
@@ -915,9 +971,9 @@ class ContentSequence:
             vq_parts=vq_parts,
             vq_mask_tokens=vq_mask_tokens,
             vq_mask_labels=vq_mask_labels,
-            vq_require_losses=vq_require_losses,
+            vq_require_losses=vq_require_losses_tensor,
             audio_parts=audio_parts,
-            audio_masks=audio_masks,
+            audio_masks=audio_masks_tensor,
             metadata=self.metadata,
         )
 
@@ -925,11 +981,10 @@ class ContentSequence:
         self: "ContentSequence",
         tokenizer: FishTokenizer,
         num_codebooks: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         encoded = self.encode(tokenizer, add_shift=False)
         tokens = encoded.tokens
-        # Use int32 for prompt cache to save memory, convert to model dtype later if needed
-        # Or keep as input_ids (long)
+
         values = torch.zeros((num_codebooks + 1, len(tokens)), dtype=torch.long)
         values[0] = tokens
 
@@ -942,21 +997,11 @@ class ContentSequence:
         audio_masks = None
 
         if encoded.vq_parts is not None and len(encoded.vq_parts) > 0:
-            vq_parts = encoded.vq_parts
-            # List[Tensor(1, T)] -> Tensor(1, Total_T) -> Tensor(1, Total_T)
-            # Ensure we are handling the list concatenation correctly
-            if len(vq_parts) > 1:
-                # We need to be careful here: vq_parts is a list of tensors from different VQPart segments
-                # They correspond to encoded.vq_mask_tokens
-                # Since we just want to fill the 'values' tensor at the right positions:
-                all_vq_codes = torch.cat(
-                    vq_parts, dim=1
-                )  # Shape: (C, Total_Semantic_Tokens)
+            if len(encoded.vq_parts) > 1:
+                all_vq_codes = torch.cat(encoded.vq_parts, dim=1)
             else:
-                all_vq_codes = vq_parts[0]
+                all_vq_codes = encoded.vq_parts[0]
 
-            # Values[0] is already the Main Token ID (Semantic Begin + Code)
-            # Values[1:] should be the codes themselves
             values[1:, encoded.vq_mask_tokens] = all_vq_codes.to(dtype=torch.long)
 
         if encoded.audio_parts is not None and len(encoded.audio_parts) > 0:
@@ -979,12 +1024,11 @@ class ContentSequence:
             tokenizer, add_shift=False, ignore_loss_tokens=ignore_loss_tokens
         )
 
-        # Colors for alternating tokens
         colors = {
-            "blue": "\033[94m",  # Light blue
-            "cyan": "\033[96m",  # Cyan
-            "green": "\033[92m",  # Light green
-            "dark_green": "\033[32m",  # Dark green
+            "blue": "\033[94m",
+            "cyan": "\033[96m",
+            "green": "\033[92m",
+            "dark_green": "\033[32m",
         }
         blue_idx = 0
         green_idx = 0
@@ -1027,10 +1071,7 @@ class ContentSequence:
                     count_semantic_tokens = 0
                     semantic_label = None
 
-            # Use HF decode
             val = tokenizer.decode([token_id])
-
-            # Simple fallback for visualization if decode returns empty or weird stuff for special tokens
             if not val:
                 val = f"<{token_id}>"
 
@@ -3087,8 +3128,10 @@ path: /inference_engine/__init__.py
 ----------------------------------------
 import os
 import queue
+import threading
 import time
-from typing import Generator
+from dataclasses import dataclass
+from typing import Generator, Literal
 
 import numpy as np
 import torch
@@ -3096,7 +3139,7 @@ from loguru import logger
 
 from fish_speech.inference_engine.reference_loader import ReferenceLoader
 from fish_speech.inference_engine.utils import InferenceResult, wav_chunk_header
-from fish_speech.inference_engine.vq_manager import VQManager
+from fish_speech.inference_engine.vq_manager import DACDecodeStats, VQManager
 from fish_speech.models.dac.modded_dac import DAC
 from fish_speech.models.text2semantic.inference import (
     GenerateRequest,
@@ -3104,6 +3147,74 @@ from fish_speech.models.text2semantic.inference import (
 )
 from fish_speech.utils import autocast_exclude_mps, set_seed
 from fish_speech.utils.schema import ServeTTSRequest
+
+ACK_CONTINUE = "continue"
+ACK_ABORT = "abort"
+QUEUE_POLL_TIMEOUT_SEC = 0.1
+QUEUE_BLOCK_LOG_INTERVAL_SEC = 0.5
+SENDER_WAIT_LOG_INTERVAL_SEC = 1.0
+THREAD_JOIN_TIMEOUT_SEC = 2.0
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip() in {"1", "true", "TRUE", "yes", "YES", "on", "ON"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+@dataclass
+class PipelineConfig:
+    codes_queue_maxsize: int
+    audio_queue_maxsize: int
+    max_ahead_chunks: int
+    response_queue_maxsize: int
+
+
+@dataclass
+class CodeChunk:
+    sequence_id: int
+    codes: torch.Tensor
+    text: str | None = None
+
+
+@dataclass
+class AudioChunk:
+    sequence_id: int
+    audio: np.ndarray
+    text: str | None = None
+    decode_ms: float = 0.0
+    microchunk_size: int = 1
+    microchunk_count: int = 0
+    retries: int = 0
+    cleanup_count: int = 0
+
+
+@dataclass
+class PipelineSignal:
+    kind: Literal["eos", "error", "cancel"]
+    error: Exception | None = None
+    reason: str | None = None
 
 
 class TTSInferenceEngine(ReferenceLoader, VQManager):
@@ -3121,52 +3232,597 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         self.precision = precision
         self.compile = compile
 
-    def inference(self, req: ServeTTSRequest) -> Generator[InferenceResult, None, None]:
-        """
-        Main inference function:
-        - Loads the reference audio and text.
-        - Calls the LLAMA model for inference.
-        - Decodes the VQ tokens to audio.
-        """
+        optimize_for_inference = getattr(
+            self.decoder_model, "optimize_for_inference", None
+        )
+        if callable(optimize_for_inference):
+            try:
+                removed = optimize_for_inference(remove_weight_norm=True)
+                logger.info(
+                    "DAC inference optimization enabled: removed_weight_norm_layers={}",
+                    removed,
+                )
+            except Exception as opt_err:
+                logger.warning("DAC inference optimization skipped: {}", opt_err)
 
-        profile = os.getenv("FISH_PROFILE_INFERENCE", "0") in {
-            "1",
-            "true",
-            "TRUE",
-            "yes",
-            "YES",
-        }
+    def _sample_rate(self) -> int:
+        if hasattr(self.decoder_model, "spec_transform"):
+            return self.decoder_model.spec_transform.sample_rate
+        return self.decoder_model.sample_rate
+
+    def _build_pipeline_config(self) -> PipelineConfig:
+        codes_queue_maxsize = max(1, _env_int("FISH_CODES_QUEUE_MAXSIZE", 4))
+        audio_queue_maxsize = max(1, _env_int("FISH_AUDIO_QUEUE_MAXSIZE", 4))
+        max_ahead_chunks = max(1, _env_int("FISH_STREAM_MAX_AHEAD_CHUNKS", 3))
+        max_ahead_chunks = min(max_ahead_chunks, codes_queue_maxsize)
+
+        return PipelineConfig(
+            codes_queue_maxsize=codes_queue_maxsize,
+            audio_queue_maxsize=audio_queue_maxsize,
+            max_ahead_chunks=max_ahead_chunks,
+            response_queue_maxsize=max(1, min(2, max_ahead_chunks)),
+        )
+
+    def _safe_ack(
+        self,
+        ack_queue: queue.Queue | None,
+        ack: str,
+        *,
+        req_tag: str,
+        reason: str,
+    ) -> None:
+        if ack_queue is None:
+            return
+
+        try:
+            ack_queue.put_nowait(ack)
+        except queue.Full:
+            logger.warning(
+                "pipeline: req={} failed to send ack={} reason={}",
+                req_tag,
+                ack,
+                reason,
+            )
+
+    def _put_queue_item(
+        self,
+        target_queue: queue.Queue,
+        item,
+        *,
+        cancel_event: threading.Event,
+        req_tag: str,
+        stage: str,
+        blocked_message: str,
+        success_message: str,
+        extra_log: str = "",
+    ) -> bool:
+        blocked_at: float | None = None
+
+        while not cancel_event.is_set():
+            try:
+                target_queue.put(item, timeout=QUEUE_POLL_TIMEOUT_SEC)
+                if blocked_at is not None:
+                    logger.info(
+                        "{} req={} blocked_ms={:.1f} depth={} {}",
+                        success_message,
+                        req_tag,
+                        (time.perf_counter() - blocked_at) * 1000.0,
+                        target_queue.qsize(),
+                        extra_log,
+                    )
+                return True
+            except queue.Full:
+                if blocked_at is None:
+                    blocked_at = time.perf_counter()
+                    logger.warning(
+                        "{} req={} depth={} {}",
+                        blocked_message,
+                        req_tag,
+                        target_queue.qsize(),
+                        extra_log,
+                    )
+                elif (
+                    time.perf_counter() - blocked_at
+                ) >= QUEUE_BLOCK_LOG_INTERVAL_SEC:
+                    logger.info(
+                        "{} req={} depth={} {}",
+                        blocked_message,
+                        req_tag,
+                        target_queue.qsize(),
+                        extra_log,
+                    )
+                    blocked_at = time.perf_counter()
+
+        logger.info(
+            "pipeline: req={} stage={} stop_put reason=cancelled depth={}",
+            req_tag,
+            stage,
+            target_queue.qsize(),
+        )
+        return False
+
+    def _put_terminal_signal(
+        self,
+        target_queue: queue.Queue,
+        signal: PipelineSignal,
+        *,
+        req_tag: str,
+        stage: str,
+        timeout_sec: float = 2.0,
+    ) -> bool:
+        deadline = time.perf_counter() + timeout_sec
+        while time.perf_counter() < deadline:
+            try:
+                target_queue.put(signal, timeout=QUEUE_POLL_TIMEOUT_SEC)
+                return True
+            except queue.Full:
+                continue
+
+        logger.warning(
+            "pipeline: failed to forward terminal signal req={} stage={} kind={} depth={}",
+            req_tag,
+            stage,
+            signal.kind,
+            target_queue.qsize(),
+        )
+        return False
+
+    def _wait_for_producer_window(
+        self,
+        *,
+        codes_queue: queue.Queue,
+        cancel_event: threading.Event,
+        memory_pressure_event: threading.Event,
+        config: PipelineConfig,
+        req_tag: str,
+    ) -> bool:
+        blocked_at: float | None = None
+
+        while not cancel_event.is_set():
+            ahead_limit = 1 if memory_pressure_event.is_set() else config.max_ahead_chunks
+            depth = codes_queue.qsize()
+            if depth < ahead_limit:
+                if blocked_at is not None:
+                    logger.info(
+                        "producer: unblocked req={} blocked_ms={:.1f} codes_depth={} ahead_limit={}",
+                        req_tag,
+                        (time.perf_counter() - blocked_at) * 1000.0,
+                        depth,
+                        ahead_limit,
+                    )
+                return True
+
+            if blocked_at is None:
+                blocked_at = time.perf_counter()
+                logger.warning(
+                    "producer: blocked req={} codes_depth={} ahead_limit={}",
+                    req_tag,
+                    depth,
+                    ahead_limit,
+                )
+            elif (
+                time.perf_counter() - blocked_at
+            ) >= QUEUE_BLOCK_LOG_INTERVAL_SEC:
+                logger.info(
+                    "producer: still_blocked req={} codes_depth={} ahead_limit={}",
+                    req_tag,
+                    depth,
+                    ahead_limit,
+                )
+                blocked_at = time.perf_counter()
+
+            time.sleep(QUEUE_POLL_TIMEOUT_SEC)
+
+        return False
+
+    def _producer_loop(
+        self,
+        *,
+        req_tag: str,
+        response_queue: queue.Queue,
+        codes_queue: queue.Queue,
+        ack_queue: queue.Queue,
+        cancel_event: threading.Event,
+        producer_done: threading.Event,
+        memory_pressure_event: threading.Event,
+        config: PipelineConfig,
+    ) -> None:
+        next_sequence_id = 0
+        sent_terminal = False
+
+        try:
+            while not cancel_event.is_set():
+                try:
+                    wrapped_result = response_queue.get(timeout=QUEUE_POLL_TIMEOUT_SEC)
+                except queue.Empty:
+                    continue
+
+                if wrapped_result.status == "error":
+                    err = (
+                        wrapped_result.response
+                        if isinstance(wrapped_result.response, Exception)
+                        else RuntimeError("Unknown LLM worker error")
+                    )
+                    logger.error("producer: worker_error req={} err={}", req_tag, err)
+                    self._put_queue_item(
+                        codes_queue,
+                        PipelineSignal(kind="error", error=err, reason="llm_worker_error"),
+                        cancel_event=cancel_event,
+                        req_tag=req_tag,
+                        stage="producer",
+                        blocked_message="producer: blocked forwarding error",
+                        success_message="producer: unblocked forwarding error",
+                    )
+                    sent_terminal = True
+                    break
+
+                if not isinstance(wrapped_result.response, GenerateResponse):
+                    err = TypeError(
+                        "Expected GenerateResponse, got "
+                        f"{type(wrapped_result.response).__name__}"
+                    )
+                    logger.error("producer: malformed response req={} err={}", req_tag, err)
+                    self._safe_ack(
+                        ack_queue,
+                        ACK_ABORT,
+                        req_tag=req_tag,
+                        reason="malformed_response",
+                    )
+                    self._put_queue_item(
+                        codes_queue,
+                        PipelineSignal(kind="error", error=err, reason="malformed_response"),
+                        cancel_event=cancel_event,
+                        req_tag=req_tag,
+                        stage="producer",
+                        blocked_message="producer: blocked forwarding malformed_response",
+                        success_message="producer: unblocked forwarding malformed_response",
+                    )
+                    sent_terminal = True
+                    break
+
+                result = wrapped_result.response
+
+                if result.action == "next":
+                    logger.info(
+                        "producer: eos req={} queued_segments={} codes_depth={}",
+                        req_tag,
+                        next_sequence_id,
+                        codes_queue.qsize(),
+                    )
+                    if not self._put_queue_item(
+                        codes_queue,
+                        PipelineSignal(kind="eos", reason="llm_eos"),
+                        cancel_event=cancel_event,
+                        req_tag=req_tag,
+                        stage="producer",
+                        blocked_message="producer: blocked forwarding eos",
+                        success_message="producer: unblocked forwarding eos",
+                    ):
+                        self._safe_ack(
+                            ack_queue,
+                            ACK_ABORT,
+                            req_tag=req_tag,
+                            reason="cancelled_while_forwarding_eos",
+                        )
+                        break
+
+                    sent_terminal = True
+                    break
+
+                codes = result.codes
+                if codes is None:
+                    err = RuntimeError("Worker returned sample action without codes")
+                    logger.error("producer: missing_codes req={}", req_tag)
+                    self._safe_ack(
+                        ack_queue,
+                        ACK_ABORT,
+                        req_tag=req_tag,
+                        reason="missing_codes",
+                    )
+                    self._put_queue_item(
+                        codes_queue,
+                        PipelineSignal(kind="error", error=err, reason="missing_codes"),
+                        cancel_event=cancel_event,
+                        req_tag=req_tag,
+                        stage="producer",
+                        blocked_message="producer: blocked forwarding missing_codes",
+                        success_message="producer: unblocked forwarding missing_codes",
+                    )
+                    sent_terminal = True
+                    break
+
+                codes_cpu = codes.detach().to(device="cpu", dtype=torch.long).contiguous()
+
+                if not self._wait_for_producer_window(
+                    codes_queue=codes_queue,
+                    cancel_event=cancel_event,
+                    memory_pressure_event=memory_pressure_event,
+                    config=config,
+                    req_tag=req_tag,
+                ):
+                    self._safe_ack(
+                        ack_queue,
+                        ACK_ABORT,
+                        req_tag=req_tag,
+                        reason="cancelled_while_waiting_for_window",
+                    )
+                    break
+
+                queued = self._put_queue_item(
+                    codes_queue,
+                    CodeChunk(
+                        sequence_id=next_sequence_id,
+                        codes=codes_cpu,
+                        text=result.text,
+                    ),
+                    cancel_event=cancel_event,
+                    req_tag=req_tag,
+                    stage="producer",
+                    blocked_message="producer: blocked on codes_queue",
+                    success_message="producer: unblocked on codes_queue",
+                    extra_log=f"sequence_id={next_sequence_id}",
+                )
+                if not queued:
+                    self._safe_ack(
+                        ack_queue,
+                        ACK_ABORT,
+                        req_tag=req_tag,
+                        reason="cancelled_while_putting_codes",
+                    )
+                    break
+
+                logger.info(
+                    "producer: queued req={} sequence_id={} codes_depth={} frames={}",
+                    req_tag,
+                    next_sequence_id,
+                    codes_queue.qsize(),
+                    int(codes_cpu.shape[1]),
+                )
+                self._safe_ack(
+                    ack_queue,
+                    ACK_CONTINUE,
+                    req_tag=req_tag,
+                    reason="codes_forwarded",
+                )
+                next_sequence_id += 1
+        except Exception as err:
+            logger.exception("producer: exception req={} err={}", req_tag, err)
+            self._safe_ack(
+                ack_queue,
+                ACK_ABORT,
+                req_tag=req_tag,
+                reason="producer_exception",
+            )
+            self._put_queue_item(
+                codes_queue,
+                PipelineSignal(kind="error", error=err, reason="producer_exception"),
+                cancel_event=cancel_event,
+                req_tag=req_tag,
+                stage="producer",
+                blocked_message="producer: blocked forwarding exception",
+                success_message="producer: unblocked forwarding exception",
+            )
+            sent_terminal = True
+        finally:
+            if cancel_event.is_set() and not sent_terminal:
+                self._safe_ack(
+                    ack_queue,
+                    ACK_ABORT,
+                    req_tag=req_tag,
+                    reason="request_cancelled",
+                )
+
+            producer_done.set()
+            logger.info(
+                "producer: done req={} queued_segments={} codes_depth={}",
+                req_tag,
+                next_sequence_id,
+                codes_queue.qsize(),
+            )
+
+    def _dac_consumer_loop(
+        self,
+        *,
+        req_tag: str,
+        codes_queue: queue.Queue,
+        audio_queue: queue.Queue,
+        cancel_event: threading.Event,
+        producer_done: threading.Event,
+        dac_done: threading.Event,
+        memory_pressure_event: threading.Event,
+    ) -> None:
+        current_microchunk = max(1, _env_int("FISH_DAC_MAX_CODES_PER_STEP", 4))
+        default_microchunk = current_microchunk
+        min_free_gb = _env_float("FISH_DAC_MIN_FREE_GB", 3.0)
+        resume_free_gb = _env_float("FISH_DAC_RESUME_FREE_GB", 5.0)
+        critical_free_gb = _env_float("FISH_DAC_CRITICAL_FREE_GB", 1.5)
+        pressure_active = False
+        emitted_terminal = False
+
+        try:
+            while True:
+                if cancel_event.is_set():
+                    break
+
+                try:
+                    item = codes_queue.get(timeout=QUEUE_POLL_TIMEOUT_SEC)
+                except queue.Empty:
+                    continue
+
+                if isinstance(item, PipelineSignal):
+                    if item.kind != "cancel":
+                        self._put_queue_item(
+                            audio_queue,
+                            item,
+                            cancel_event=cancel_event,
+                            req_tag=req_tag,
+                            stage="dac",
+                            blocked_message="dac: blocked forwarding terminal",
+                            success_message="dac: unblocked forwarding terminal",
+                            extra_log=f"kind={item.kind}",
+                        )
+                        emitted_terminal = True
+                    else:
+                        emitted_terminal = True
+                    break
+
+                if not isinstance(item, CodeChunk):
+                    err = TypeError(
+                        f"Unexpected codes_queue payload: {type(item).__name__}"
+                    )
+                    self._put_queue_item(
+                        audio_queue,
+                        PipelineSignal(kind="error", error=err, reason="invalid_codes_item"),
+                        cancel_event=cancel_event,
+                        req_tag=req_tag,
+                        stage="dac",
+                        blocked_message="dac: blocked forwarding invalid item",
+                        success_message="dac: unblocked forwarding invalid item",
+                    )
+                    emitted_terminal = True
+                    break
+
+                snapshot = self.cuda_memory_snapshot(self._decoder_device())
+                free_gb = snapshot.free_gb
+                if free_gb is not None and free_gb < critical_free_gb:
+                    if not pressure_active:
+                        logger.warning(
+                            "dac: memory_pressure_on req={} free_gb={:.2f} codes_depth={}",
+                            req_tag,
+                            free_gb,
+                            codes_queue.qsize(),
+                        )
+                    pressure_active = True
+                    memory_pressure_event.set()
+                    current_microchunk = 1
+                    self._light_cuda_cleanup(self._decoder_device())
+                elif free_gb is not None and free_gb < min_free_gb:
+                    if not pressure_active:
+                        logger.warning(
+                            "dac: memory_pressure_on req={} free_gb={:.2f} codes_depth={}",
+                            req_tag,
+                            free_gb,
+                            codes_queue.qsize(),
+                        )
+                    pressure_active = True
+                    memory_pressure_event.set()
+                    current_microchunk = max(1, min(current_microchunk, default_microchunk // 2))
+                elif free_gb is not None and free_gb >= resume_free_gb:
+                    if pressure_active:
+                        logger.info(
+                            "dac: memory_pressure_off req={} free_gb={:.2f} codes_depth={}",
+                            req_tag,
+                            free_gb,
+                            codes_queue.qsize(),
+                        )
+                    pressure_active = False
+                    memory_pressure_event.clear()
+                    current_microchunk = min(
+                        default_microchunk,
+                        max(1, current_microchunk * 2),
+                    )
+
+                try:
+                    segment, stats = self.get_audio_segment(
+                        item.codes,
+                        req_tag=req_tag,
+                        segment_idx=item.sequence_id + 1,
+                        max_codes_per_step=current_microchunk,
+                    )
+                    current_microchunk = stats.microchunk_size
+                except Exception as err:
+                    logger.exception(
+                        "dac: decode_failed req={} sequence_id={} frames={} err={}",
+                        req_tag,
+                        item.sequence_id,
+                        int(item.codes.shape[1]),
+                        err,
+                    )
+                    self._put_terminal_signal(
+                        audio_queue,
+                        PipelineSignal(kind="error", error=err, reason="dac_decode_failed"),
+                        req_tag=req_tag,
+                        stage="dac",
+                    )
+                    cancel_event.set()
+                    emitted_terminal = True
+                    break
+
+                queued = self._put_queue_item(
+                    audio_queue,
+                    AudioChunk(
+                        sequence_id=item.sequence_id,
+                        audio=segment,
+                        text=item.text,
+                        decode_ms=stats.decode_ms,
+                        microchunk_size=stats.microchunk_size,
+                        microchunk_count=stats.microchunk_count,
+                        retries=stats.retries,
+                        cleanup_count=stats.cleanup_count,
+                    ),
+                    cancel_event=cancel_event,
+                    req_tag=req_tag,
+                    stage="dac",
+                    blocked_message="dac: blocked on audio_queue",
+                    success_message="dac: unblocked on audio_queue",
+                    extra_log=f"sequence_id={item.sequence_id}",
+                )
+                if not queued:
+                    break
+
+                logger.info(
+                    "dac: queued_audio req={} sequence_id={} samples={} decode_ms={:.1f} microchunk={} codes_depth={} audio_depth={} free_gb={} alloc_gb={} reserved_gb={}",
+                    req_tag,
+                    item.sequence_id,
+                    len(segment),
+                    stats.decode_ms,
+                    stats.microchunk_size,
+                    codes_queue.qsize(),
+                    audio_queue.qsize(),
+                    f"{stats.snapshot_after.free_gb:.2f}" if stats.snapshot_after.free_gb is not None else "na",
+                    f"{stats.snapshot_after.allocated_gb:.2f}" if stats.snapshot_after.allocated_gb is not None else "na",
+                    f"{stats.snapshot_after.reserved_gb:.2f}" if stats.snapshot_after.reserved_gb is not None else "na",
+                )
+        finally:
+            if cancel_event.is_set() and not emitted_terminal:
+                self._put_terminal_signal(
+                    audio_queue,
+                    PipelineSignal(kind="cancel", reason="request_cancelled"),
+                    req_tag=req_tag,
+                    stage="dac",
+                )
+            dac_done.set()
+            logger.info(
+                "dac: done req={} codes_depth={} audio_depth={}",
+                req_tag,
+                codes_queue.qsize(),
+                audio_queue.qsize(),
+            )
+
+    def _drain_pipeline_queue(self, target_queue: queue.Queue) -> None:
+        while True:
+            try:
+                target_queue.get_nowait()
+            except queue.Empty:
+                return
+
+    def inference(self, req: ServeTTSRequest) -> Generator[InferenceResult, None, None]:
+        profile = _env_flag("FISH_PROFILE_INFERENCE", False)
         req_tag = hex(id(req))[-6:]
         t_start = time.perf_counter()
-        t_prev = t_start
-
-        def _vram_gb() -> dict:
-            if not torch.cuda.is_available():
-                return {}
-            return {
-                "vram_alloc_gb": round(torch.cuda.memory_allocated() / (1024**3), 2),
-                "vram_reserved_gb": round(torch.cuda.memory_reserved() / (1024**3), 2),
-                "vram_max_alloc_gb": round(
-                    torch.cuda.max_memory_allocated() / (1024**3), 2
-                ),
-            }
+        ttfa_logged = False
 
         def _mark(event: str, **extra) -> None:
-            nonlocal t_prev
             if not profile:
                 return
             now = time.perf_counter()
-            delta_ms = (now - t_prev) * 1000.0
-            total_ms = (now - t_start) * 1000.0
-            t_prev = now
-            vram = _vram_gb()
-            details = " ".join(f"{k}={v}" for k, v in (*vram.items(), *extra.items()))
+            elapsed_ms = (now - t_start) * 1000.0
+            details = " ".join(f"{k}={v}" for k, v in extra.items())
             logger.info(
-                "inference_timing req={} event={} delta_ms={:.1f} total_ms={:.1f} {}",
+                "pipeline_timing req={} event={} elapsed_ms={:.1f} {}",
                 req_tag,
                 event,
-                delta_ms,
-                total_ms,
+                elapsed_ms,
                 details,
             )
 
@@ -3174,9 +3830,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         prompt_tokens, prompt_texts = [], []
 
         if ref_id is not None:
-            prompt_tokens, prompt_texts = self.load_by_id(
-                ref_id, req.use_memory_cache
-            )
+            prompt_tokens, prompt_texts = self.load_by_id(ref_id, req.use_memory_cache)
             _mark("ref_loaded", mode="id")
         elif req.references:
             prompt_tokens, prompt_texts = self.load_by_hash(
@@ -3186,217 +3840,363 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
         if req.seed is not None:
             set_seed(req.seed)
-            logger.warning(f"set seed: {req.seed}")
+            logger.warning("set seed: {}", req.seed)
 
-        stream_tokens = getattr(req, "stream_tokens", False) or req.streaming
+        if req.control == "cleanup":
+            response_queue = self.send_Llama_request(
+                req,
+                prompt_tokens,
+                prompt_texts,
+                req_tag=req_tag,
+                ack_queue=None,
+                cancel_event=None,
+                response_queue_maxsize=1,
+            )
+            wrapped_result = response_queue.get()
+            if wrapped_result.status == "error":
+                err = (
+                    wrapped_result.response
+                    if isinstance(wrapped_result.response, Exception)
+                    else RuntimeError("Cleanup request failed")
+                )
+                yield InferenceResult(code="error", audio=None, error=err)
+            return
 
-        # Worker waits for ack after each chunk so DAC decode and LLM token generation
-        # do not overlap aggressively on GPU.
-        ack_queue = queue.Queue() if stream_tokens else None
+        sample_rate = self._sample_rate()
+        pipeline_config = self._build_pipeline_config()
+        cancel_event = threading.Event()
+        producer_done = threading.Event()
+        dac_done = threading.Event()
+        memory_pressure_event = threading.Event()
+        ack_queue: queue.Queue = queue.Queue()
+        codes_queue: queue.Queue = queue.Queue(maxsize=pipeline_config.codes_queue_maxsize)
+        audio_queue: queue.Queue = queue.Queue(maxsize=pipeline_config.audio_queue_maxsize)
+
         response_queue = self.send_Llama_request(
             req,
             prompt_tokens,
             prompt_texts,
             req_tag=req_tag,
             ack_queue=ack_queue,
+            cancel_event=cancel_event,
+            response_queue_maxsize=pipeline_config.response_queue_maxsize,
         )
-        _mark("llama_queued")
+        _mark(
+            "llama_queued",
+            codes_queue_maxsize=pipeline_config.codes_queue_maxsize,
+            audio_queue_maxsize=pipeline_config.audio_queue_maxsize,
+            max_ahead_chunks=pipeline_config.max_ahead_chunks,
+        )
 
-        if stream_tokens:
-            logger.info(
-                "stream: inference started (token streaming), req={}", req_tag
-            )
+        producer_thread = threading.Thread(
+            target=self._producer_loop,
+            kwargs=dict(
+                req_tag=req_tag,
+                response_queue=response_queue,
+                codes_queue=codes_queue,
+                ack_queue=ack_queue,
+                cancel_event=cancel_event,
+                producer_done=producer_done,
+                memory_pressure_event=memory_pressure_event,
+                config=pipeline_config,
+            ),
+            daemon=True,
+        )
+        dac_thread = threading.Thread(
+            target=self._dac_consumer_loop,
+            kwargs=dict(
+                req_tag=req_tag,
+                codes_queue=codes_queue,
+                audio_queue=audio_queue,
+                cancel_event=cancel_event,
+                producer_done=producer_done,
+                dac_done=dac_done,
+                memory_pressure_event=memory_pressure_event,
+            ),
+            daemon=True,
+        )
+        producer_thread.start()
+        dac_thread.start()
 
-        if hasattr(self.decoder_model, "spec_transform"):
-            sample_rate = self.decoder_model.spec_transform.sample_rate
-        else:
-            sample_rate = self.decoder_model.sample_rate
-
-        if req.streaming:
-            _mark("yield_header")
-            yield InferenceResult(
-                code="header",
-                audio=(
-                    sample_rate,
-                    np.array(wav_chunk_header(sample_rate=sample_rate)),
-                ),
-                error=None,
-            )
-
+        pending_audio: dict[int, AudioChunk] = {}
+        ready_to_send: list[AudioChunk] = []
+        next_expected_sequence = 0
         segments: list[np.ndarray] = []
-        seg_idx = 0
         produced_segments = 0
-        failed = False
+        terminal_signal: PipelineSignal | None = None
+        sender_wait_since: float | None = None
+        ttfa_ms: float | None = None
+        sender_wait_ms_total = 0.0
+        sender_underruns = 0
+        codes_high_water = codes_queue.qsize()
+        audio_high_water = audio_queue.qsize()
+        dac_decode_ms_total = 0.0
+        dac_retries_total = 0
+        dac_cleanup_total = 0
+        dac_microchunk_parts_total = 0
+        samples_total = 0
+        start_buffer_chunks = (
+            0
+            if not req.streaming
+            else max(1, _env_int("FISH_STREAM_START_BUFFER_CHUNKS", 2))
+        )
+        playback_started = not req.streaming
 
-        while True:
-            if stream_tokens:
+        def _fill_ready_chunks() -> None:
+            nonlocal next_expected_sequence
+            while next_expected_sequence in pending_audio:
+                ready_to_send.append(pending_audio.pop(next_expected_sequence))
+                next_expected_sequence += 1
+
+        def _emit_ready_chunks() -> Generator[InferenceResult, None, None]:
+            nonlocal ttfa_logged, produced_segments, ttfa_ms
+            nonlocal dac_decode_ms_total, dac_retries_total, dac_cleanup_total
+            nonlocal dac_microchunk_parts_total, samples_total
+
+            while ready_to_send:
+                ready = ready_to_send.pop(0)
+
+                if not ttfa_logged:
+                    ttfa_ms = (time.perf_counter() - t_start) * 1000.0
+                    logger.info(
+                        "pipeline: ttfa req={} ttfa_ms={:.1f}",
+                        req_tag,
+                        ttfa_ms,
+                    )
+                    ttfa_logged = True
+
+                duration_ms = (len(ready.audio) / max(1, sample_rate)) * 1000.0
+                byte_count = len(ready.audio) * 2
+                dac_decode_ms_total += ready.decode_ms
+                dac_retries_total += ready.retries
+                dac_cleanup_total += ready.cleanup_count
+                dac_microchunk_parts_total += ready.microchunk_count
+                samples_total += len(ready.audio)
+
                 logger.info(
-                    "stream: waiting for next chunk from queue, req={}", req_tag
-                )
-
-            wrapped_result = response_queue.get()
-            _mark("queue_get")
-
-            if stream_tokens:
-                action = (
-                    getattr(wrapped_result.response, "action", None)
-                    if hasattr(wrapped_result.response, "action")
-                    else None
+                    "sender: segment req={} sequence_id={} samples={} decode_ms={:.1f} microchunk={} codes_depth={} audio_depth={}",
+                    req_tag,
+                    ready.sequence_id,
+                    len(ready.audio),
+                    ready.decode_ms,
+                    ready.microchunk_size,
+                    codes_queue.qsize(),
+                    audio_queue.qsize(),
                 )
                 logger.info(
-                    "stream: queue_get status={} action={} req={}",
-                    wrapped_result.status,
-                    action,
+                    "audio_generated req={} sequence_id={} duration_ms={:.1f} sample_rate={} samples={} bytes={} decode_ms={:.1f} microchunk={} parts={} retries={} cleanup={}",
                     req_tag,
+                    ready.sequence_id,
+                    duration_ms,
+                    sample_rate,
+                    len(ready.audio),
+                    byte_count,
+                    ready.decode_ms,
+                    ready.microchunk_size,
+                    ready.microchunk_count,
+                    ready.retries,
+                    ready.cleanup_count,
                 )
 
-            if wrapped_result.status == "error":
-                failed = True
-                logger.error(
-                    "stream: got error from worker req={} err={}",
-                    req_tag,
-                    wrapped_result.response,
-                )
-                if ack_queue is not None:
-                    ack_queue.put(None)
+                produced_segments += 1
+                if not req.streaming:
+                    segments.append(ready.audio)
 
-                _mark("yield_error")
+                yield InferenceResult(
+                    code="segment",
+                    audio=(sample_rate, ready.audio),
+                    error=None,
+                )
+
+        try:
+            if req.streaming and req.format == "wav":
+                yield InferenceResult(
+                    code="header",
+                    audio=(sample_rate, np.array(wav_chunk_header(sample_rate=sample_rate))),
+                    error=None,
+                )
+
+            while True:
+                try:
+                    item = audio_queue.get(timeout=QUEUE_POLL_TIMEOUT_SEC)
+                    if sender_wait_since is not None:
+                        sender_wait_ms_total += (
+                            time.perf_counter() - sender_wait_since
+                        ) * 1000.0
+                    sender_wait_since = None
+                except queue.Empty:
+                    _fill_ready_chunks()
+                    codes_high_water = max(codes_high_water, codes_queue.qsize())
+                    audio_high_water = max(audio_high_water, audio_queue.qsize())
+
+                    if (
+                        req.streaming
+                        and not playback_started
+                        and ready_to_send
+                        and producer_done.is_set()
+                        and dac_done.is_set()
+                    ):
+                        playback_started = True
+
+                    if playback_started or not req.streaming:
+                        yield from _emit_ready_chunks()
+
+                    if producer_done.is_set() and dac_done.is_set():
+                        break
+
+                    if sender_wait_since is None:
+                        sender_wait_since = time.perf_counter()
+                    elif (
+                        time.perf_counter() - sender_wait_since
+                    ) >= SENDER_WAIT_LOG_INTERVAL_SEC:
+                        logger.info(
+                            "sender: underrun req={} codes_depth={} audio_depth={} producer_done={} dac_done={}",
+                            req_tag,
+                            codes_queue.qsize(),
+                            audio_queue.qsize(),
+                            producer_done.is_set(),
+                            dac_done.is_set(),
+                        )
+                        sender_underruns += 1
+                        sender_wait_since = time.perf_counter()
+                    continue
+
+                if isinstance(item, PipelineSignal):
+                    terminal_signal = item
+                    if item.kind != "eos":
+                        break
+                elif not isinstance(item, AudioChunk):
+                    terminal_signal = PipelineSignal(
+                        kind="error",
+                        error=TypeError(
+                            f"Unexpected audio_queue payload: {type(item).__name__}"
+                        ),
+                        reason="invalid_audio_item",
+                    )
+                    break
+                else:
+                    pending_audio[item.sequence_id] = item
+                    codes_high_water = max(codes_high_water, codes_queue.qsize())
+                    audio_high_water = max(audio_high_water, audio_queue.qsize())
+
+                _fill_ready_chunks()
+
+                if req.streaming and not playback_started:
+                    enough_buffered = len(ready_to_send) >= start_buffer_chunks
+                    should_force_start = (
+                        terminal_signal is not None
+                        and terminal_signal.kind == "eos"
+                        and len(ready_to_send) > 0
+                    )
+                    if enough_buffered or should_force_start:
+                        playback_started = True
+                    else:
+                        continue
+
+                yield from _emit_ready_chunks()
+
+                if terminal_signal is not None and terminal_signal.kind == "eos":
+                    break
+
+            if terminal_signal is None and producer_done.is_set() and dac_done.is_set():
+                terminal_signal = PipelineSignal(kind="cancel", reason="pipeline_stopped")
+
+            if terminal_signal is not None and terminal_signal.kind == "error":
                 yield InferenceResult(
                     code="error",
                     audio=None,
-                    error=(
-                        wrapped_result.response
-                        if isinstance(wrapped_result.response, Exception)
-                        else Exception("Unknown error")
-                    ),
+                    error=terminal_signal.error or RuntimeError("Unknown pipeline error"),
                 )
-                break
+                return
 
-            if not isinstance(wrapped_result.response, GenerateResponse):
-                if ack_queue is not None:
-                    ack_queue.put(None)
-                raise TypeError(
-                    f"Expected GenerateResponse, got {type(wrapped_result.response).__name__}"
+            if terminal_signal is not None and terminal_signal.kind == "cancel":
+                logger.info(
+                    "pipeline: cancelled req={} reason={}",
+                    req_tag,
+                    terminal_signal.reason or "unknown",
                 )
+                return
 
-            result = wrapped_result.response
-
-            if result.action != "next":
-                if stream_tokens:
-                    logger.info(
-                        "stream: decoding segment seg_idx={} codes_shape={} req={}",
-                        seg_idx + 1,
-                        result.codes.shape if result.codes is not None else None,
-                        req_tag,
-                    )
-
-                _mark(
-                    "decode_vq_start",
-                    segment_idx=seg_idx + 1,
-                    codes_frames=(
-                        result.codes.shape[1] if result.codes is not None else 0
-                    ),
+            if produced_segments == 0:
+                yield InferenceResult(
+                    code="error",
+                    audio=None,
+                    error=RuntimeError("No audio generated, please check the input text."),
                 )
+                return
 
-                if result.codes is not None and not result.codes.is_cuda:
-                    result = GenerateResponse(
-                        result.action,
-                        result.codes.to(self.decoder_model.device),
-                        getattr(result, "text", None),
-                    )
+            if req.streaming:
+                yield InferenceResult(code="final", audio=None, error=None)
+                return
 
-                try:
-                    segment = self.get_audio_segment(result)
-                except Exception as seg_err:
-                    if ack_queue is not None:
-                        ack_queue.put(None)
-                    if stream_tokens:
-                        logger.exception(
-                            "stream: get_audio_segment FAILED seg_idx={} codes_shape={} req={}: {}",
-                            seg_idx + 1,
-                            result.codes.shape if result.codes is not None else None,
-                            req_tag,
-                            seg_err,
-                        )
-                    raise
-
-                seg_idx += 1
-                produced_segments += 1
-
-                _mark("segment_decoded", segment_idx=seg_idx, samples=len(segment))
-
-                if stream_tokens:
-                    logger.info(
-                        "stream: segment_decoded seg_idx={} samples={} req={}",
-                        seg_idx,
-                        len(segment),
-                        req_tag,
-                    )
-
-                # Ack immediately after decode is complete.
-                # This preserves back-pressure between LLM generation and DAC decode,
-                # and avoids deadlock if the HTTP client closes while we're yielding.
-                if ack_queue is not None:
-                    ack_queue.put(None)
-
-                if req.streaming:
-                    _mark("yield_segment", segment_idx=seg_idx)
-                    yield InferenceResult(
-                        code="segment",
-                        audio=(sample_rate, segment),
-                        error=None,
-                    )
-                else:
-                    segments.append(segment)
-            else:
-                if stream_tokens:
-                    logger.info(
-                        "stream: got_next (end of stream), total_segments={} req={}",
-                        seg_idx,
-                        req_tag,
-                    )
-
-                if ack_queue is not None:
-                    ack_queue.put(None)
-
-                _mark("got_next")
-                break
-
-        if failed:
-            return None
-
-        if produced_segments == 0:
-            _mark("yield_error_empty")
-            yield InferenceResult(
-                code="error",
-                audio=None,
-                error=RuntimeError(
-                    "No audio generated, please check the input text."
-                ),
-            )
-            return None
-
-        # Important:
-        # - in streaming mode we must NOT emit full final audio again, otherwise
-        #   upper layers may replay the whole answer a second time;
-        # - in non-streaming mode we still return the complete waveform.
-        if req.streaming:
-            _mark("yield_final_stream")
-            yield InferenceResult(
-                code="final",
-                audio=None,
-                error=None,
-            )
-        else:
             audio = np.concatenate(segments, axis=0)
-            _mark("yield_final", total_samples=len(audio), segments=len(segments))
             yield InferenceResult(
                 code="final",
                 audio=(sample_rate, audio),
                 error=None,
             )
+        except GeneratorExit:
+            normal_eos = terminal_signal is not None and terminal_signal.kind == "eos"
+            pipeline_settled = producer_done.is_set() and dac_done.is_set()
 
-        return None
+            if not normal_eos and not pipeline_settled:
+                cancel_event.set()
+                self._safe_ack(
+                    ack_queue,
+                    ACK_ABORT,
+                    req_tag=req_tag,
+                    reason="generator_closed",
+                )
+                logger.info("pipeline: generator_closed req={}", req_tag)
+
+            raise
+        finally:
+            normal_eos = terminal_signal is not None and terminal_signal.kind == "eos"
+            pipeline_settled = producer_done.is_set() and dac_done.is_set()
+
+            if normal_eos:
+                self._safe_ack(
+                    ack_queue,
+                    ACK_CONTINUE,
+                    req_tag=req_tag,
+                    reason="inference_finally_eos",
+                )
+            elif not pipeline_settled:
+                cancel_event.set()
+                self._safe_ack(
+                    ack_queue,
+                    ACK_ABORT,
+                    req_tag=req_tag,
+                    reason="inference_finally_abort",
+                )
+
+            self._drain_pipeline_queue(audio_queue)
+            self._drain_pipeline_queue(codes_queue)
+
+            producer_thread.join(timeout=THREAD_JOIN_TIMEOUT_SEC)
+            dac_thread.join(timeout=THREAD_JOIN_TIMEOUT_SEC)
+
+            logger.info(
+                "pipeline: finished req={} status={} producer_alive={} dac_alive={} codes_depth={} audio_depth={} codes_hwm={} audio_hwm={} segments={} samples={} ttfa_ms={} total_ms={:.1f} sender_wait_ms={:.1f} underruns={} dac_decode_ms={:.1f} dac_parts={} dac_retries={} dac_cleanup={}",
+                req_tag,
+                terminal_signal.kind if terminal_signal is not None else "unknown",
+                producer_thread.is_alive(),
+                dac_thread.is_alive(),
+                codes_queue.qsize(),
+                audio_queue.qsize(),
+                codes_high_water,
+                audio_high_water,
+                produced_segments,
+                samples_total,
+                f"{ttfa_ms:.1f}" if ttfa_ms is not None else "na",
+                (time.perf_counter() - t_start) * 1000.0,
+                sender_wait_ms_total,
+                sender_underruns,
+                dac_decode_ms_total,
+                dac_microchunk_parts_total,
+                dac_retries_total,
+                dac_cleanup_total,
+            )
 
     def send_Llama_request(
         self,
@@ -3405,11 +4205,9 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         prompt_texts: list,
         req_tag: str,
         ack_queue: queue.Queue | None = None,
+        cancel_event: threading.Event | None = None,
+        response_queue_maxsize: int = 0,
     ) -> queue.Queue:
-        """
-        Send a request to the LLAMA model to generate the symbolic tokens.
-        """
-
         stream_tokens = getattr(req, "stream_tokens", False) or req.streaming
 
         request = dict(
@@ -3429,12 +4227,13 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             stream_chunk_size=getattr(req, "stream_chunk_size", 8),
             initial_stream_chunk_size=getattr(req, "initial_stream_chunk_size", None),
             ack_queue=ack_queue,
+            cancel_event=cancel_event,
             cleanup_mode=getattr(req, "cleanup_mode", "request_end"),
             stream_empty_cache=getattr(req, "stream_empty_cache", None),
             control=getattr(req, "control", None),
         )
 
-        response_queue = queue.Queue()
+        response_queue = queue.Queue(maxsize=max(0, response_queue_maxsize))
 
         self.llama_queue.put(
             GenerateRequest(
@@ -3445,17 +4244,28 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
         return response_queue
 
-    def get_audio_segment(self, result: GenerateResponse) -> np.ndarray:
-        """
-        Decode the VQ tokens to audio.
-        """
+    def get_audio_segment(
+        self,
+        codes: torch.Tensor,
+        *,
+        req_tag: str,
+        segment_idx: int,
+        max_codes_per_step: int | None = None,
+    ) -> tuple[np.ndarray, DACDecodeStats]:
+        with torch.inference_mode():
+            decoder_device = self._decoder_device()
+            with autocast_exclude_mps(
+                device_type=decoder_device.type,
+                dtype=self.precision,
+            ):
+                segment, stats = self.decode_vq_tokens(
+                    codes=codes,
+                    req_tag=req_tag,
+                    segment_idx=segment_idx,
+                    max_codes_per_step=max_codes_per_step,
+                )
 
-        with autocast_exclude_mps(
-            device_type=self.decoder_model.device.type, dtype=self.precision
-        ):
-            segment = self.decode_vq_tokens(codes=result.codes)
-
-        return segment.float().detach().cpu().numpy()
+        return segment.float().detach().cpu().numpy(), stats
 
 
 path: /inference_engine/reference_loader.py
@@ -3479,6 +4289,11 @@ from fish_speech.utils.file import (
 from fish_speech.utils.schema import ServeReferenceAudio
 
 
+def _stem_for_codes_file(path: Path) -> str:
+    stem = path.stem
+    return stem.removesuffix(".codes") if stem.endswith(".codes") else stem
+
+
 class ReferenceLoader:
     def __init__(self) -> None:
         """
@@ -3488,12 +4303,14 @@ class ReferenceLoader:
         self.ref_by_id: dict = {}
         self.ref_by_hash: dict = {}
 
-        # Make Pylance happy (attribut/method not defined...)
         self.decoder_model: DAC
         self.encode_reference: Callable
 
-        # Define the torchaudio backend
-        backends = torchaudio.list_audio_backends()
+        try:
+            backends = torchaudio.list_audio_backends()
+        except AttributeError:
+            backends = []
+
         if "ffmpeg" in backends:
             self.backend = "ffmpeg"
         else:
@@ -3504,26 +4321,24 @@ class ReferenceLoader:
         id: str,
         use_cache: Literal["on", "off"],
     ) -> Tuple:
-        # Load the references audio and text by id.
-        # Each reference can be: (a) .wav + .lab → encode at load, or (b) .codes.pt + .lab → load pre-encoded (no encoder run).
         ref_folder = Path("references") / id
         ref_folder.mkdir(parents=True, exist_ok=True)
+
         ref_audios = list_files(
-            ref_folder, AUDIO_EXTENSIONS, recursive=True, sort=False
+            ref_folder,
+            AUDIO_EXTENSIONS,
+            recursive=True,
+            sort=False,
         )
         ref_codes = list(ref_folder.glob("*.codes.pt"))
 
-        # .codes.pt filename stem is "en.codes" (Path.stem); we want logical stem "en" for en.lab / en.codes.pt
-        def _stem_for_codes(p: Path) -> str:
-            s = p.stem
-            return s.removesuffix(".codes") if s.endswith(".codes") else s
-
-        stems = {p.stem for p in ref_audios} | {_stem_for_codes(p) for p in ref_codes}
+        stems = {p.stem for p in ref_audios} | {_stem_for_codes_file(p) for p in ref_codes}
         stems = sorted(stems)
 
         if use_cache == "off" or id not in self.ref_by_id:
             prompt_tokens = []
             prompt_texts = []
+
             for stem in stems:
                 lab_path = ref_folder / f"{stem}.lab"
                 codes_path = ref_folder / f"{stem}.codes.pt"
@@ -3535,21 +4350,26 @@ class ReferenceLoader:
                     ),
                     None,
                 )
+
                 if not lab_path.exists():
                     logger.warning("Reference stem {} missing .lab, skipping", stem)
                     continue
+
                 prompt_texts.append(read_ref_text(str(lab_path)))
+
                 if codes_path.exists():
-                    # Pre-encoded: load from disk (no encoder run). File must be tensor shape (num_codebooks, T) from DAC encode.
-                    # map_location="cpu" = put tensor in RAM (worker will .to(device) later). Loading to GPU here would save one tiny copy but is negligible for KB-sized tensors.
                     loaded = torch.load(
-                        codes_path, map_location="cpu", weights_only=True
+                        codes_path,
+                        map_location="cpu",
+                        weights_only=True,
                     )
                     prompt_tokens.append(
                         loaded if isinstance(loaded, torch.Tensor) else loaded[0]
                     )
                     logger.info(
-                        "Loaded pre-encoded reference {} from {}", stem, codes_path.name
+                        "Loaded pre-encoded reference {} from {}",
+                        stem,
+                        codes_path.name,
                     )
                 elif audio_path is not None:
                     prompt_tokens.append(
@@ -3564,10 +4384,9 @@ class ReferenceLoader:
                         stem,
                     )
                     prompt_texts.pop()
-            self.ref_by_id[id] = (prompt_tokens, prompt_texts)
 
+            self.ref_by_id[id] = (prompt_tokens, prompt_texts)
         else:
-            # Reuse already encoded references
             logger.info("Use same references")
             prompt_tokens, prompt_texts = self.ref_by_id[id]
 
@@ -3578,14 +4397,13 @@ class ReferenceLoader:
         references: list[ServeReferenceAudio],
         use_cache: Literal["on", "off"],
     ) -> Tuple:
-        # Load the references audio and text by hash
         audio_hashes = [sha256(ref.audio).hexdigest() for ref in references]
 
         cache_used = False
         prompt_tokens, prompt_texts = [], []
+
         for i, ref in enumerate(references):
             if use_cache == "off" or audio_hashes[i] not in self.ref_by_hash:
-                # If the references are not already loaded, encode them
                 prompt_tokens.append(
                     self.encode_reference(
                         reference_audio=ref.audio,
@@ -3594,9 +4412,7 @@ class ReferenceLoader:
                 )
                 prompt_texts.append(ref.text)
                 self.ref_by_hash[audio_hashes[i]] = (prompt_tokens[-1], ref.text)
-
             else:
-                # Reuse already encoded references
                 cached_token, cached_text = self.ref_by_hash[audio_hashes[i]]
                 prompt_tokens.append(cached_token)
                 prompt_texts.append(cached_text)
@@ -3607,56 +4423,75 @@ class ReferenceLoader:
 
         return prompt_tokens, prompt_texts
 
-    def load_audio(self, reference_audio: bytes | str, sr: int):
+    def load_audio(self, reference_audio: bytes | bytearray | memoryview | str | Path, sr: int):
         """
-        Load the audio data from a file or bytes.
+        Load audio data either from raw bytes or from a filesystem path.
         """
-        if len(reference_audio) > 255 or not Path(reference_audio).exists():
-            audio_data = reference_audio
-            reference_audio = io.BytesIO(audio_data)
+        if isinstance(reference_audio, (bytes, bytearray, memoryview)):
+            source = io.BytesIO(bytes(reference_audio))
+        elif isinstance(reference_audio, (str, Path)):
+            source_path = Path(reference_audio)
+            if not source_path.exists():
+                raise FileNotFoundError(f"Reference audio file not found: {source_path}")
+            source = str(source_path)
+        else:
+            raise TypeError(
+                "reference_audio must be bytes, bytearray, memoryview, str or Path"
+            )
 
-        waveform, original_sr = torchaudio.load(reference_audio, backend=self.backend)
+        waveform, original_sr = torchaudio.load(source, backend=self.backend)
 
         if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
 
         if original_sr != sr:
             resampler = torchaudio.transforms.Resample(
-                orig_freq=original_sr, new_freq=sr
+                orig_freq=original_sr,
+                new_freq=sr,
             )
             waveform = resampler(waveform)
 
-        audio = waveform.squeeze().numpy()
+        audio = waveform.squeeze(0).cpu().numpy()
         return audio
 
     def list_reference_ids(self) -> list[str]:
         """
-        List all valid reference IDs (subdirectory names containing valid audio and .lab files).
+        List all valid reference IDs.
 
-        Returns:
-            list[str]: List of valid reference IDs
+        Valid reference:
+        - at least one <stem>.lab
+        - and either corresponding audio <stem>.* or pre-encoded <stem>.codes.pt
         """
         ref_base_path = Path("references")
         if not ref_base_path.exists():
             return []
 
         valid_ids = []
+
         for ref_dir in ref_base_path.iterdir():
             if not ref_dir.is_dir():
                 continue
 
-            # Check if directory contains at least one audio file and corresponding .lab file
             audio_files = list_files(
-                ref_dir, AUDIO_EXTENSIONS, recursive=False, sort=False
+                ref_dir,
+                AUDIO_EXTENSIONS,
+                recursive=False,
+                sort=False,
             )
-            if not audio_files:
+            code_files = list(ref_dir.glob("*.codes.pt"))
+
+            stems = {p.stem for p in audio_files} | {_stem_for_codes_file(p) for p in code_files}
+            if not stems:
                 continue
 
-            # Check if corresponding .lab file exists for at least one audio file
             has_valid_pair = False
-            for audio_file in audio_files:
-                lab_file = audio_file.with_suffix(".lab")
-                if lab_file.exists():
+            for stem in stems:
+                lab_file = ref_dir / f"{stem}.lab"
+                code_file = ref_dir / f"{stem}.codes.pt"
+                audio_exists = any(
+                    (ref_dir / f"{stem}{ext}").exists() for ext in AUDIO_EXTENSIONS
+                )
+                if lab_file.exists() and (audio_exists or code_file.exists()):
                     has_valid_pair = True
                     break
 
@@ -3669,8 +4504,8 @@ class ReferenceLoader:
         self, id: str, codes_bytes: bytes, lab_text: str, stem: str | None = None
     ) -> Literal["created", "updated", "unchanged"]:
         """
-        Add or update a pre-encoded reference (e.g. from preencode_references.py).
-        Writes references/<id>/<stem>.codes.pt and <stem>.lab (stem defaults to id). Skips if hash matches.
+        Add or update a pre-encoded reference.
+        Writes references/<id>/<stem>.codes.pt and <stem>.lab.
         """
         import re
 
@@ -3682,6 +4517,7 @@ class ReferenceLoader:
             raise ValueError(
                 "Reference ID is too long. Maximum length is 255 characters."
             )
+
         stem = stem or id
         if not re.match(r"^[a-zA-Z0-9\-_ ]+$", stem):
             raise ValueError("Stem contains invalid characters.")
@@ -3694,17 +4530,22 @@ class ReferenceLoader:
         if ref_dir.exists() and hash_file.exists():
             if hash_file.read_text(encoding="utf-8").strip() == content_hash:
                 logger.info(
-                    "Reference %s/%s unchanged (hash match), skip write", id, stem
+                    "Reference %s/%s unchanged (hash match), skip write",
+                    id,
+                    stem,
                 )
                 return "unchanged"
 
         existed_before = ref_dir.exists() and (ref_dir / f"{stem}.codes.pt").exists()
         ref_dir.mkdir(parents=True, exist_ok=True)
+
         (ref_dir / f"{stem}.codes.pt").write_bytes(codes_bytes)
         (ref_dir / f"{stem}.lab").write_text(lab_text, encoding="utf-8")
         hash_file.write_text(content_hash, encoding="utf-8")
+
         if id in self.ref_by_id:
             del self.ref_by_id[id]
+
         status = "updated" if existed_before else "created"
         logger.info("Reference %s/%s %s", id, stem, status)
         return status
@@ -3712,19 +4553,9 @@ class ReferenceLoader:
     def add_reference(self, id: str, wav_file_path: str, reference_text: str) -> None:
         """
         Add a new reference voice by creating a new directory and copying files.
-
-        Args:
-            id: Reference ID (directory name)
-            wav_file_path: Path to the audio file to copy
-            reference_text: Text content for the .lab file
-
-        Raises:
-            FileExistsError: If the reference ID already exists
-            FileNotFoundError: If the audio file doesn't exist
-            OSError: If file operations fail
         """
-        # Validate ID format
         import re
+        import shutil
 
         if not re.match(r"^[a-zA-Z0-9\-_ ]+$", id):
             raise ValueError(
@@ -3736,76 +4567,52 @@ class ReferenceLoader:
                 "Reference ID is too long. Maximum length is 255 characters."
             )
 
-        # Check if reference already exists
         ref_dir = Path("references") / id
         if ref_dir.exists():
             raise FileExistsError(f"Reference ID '{id}' already exists")
 
-        # Check if audio file exists
         audio_path = Path(wav_file_path)
         if not audio_path.exists():
             raise FileNotFoundError(f"Audio file not found: {wav_file_path}")
 
-        # Validate audio file extension
         if audio_path.suffix.lower() not in AUDIO_EXTENSIONS:
             raise ValueError(
-                f"Unsupported audio format: {audio_path.suffix}. Supported formats: {', '.join(AUDIO_EXTENSIONS)}"
+                f"Unsupported audio format: {audio_path.suffix}. Supported formats: {', '.join(sorted(AUDIO_EXTENSIONS))}"
             )
 
         try:
-            # Create reference directory
             ref_dir.mkdir(parents=True, exist_ok=False)
 
-            # Determine the target audio filename with original extension
             target_audio_path = ref_dir / f"sample{audio_path.suffix}"
-
-            # Copy audio file
-            import shutil
-
             shutil.copy2(audio_path, target_audio_path)
 
-            # Create .lab file
             lab_path = ref_dir / "sample.lab"
             with open(lab_path, "w", encoding="utf-8") as f:
                 f.write(reference_text)
 
-            # Clear cache for this ID if it exists
             if id in self.ref_by_id:
                 del self.ref_by_id[id]
 
             logger.info(f"Successfully added reference voice with ID: {id}")
 
         except Exception as e:
-            # Clean up on failure
             if ref_dir.exists():
-                import shutil
-
                 shutil.rmtree(ref_dir)
             raise e
 
     def delete_reference(self, id: str) -> None:
         """
         Delete a reference voice by removing its directory and files.
-
-        Args:
-            id: Reference ID (directory name) to delete
-
-        Raises:
-            FileNotFoundError: If the reference ID doesn't exist
-            OSError: If file operations fail
         """
-        # Check if reference exists
+        import shutil
+
         ref_dir = Path("references") / id
         if not ref_dir.exists():
             raise FileNotFoundError(f"Reference ID '{id}' does not exist")
 
         try:
-            # Remove the entire reference directory
-            import shutil
-
             shutil.rmtree(ref_dir)
 
-            # Clear cache for this ID if it exists
             if id in self.ref_by_id:
                 del self.ref_by_id[id]
 
@@ -3851,6 +4658,10 @@ def wav_chunk_header(
 
 path: /inference_engine/vq_manager.py
 ----------------------------------------
+import gc
+import os
+import time
+from dataclasses import dataclass
 from typing import Callable
 
 import torch
@@ -3859,55 +4670,358 @@ from loguru import logger
 from fish_speech.models.dac.modded_dac import DAC
 
 
-class VQManager:
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip() in {"1", "true", "TRUE", "yes", "YES", "on", "ON"}
 
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+@dataclass(frozen=True)
+class CUDAMemorySnapshot:
+    free_gb: float | None
+    allocated_gb: float | None
+    reserved_gb: float | None
+    total_gb: float | None
+
+
+@dataclass(frozen=True)
+class DACDecodeStats:
+    microchunk_size: int
+    microchunk_count: int
+    retries: int
+    cleanup_count: int
+    decode_ms: float
+    snapshot_before: CUDAMemorySnapshot
+    snapshot_after: CUDAMemorySnapshot
+
+
+class VQManager:
     def __init__(self):
-        # Make Pylance happy (attribut/method not defined...)
         self.decoder_model: DAC
         self.load_audio: Callable
 
-    def decode_vq_tokens(self, codes):
-        chunk_len = codes.shape[1] if codes.dim() >= 2 else 0
-        logger.info("VQ features: {} (stream chunk={})", codes.shape, chunk_len)
+    def _decoder_device(self) -> torch.device:
+        device = getattr(self.decoder_model, "device", None)
+        if device is not None:
+            return torch.device(device)
 
-        if isinstance(self.decoder_model, DAC):
-            return self.decoder_model.from_indices(codes[None])[0].squeeze()
+        try:
+            return next(self.decoder_model.parameters()).device
+        except StopIteration:
+            return torch.device("cpu")
 
-        raise ValueError(f"Unknown model type: {type(self.decoder_model)}")
+    def _decoder_dtype(self) -> torch.dtype:
+        try:
+            return next(self.decoder_model.parameters()).dtype
+        except StopIteration:
+            return torch.float32
+
+    def _cuda_index(self, device: torch.device | str | None = None) -> int | None:
+        if not torch.cuda.is_available():
+            return None
+
+        if device is None:
+            return torch.cuda.current_device()
+
+        if isinstance(device, str):
+            device = torch.device(device)
+
+        if device.type != "cuda":
+            return None
+
+        return torch.cuda.current_device() if device.index is None else device.index
+
+    def cuda_memory_snapshot(
+        self, device: torch.device | str | None = None
+    ) -> CUDAMemorySnapshot:
+        cuda_idx = self._cuda_index(device)
+        if cuda_idx is None:
+            return CUDAMemorySnapshot(
+                free_gb=None,
+                allocated_gb=None,
+                reserved_gb=None,
+                total_gb=None,
+            )
+
+        free_gb = None
+        total_gb = None
+        if hasattr(torch.cuda, "mem_get_info"):
+            try:
+                free_bytes, total_bytes = torch.cuda.mem_get_info(cuda_idx)
+                free_gb = free_bytes / (1024**3)
+                total_gb = total_bytes / (1024**3)
+            except Exception:
+                free_gb = None
+                total_gb = None
+
+        if total_gb is None:
+            props = torch.cuda.get_device_properties(cuda_idx)
+            total_gb = props.total_memory / (1024**3)
+
+        allocated_gb = torch.cuda.memory_allocated(cuda_idx) / (1024**3)
+        reserved_gb = torch.cuda.memory_reserved(cuda_idx) / (1024**3)
+
+        if free_gb is None:
+            used_bytes = max(
+                torch.cuda.memory_reserved(cuda_idx),
+                torch.cuda.memory_allocated(cuda_idx),
+            )
+            free_gb = max(0, (total_gb * (1024**3)) - used_bytes) / (1024**3)
+
+        return CUDAMemorySnapshot(
+            free_gb=free_gb,
+            allocated_gb=allocated_gb,
+            reserved_gb=reserved_gb,
+            total_gb=total_gb,
+        )
+
+    def _light_cuda_cleanup(self, device: torch.device | str | None = None) -> None:
+        cuda_idx = self._cuda_index(device)
+        if cuda_idx is None:
+            return
+
+        try:
+            torch.cuda.synchronize(cuda_idx)
+        except Exception:
+            pass
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def _is_oom_error(self, err: BaseException) -> bool:
+        return isinstance(err, RuntimeError) and "out of memory" in str(err).lower()
+
+    def _decode_codes_chunk_cpu_fallback(self, codes: torch.Tensor) -> torch.Tensor:
+        original_device = self._decoder_device()
+        original_dtype = self._decoder_dtype()
+
+        logger.warning(
+            "DAC emergency CPU fallback chunk_len={} original_device={}",
+            int(codes.shape[1]),
+            original_device,
+        )
+
+        try:
+            self.decoder_model.to(device="cpu", dtype=original_dtype)
+            with torch.inference_mode():
+                audio = self.decoder_model.from_indices(
+                    codes.to(device="cpu", dtype=torch.long, non_blocking=False)[None]
+                )[0].squeeze()
+            return audio.detach().cpu()
+        finally:
+            self.decoder_model.to(device=original_device, dtype=original_dtype)
+            self._light_cuda_cleanup(original_device)
+
+    def _decode_codes_window(
+        self,
+        codes: torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        audio = self.decoder_model.from_indices(
+            codes.to(device=device, dtype=torch.long, non_blocking=True)[None]
+        )[0].squeeze()
+        return audio.detach().cpu()
+
+    def decode_vq_tokens(
+        self,
+        codes: torch.Tensor,
+        *,
+        req_tag: str = "na",
+        segment_idx: int | None = None,
+        max_codes_per_step: int | None = None,
+    ) -> tuple[torch.Tensor, DACDecodeStats]:
+        if not isinstance(codes, torch.Tensor):
+            raise TypeError(f"codes must be a torch.Tensor, got {type(codes)}")
+
+        if codes.ndim != 2:
+            raise ValueError(
+                f"Expected codes shape [num_codebooks, time], got {codes.shape}"
+            )
+
+        if not isinstance(self.decoder_model, DAC):
+            raise ValueError(f"Unknown model type: {type(self.decoder_model)}")
+
+        if codes.shape[1] == 0:
+            empty = torch.empty(0, dtype=torch.float32)
+            snapshot = self.cuda_memory_snapshot(self._decoder_device())
+            return empty, DACDecodeStats(
+                microchunk_size=0,
+                microchunk_count=0,
+                retries=0,
+                cleanup_count=0,
+                decode_ms=0.0,
+                snapshot_before=snapshot,
+                snapshot_after=snapshot,
+            )
+
+        device = self._decoder_device()
+        requested_step = max(
+            1,
+            max_codes_per_step
+            if max_codes_per_step is not None
+            else _env_int("FISH_DAC_MAX_CODES_PER_STEP", 4),
+        )
+        current_step = requested_step
+        min_free_gb = _env_float("FISH_DAC_MIN_FREE_GB", 3.0)
+        resume_free_gb = _env_float("FISH_DAC_RESUME_FREE_GB", 5.0)
+        critical_free_gb = _env_float("FISH_DAC_CRITICAL_FREE_GB", 1.5)
+        allow_cpu_fallback = _env_flag("FISH_DAC_CPU_FALLBACK_ON_OOM", False)
+
+        snapshot_before = self.cuda_memory_snapshot(device)
+        if snapshot_before.free_gb is not None:
+            if snapshot_before.free_gb < critical_free_gb:
+                current_step = 1
+                self._light_cuda_cleanup(device)
+            elif snapshot_before.free_gb < min_free_gb:
+                current_step = max(1, min(current_step, requested_step // 2))
+
+        decode_started = time.perf_counter()
+        audio_parts: list[torch.Tensor] = []
+        retries = 0
+        cleanup_count = 0
+        microchunk_count = 0
+        offset = 0
+
+        while offset < codes.shape[1]:
+            step = min(current_step, int(codes.shape[1]) - offset)
+            window = codes[:, offset : offset + step]
+
+            while True:
+                try:
+                    part = self._decode_codes_window(window, device=device)
+                    audio_parts.append(part)
+                    microchunk_count += 1
+                    offset += int(window.shape[1])
+                    break
+                except Exception as err:
+                    if not self._is_oom_error(err):
+                        raise
+
+                    retries += 1
+                    cleanup_count += 1
+                    self._light_cuda_cleanup(device)
+
+                    if int(window.shape[1]) > 1:
+                        next_step = max(1, int(window.shape[1]) // 2)
+                        logger.warning(
+                            "dac: oom req={} seg={} offset={} step={} retry_step={}",
+                            req_tag,
+                            segment_idx,
+                            offset,
+                            int(window.shape[1]),
+                            next_step,
+                        )
+                        current_step = min(current_step, next_step)
+                        step = next_step
+                        window = codes[:, offset : offset + step]
+                        continue
+
+                    if allow_cpu_fallback:
+                        part = self._decode_codes_chunk_cpu_fallback(window)
+                        audio_parts.append(part)
+                        microchunk_count += 1
+                        offset += int(window.shape[1])
+                        break
+
+                    raise
+
+            snapshot_now = self.cuda_memory_snapshot(device)
+            if snapshot_now.free_gb is not None:
+                if snapshot_now.free_gb < critical_free_gb:
+                    current_step = 1
+                elif snapshot_now.free_gb < min_free_gb:
+                    current_step = max(1, min(current_step, requested_step // 2))
+                elif snapshot_now.free_gb >= resume_free_gb:
+                    current_step = min(requested_step, max(1, current_step * 2))
+
+        if len(audio_parts) == 1:
+            audio = audio_parts[0]
+        else:
+            audio = torch.cat(audio_parts, dim=-1)
+
+        snapshot_after = self.cuda_memory_snapshot(device)
+        stats = DACDecodeStats(
+            microchunk_size=current_step,
+            microchunk_count=microchunk_count,
+            retries=retries,
+            cleanup_count=cleanup_count,
+            decode_ms=(time.perf_counter() - decode_started) * 1000.0,
+            snapshot_before=snapshot_before,
+            snapshot_after=snapshot_after,
+        )
+
+        logger.info(
+            "dac: decode_summary req={} seg={} frames={} microchunk={} parts={} retries={} cleanup={} decode_ms={:.1f} free_gb={} alloc_gb={} reserved_gb={}",
+            req_tag,
+            segment_idx,
+            int(codes.shape[1]),
+            stats.microchunk_size,
+            stats.microchunk_count,
+            stats.retries,
+            stats.cleanup_count,
+            stats.decode_ms,
+            f"{stats.snapshot_after.free_gb:.2f}" if stats.snapshot_after.free_gb is not None else "na",
+            f"{stats.snapshot_after.allocated_gb:.2f}" if stats.snapshot_after.allocated_gb is not None else "na",
+            f"{stats.snapshot_after.reserved_gb:.2f}" if stats.snapshot_after.reserved_gb is not None else "na",
+        )
+
+        return audio, stats
 
     def encode_reference(self, reference_audio, enable_reference_audio):
         if enable_reference_audio and reference_audio is not None:
-            # Load audios, and prepare basic info here
             if hasattr(self.decoder_model, "spec_transform"):
                 sample_rate = self.decoder_model.spec_transform.sample_rate
             else:
                 sample_rate = self.decoder_model.sample_rate
-            reference_audio_content = self.load_audio(reference_audio, sample_rate)
 
-            # Keep audio on CPU; run encoder on CPU to avoid OOM (encoder on long ref
-            # can use ~14+ GB GPU and we're already near 16 GB after warmup).
+            reference_audio_content = self.load_audio(reference_audio, sample_rate)
             audios = torch.from_numpy(reference_audio_content)[None, None, :]
             audio_lengths = torch.tensor([audios.shape[2]], dtype=torch.long)
             logger.info(
-                f"Loaded audio with {audios.shape[2] / sample_rate:.2f} seconds"
+                "Loaded audio with {:.2f} seconds",
+                audios.shape[2] / sample_rate,
             )
 
             if isinstance(self.decoder_model, DAC):
                 device = getattr(self.decoder_model, "device", None)
                 on_cuda = device is not None and str(device).startswith("cuda")
+
                 if on_cuda:
                     torch.cuda.empty_cache()
                     self.decoder_model.to("cpu")
                     try:
-                        prompt_tokens = self.decoder_model.encode(
-                            audios, audio_lengths
-                        )[0][0]
+                        prompt_tokens = self.decoder_model.encode(audios, audio_lengths)[0][
+                            0
+                        ]
                     finally:
                         self.decoder_model.to(device)
                 else:
                     prompt_tokens = self.decoder_model.encode(audios, audio_lengths)[0][
                         0
                     ]
+
                 logger.info("Encoded prompt: {}", prompt_tokens.shape)
             else:
                 raise ValueError(f"Unknown model type: {type(self.decoder_model)}")
@@ -4916,6 +6030,33 @@ class DAC(BaseModel, CodecMixin):
         self.delay = self.get_delay()
 
         self.frame_length = self.hop_length * 4
+        self._weight_norm_removed = False
+
+    def _remove_weight_norm_parametrizations(self) -> int:
+        removed = 0
+        for module in self.modules():
+            parametrizations = getattr(module, "parametrizations", None)
+            if parametrizations is None:
+                continue
+            try:
+                has_weight = "weight" in parametrizations
+            except TypeError:
+                has_weight = hasattr(parametrizations, "weight")
+            if not has_weight:
+                continue
+            try:
+                remove_parametrizations(module, "weight", leave_parametrized=True)
+                removed += 1
+            except ValueError:
+                continue
+        return removed
+
+    def optimize_for_inference(self, remove_weight_norm: bool = True) -> int:
+        if not remove_weight_norm or self._weight_norm_removed:
+            return 0
+        removed = self._remove_weight_norm_parametrizations()
+        self._weight_norm_removed = True
+        return removed
 
     def preprocess(self, audio_data, sample_rate):
         if sample_rate is None:
@@ -5538,6 +6679,12 @@ from fish_speech.content_sequence import (
 from fish_speech.conversation import Conversation, Message
 from fish_speech.tokenizer import IM_END_TOKEN
 
+# Явные ack-команды между pipeline producer и LLM worker.
+# Теперь ack означает, что chunk безопасно принят bounded CPU pipeline,
+# а не то, что DAC уже закончил decode.
+ACK_CONTINUE = "continue"
+ACK_ABORT = "abort"
+
 
 def _to_normal_tensor(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     """
@@ -5558,6 +6705,16 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.strip() in {"1", "true", "TRUE", "yes", "YES", "on", "ON"}
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def _normalize_cleanup_mode(cleanup_mode: str | None) -> str:
     mode = (cleanup_mode or "request_end").strip().lower()
     aliases = {
@@ -5575,9 +6732,47 @@ def _normalize_cleanup_mode(cleanup_mode: str | None) -> str:
     return aliases.get(mode, mode)
 
 
+def _cuda_index(device: torch.device | str | None = None) -> int | None:
+    if not torch.cuda.is_available():
+        return None
+
+    if device is None:
+        return torch.cuda.current_device()
+
+    if isinstance(device, str):
+        device = torch.device(device)
+
+    if device.type != "cuda":
+        return None
+
+    return torch.cuda.current_device() if device.index is None else device.index
+
+
+def _cuda_free_gb(device: torch.device | str | None = None) -> float | None:
+    cuda_idx = _cuda_index(device)
+    if cuda_idx is None:
+        return None
+
+    if hasattr(torch.cuda, "mem_get_info"):
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(cuda_idx)
+            return free_bytes / (1024**3)
+        except Exception:
+            pass    
+
+    props = torch.cuda.get_device_properties(cuda_idx)
+    total_bytes = props.total_memory
+    reserved_bytes = torch.cuda.memory_reserved(cuda_idx)
+    allocated_bytes = torch.cuda.memory_allocated(cuda_idx)
+    used_bytes = max(reserved_bytes, allocated_bytes)
+    free_bytes = max(0, total_bytes - used_bytes)
+    return free_bytes / (1024**3)
+
+
 def _light_cuda_cleanup() -> None:
     if not torch.cuda.is_available():
         return
+    torch.cuda.synchronize()
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -5636,6 +6831,34 @@ def _run_request_cleanup(
         return
 
     if mode == "session_idle":
+        try:
+            device = next(model.parameters()).device
+        except StopIteration:
+            device = None
+
+        free_gb = _cuda_free_gb(device)
+        force_heavy_below_gb = _env_float(
+            "FISH_SESSION_IDLE_FORCE_HEAVY_BELOW_GB", 3.0
+        )
+
+        if free_gb is not None and free_gb < force_heavy_below_gb:
+            logger.warning(
+                "worker: session_idle fallback to heavy cleanup req={} free={:.2f} GB < {:.2f} GB reason={}",
+                req_tag,
+                free_gb,
+                force_heavy_below_gb,
+                reason,
+            )
+            before_clear_gb, after_clear_gb = _heavy_cuda_cleanup(model)
+            if before_clear_gb is not None:
+                logger.info(
+                    "worker: clear_caches done alloc before={} GB after={} GB req={}",
+                    before_clear_gb,
+                    after_clear_gb,
+                    req_tag,
+                )
+            return
+        
         logger.info(
             "worker: keeping model warm req={} mode={} reason={}",
             req_tag,
@@ -5668,6 +6891,85 @@ def _run_request_cleanup(
             after_clear_gb,
             req_tag,
         )
+
+
+def _maybe_force_cleanup_before_request(
+    *,
+    model: torch.nn.Module,
+    req_tag: str,
+    cleanup_mode: str,
+) -> None:
+    """
+    Если мы живём в session_idle режиме, но VRAM уже почти не осталось,
+    лучше один раз сделать heavy cleanup до старта нового запроса,
+    чем уронить процесс посередине DAC decode.
+    """
+    if _normalize_cleanup_mode(cleanup_mode) != "session_idle":
+        return
+
+    min_free_gb = _env_float("FISH_SESSION_IDLE_MIN_FREE_GB", 4.0)
+    device = next(model.parameters()).device
+    free_gb = _cuda_free_gb(device)
+    if free_gb is None or free_gb >= min_free_gb:
+        return
+
+    logger.warning(
+        "worker: low free VRAM before request req={} free={:.2f} GB < {:.2f} GB, "
+        "forcing heavy cleanup before generation",
+        req_tag,
+        free_gb,
+        min_free_gb,
+    )
+    _run_request_cleanup(
+        model=model,
+        cleanup_mode="request_end",
+        req_tag=req_tag,
+        reason="pre_request_low_free_vram",
+    )
+
+
+def _queue_put_with_cancel(
+    target_queue: queue.Queue,
+    item,
+    *,
+    cancel_event: threading.Event | None,
+    timeout_sec: float = 0.1,
+) -> bool:
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+        try:
+            target_queue.put(item, timeout=timeout_sec)
+            return True
+        except queue.Full:
+            if cancel_event is not None and cancel_event.is_set():
+                return False
+
+
+def _wait_for_consumer_ack(
+    ack_queue: queue.Queue,
+    *,
+    cancel_event: threading.Event | None,
+    ack_timeout_sec: float,
+) -> str:
+    deadline = time.perf_counter() + ack_timeout_sec
+    poll_sec = min(0.25, ack_timeout_sec)
+
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            return ACK_ABORT
+
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Timed out waiting for pipeline ack after {ack_timeout_sec:.1f}s"
+            )
+
+        try:
+            return ack_queue.get(timeout=min(poll_sec, remaining))
+        except queue.Empty:
+            if cancel_event is not None and cancel_event.is_set():
+                return ACK_ABORT
 
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -5893,7 +7195,17 @@ def decode_n_tokens(
         else:
             current_stream_chunk_size = stream_chunk_size
 
+    llm_critical_free_gb = _env_float("FISH_LLM_CRITICAL_FREE_GB", 1.5)
+
     for i in tqdm(range(num_new_tokens)):
+        if (i + 1) % 4 == 0:
+            free_gb = _cuda_free_gb(cur_token.device)
+            if free_gb is not None and free_gb < llm_critical_free_gb:
+                _light_cuda_cleanup()
+
+        if i == 0 and do_stream_log:
+            logger.info("stream: decode_n_tokens started generating first token")
+
         if do_stream_log and i < 3:
             logger.info(
                 "stream: decode_n_tokens iter={} cur_token.shape={} input_pos={}",
@@ -6095,6 +7407,10 @@ def generate(
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
     stream_chunk_size = sampling_kwargs.pop("stream_chunk_size", None)
     initial_stream_chunk_size = sampling_kwargs.pop("initial_stream_chunk_size", None)
+
+    if stream_chunk_size is not None and initial_stream_chunk_size is None:
+        initial_stream_chunk_size = 8
+
     compile = sampling_kwargs.pop("compile", False)
 
     decode_iter = decode_n_tokens(
@@ -6144,7 +7460,8 @@ def init_model(checkpoint_path, device, precision, compile=False):
     logger.info("Restored model from checkpoint")
 
     if isinstance(model, DualARTransformer):
-        decode_one_token = decode_one_token_ar
+        eager_decode_one_token = decode_one_token_ar
+        decode_one_token = eager_decode_one_token
         logger.info("Using DualARTransformer")
     else:
         raise ValueError("Unsupported model type")
@@ -6165,7 +7482,7 @@ def init_model(checkpoint_path, device, precision, compile=False):
             dynamic=True,
         )
 
-    return model.eval(), decode_one_token
+    return model.eval(), decode_one_token, eager_decode_one_token
 
 
 @torch.inference_mode()
@@ -6228,12 +7545,6 @@ class GenerateResponse:
 def split_text_by_speaker(text: str) -> list[str]:
     """
     Split text into turns based on <|speaker:X|> tags.
-
-    Args:
-        text: The full text with speaker tags
-
-    Returns:
-        List of speaker turns, each starting with <|speaker:X|>
     """
     pattern = r"(<\|speaker:\d+\|>)"
     parts = re.split(pattern, text)
@@ -6283,14 +7594,6 @@ def group_turns_into_batches(
 ) -> list[str]:
     """
     Group turns into batches based on speaker count or byte limit.
-
-    Args:
-        turns: List of speaker turns
-        max_speakers: Maximum number of speakers per batch (default 3)
-        max_bytes: Maximum UTF-8 bytes per batch (default 300)
-
-    Returns:
-        List of batched text strings
     """
     batches = []
     current_batch = []
@@ -6340,6 +7643,14 @@ def generate_long(
     assert 0 < top_p <= 1, "top_p must be in (0, 1]"
     assert 0 < temperature < 2, "temperature must be in (0, 2)"
 
+    tokenizer = getattr(model, "tokenizer", None)
+    if tokenizer is None:
+        raise RuntimeError(
+            "Model tokenizer is not initialized. Ensure checkpoint directory contains tokenizer files."
+        )
+
+    debug_visualize_prompt = _env_flag("FISH_DEBUG_VISUALIZE_PROMPT", False)
+
     use_prompt = bool(prompt_text) and bool(prompt_tokens)
     if use_prompt and isinstance(prompt_text, str):
         prompt_text = [prompt_text]
@@ -6354,7 +7665,6 @@ def generate_long(
         prompt_tokens = [i.cpu() for i in prompt_tokens]
 
     model_size = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    tokenizer = model.tokenizer
     max_length = _cache_max_seq_len(model)
 
     base_conversation = Conversation()
@@ -6397,6 +7707,8 @@ def generate_long(
     if stream_tokens:
         batches = [text]
         logger.info("Token streaming: single batch (no text split)")
+        if initial_stream_chunk_size is None:
+            initial_stream_chunk_size = 8
     elif turns:
         batches = group_turns_into_batches(
             turns, max_speakers=5, max_bytes=chunk_length
@@ -6442,12 +7754,13 @@ def generate_long(
                 )
             )
 
-            logger.info("Visualizing prompt structure:")
-            conversation_gen.visualize(
-                tokenizer,
-                merge_audio_tokens=True,
-                merge_semantic_tokens=True,
-            )
+            if debug_visualize_prompt:
+                logger.info("Visualizing prompt structure:")
+                conversation_gen.visualize(
+                    tokenizer,
+                    merge_audio_tokens=True,
+                    merge_semantic_tokens=True,
+                )
 
             encoded, audio_masks, audio_parts = conversation_gen.encode_for_inference(
                 tokenizer, num_codebooks=model.config.num_codebooks
@@ -6665,7 +7978,7 @@ def launch_thread_safe_queue(
             "YES",
         }
 
-        model, decode_one_token = init_model(
+        model, decode_one_token, eager_decode_one_token = init_model(
             checkpoint_path, device, precision, compile=compile
         )
         cache_len = _cache_max_seq_len(model)
@@ -6694,10 +8007,16 @@ def launch_thread_safe_queue(
             kwargs = item.request
             req_tag = str(kwargs.pop("req_tag", "na"))
             ack_queue = kwargs.pop("ack_queue", None)
+            cancel_event = kwargs.pop("cancel_event", None)
             response_queue = item.response_queue
             t_req_start = time.perf_counter()
             t_last_put = t_req_start
             stream_tokens = kwargs.get("stream_tokens", False)
+            streaming_eager_decode = stream_tokens and _env_flag(
+                "FISH_STREAMING_EAGER_DECODE", False
+            )
+            if streaming_eager_decode:
+                kwargs["compile"] = False
             put_count = 0
             cleanup_mode = _normalize_cleanup_mode(
                 kwargs.pop("cleanup_mode", "request_end")
@@ -6706,7 +8025,12 @@ def launch_thread_safe_queue(
             stream_empty_cache = kwargs.pop("stream_empty_cache", None)
             if stream_empty_cache is None:
                 stream_empty_cache = _env_flag("FISH_STREAM_EMPTY_CACHE", False)
+
+            ack_timeout_sec = max(
+                0.1, _env_float("FISH_STREAM_ACK_TIMEOUT_SEC", 15.0)
+            )
             did_run_cleanup = False
+            abort_requested = False
 
             if control == "cleanup":
                 try:
@@ -6722,11 +8046,13 @@ def launch_thread_safe_queue(
                         reason="control_cleanup",
                     )
                     did_run_cleanup = True
-                    response_queue.put(
+                    _queue_put_with_cancel(
+                        response_queue,
                         WrappedGenerateResponse(
                             status="success",
                             response=GenerateResponse(action="next"),
-                        )
+                        ),
+                        cancel_event=cancel_event,
                     )
                 except Exception as e:
                     logger.error(
@@ -6735,10 +8061,20 @@ def launch_thread_safe_queue(
                         e,
                         exc_info=True,
                     )
-                    response_queue.put(
-                        WrappedGenerateResponse(status="error", response=e)
+                    _queue_put_with_cancel(
+                        response_queue,
+                        WrappedGenerateResponse(status="error", response=e),
+                        cancel_event=cancel_event,
                     )
                 continue
+
+            # В режиме session_idle не делаем heavy cleanup всегда,
+            # но если VRAM уже опасно мала — чистим до старта запроса.
+            _maybe_force_cleanup_before_request(
+                model=model,
+                req_tag=req_tag,
+                cleanup_mode=cleanup_mode,
+            )
 
             if stream_tokens:
                 logger.info(
@@ -6751,8 +8087,23 @@ def launch_thread_safe_queue(
 
             try:
                 for chunk in generate_long(
-                    model=model, decode_one_token=decode_one_token, **kwargs
+                    model=model,
+                    decode_one_token=(
+                        eager_decode_one_token
+                        if streaming_eager_decode
+                        else decode_one_token
+                    ),
+                    **kwargs,
                 ):
+                    if cancel_event is not None and cancel_event.is_set():
+                        abort_requested = True
+                        logger.info(
+                            "worker: cancel_event observed before queue_put req={} put_count={}",
+                            req_tag,
+                            put_count,
+                        )
+                        break
+
                     if stream_tokens and put_count < 5:
                         logger.info(
                             "stream: worker putting chunk put_count={} action={} req={}",
@@ -6761,6 +8112,7 @@ def launch_thread_safe_queue(
                             req_tag,
                         )
                     put_count += 1
+
                     if profile_cadence:
                         now = time.perf_counter()
                         delta_ms = (now - t_last_put) * 1000.0
@@ -6774,10 +8126,11 @@ def launch_thread_safe_queue(
                                 torch.cuda.max_memory_allocated() / (1024**3),
                             )
                         logger.info(
-                            "queue_put req={} action={} delta_ms={:.1f} total_ms={:.1f}{}",
+                            "queue_put req={} action={} delta_ms={:.1f} total_ms={:.1f} time_since_req_start_ms={:.1f}{}",
                             req_tag,
                             action,
                             delta_ms,
+                            total_ms,
                             total_ms,
                             vram_s,
                         )
@@ -6790,22 +8143,56 @@ def launch_thread_safe_queue(
                             codes=codes.cpu(),
                             text=getattr(chunk, "text", None),
                         )
-                    response_queue.put(
-                        WrappedGenerateResponse(status="success", response=out)
+
+                    queued = _queue_put_with_cancel(
+                        response_queue,
+                        WrappedGenerateResponse(status="success", response=out),
+                        cancel_event=cancel_event,
                     )
+                    if not queued:
+                        abort_requested = True
+                        logger.info(
+                            "worker: response_queue put cancelled req={} put_count={}",
+                            req_tag,
+                            put_count,
+                        )
+                        break
 
-                    if stream_tokens and ack_queue is not None:
-                        ack_queue.get()
+                    # Bounded pipeline backpressure:
+                    # ждём подтверждение, что chunk принят CPU pipeline.
+                    if ack_queue is not None:
+                        ack = _wait_for_consumer_ack(
+                            ack_queue,
+                            cancel_event=cancel_event,
+                            ack_timeout_sec=ack_timeout_sec,
+                        )
 
-                    if stream_tokens and stream_empty_cache and torch.cuda.is_available():
+                        if ack == ACK_ABORT:
+                            abort_requested = True
+                            logger.warning(
+                                "worker: got abort ack req={} put_count={}",
+                                req_tag,
+                                put_count,
+                            )
+                            break
+
+                    if ack_queue is not None and stream_empty_cache and torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
-                _run_request_cleanup(
-                    model=model,
-                    cleanup_mode=cleanup_mode,
-                    req_tag=req_tag,
-                    reason="request_success",
-                )
+                if abort_requested:
+                    _run_request_cleanup(
+                        model=model,
+                        cleanup_mode=cleanup_mode,
+                        req_tag=req_tag,
+                        reason="pipeline_abort",
+                    )
+                else:
+                    _run_request_cleanup(
+                        model=model,
+                        cleanup_mode=cleanup_mode,
+                        req_tag=req_tag,
+                        reason="request_success",
+                    )
                 did_run_cleanup = True
 
             except Exception as e:
@@ -6817,7 +8204,14 @@ def launch_thread_safe_queue(
                     exc_info=True,
                 )
                 logger.error(traceback.format_exc())
-                response_queue.put(WrappedGenerateResponse(status="error", response=e))
+
+                # Если consumer уже попросил abort, не надо ещё раз слать ошибку наружу.
+                if not abort_requested and not (cancel_event and cancel_event.is_set()):
+                    _queue_put_with_cancel(
+                        response_queue,
+                        WrappedGenerateResponse(status="error", response=e),
+                        cancel_event=cancel_event,
+                    )
 
             finally:
                 if not did_run_cleanup:
@@ -6917,7 +8311,7 @@ def main(
 
     logger.info("Loading model ...")
     t0 = time.time()
-    model, decode_one_token = init_model(
+    model, decode_one_token, _ = init_model(
         checkpoint_path, device, precision, compile=compile
     )
     with torch.device(device):
@@ -7226,7 +8620,9 @@ path: /models/text2semantic/llama.py
 import dataclasses
 import json
 import math
+import warnings
 from collections import OrderedDict
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -7241,6 +8637,12 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 
 from fish_speech.models.text2semantic.lora import LoraConfig, setup_lora
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"Logical operators 'and' and 'or' are deprecated for non-scalar tensors.*",
+    module=r"torch\._inductor\.runtime\.triton_helpers",
+)
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -7269,20 +8671,15 @@ class BaseModelArgs:
     attention_o_bias: bool = False
     attention_qk_norm: bool = False
 
-    # Codebook configs
     codebook_size: int = 160
     num_codebooks: int = 4
 
     semantic_begin_id: int = 0
     semantic_end_id: int = 0
 
-    # Gradient checkpointing
     use_gradient_checkpointing: bool = True
-
-    # Initialize the model
     initializer_range: float = 0.02
 
-    # Dummy vars
     is_reward_model: bool = False
     scale_codebook_embeddings: bool = False
     audio_embed_dim: Optional[int] = None
@@ -7317,7 +8714,6 @@ class BaseModelArgs:
             case _:
                 raise ValueError(f"Unknown model type: {data['model_type']}")
 
-        # Filter out unexpected keyword arguments
         valid_keys = {f.name for f in dataclasses.fields(cls)}
         data = {k: v for k, v in data.items() if k in valid_keys}
 
@@ -7428,7 +8824,6 @@ class KVCache(nn.Module):
         self.register_buffer("v_cache", torch.zeros(cache_shape, dtype=dtype))
 
     def update(self, input_pos, k_val, v_val):
-        # input_pos: [S], k_val: [B, H, S, D]
         assert input_pos.shape[0] == k_val.shape[2]
 
         k_out = self.k_cache
@@ -7480,7 +8875,6 @@ class BaseTransformer(nn.Module):
         super().__init__()
         self.config = config
 
-        # Slow transformer
         self.embeddings = nn.Embedding(
             config.vocab_size,
             config.dim,
@@ -7522,7 +8916,6 @@ class BaseTransformer(nn.Module):
             persistent=False,
         )
 
-        # For kv cache
         self.max_batch_size = -1
         self.max_seq_len = -1
 
@@ -7549,7 +8942,6 @@ class BaseTransformer(nn.Module):
             )
 
     def clear_caches(self) -> None:
-        """Release KV cache buffers so VRAM can be freed between requests (avoids OOM on 32 GB)."""
         if not getattr(self, "_cache_setup_done", False):
             return
         for b in self.layers:
@@ -7586,7 +8978,6 @@ class BaseTransformer(nn.Module):
     ) -> BaseTransformerForwardResult:
         seq_len = inp.size(2)
 
-        # Here we want to merge the embeddings of the codebooks
         x = self.embed(inp)
 
         freqs_cis = self.freqs_cis[:seq_len]
@@ -7630,8 +9021,6 @@ class BaseTransformer(nn.Module):
         audio_parts: Optional[Tensor] = None,
         return_all: bool = False,
     ) -> BaseTransformerForwardResult:
-
-        # Embedding logic replicated from embed() for compilation compatibility
         embeds = []
         for i in range(self.config.num_codebooks):
             emb = self.codebook_embeddings(
@@ -7654,10 +9043,7 @@ class BaseTransformer(nn.Module):
                 vq_masks_expanded, x / math.sqrt(self.config.num_codebooks + 1), x
             )
 
-        # Audio embeddings
         if audio_parts is not None:
-            # Note: This assumes self.audio_projector exists if audio_parts is used
-            # It seems missing in init, but we keep existing logic
             if hasattr(self, "audio_projector"):
                 audio_embeds = self.audio_projector(audio_parts)
                 if self.config.scale_codebook_embeddings:
@@ -7673,7 +9059,7 @@ class BaseTransformer(nn.Module):
         else:
             max_seq_len = self.max_seq_len
 
-        mask = self.causal_mask[None, None, input_pos, :max_seq_len]  # (B, N, Q, K)
+        mask = self.causal_mask[None, None, input_pos, :max_seq_len]
         freqs_cis = self.freqs_cis[input_pos]
 
         for layer in self.layers:
@@ -7719,7 +9105,6 @@ class BaseTransformer(nn.Module):
         lora_config: LoraConfig | None = None,
         rope_base: int | None = None,
     ) -> "BaseTransformer":
-        # Import wrapper locally to avoid circular dependency or global import issues
         from fish_speech.tokenizer import FishTokenizer
 
         config = BaseModelArgs.from_pretrained(str(path))
@@ -7731,6 +9116,7 @@ class BaseTransformer(nn.Module):
             config.rope_base = rope_base
             logger.info(f"Override rope_base to {rope_base}")
 
+        tokenizer = None
         try:
             tokenizer = FishTokenizer.from_pretrained(path)
             config.semantic_begin_id = tokenizer.semantic_begin_id
@@ -7752,9 +9138,8 @@ class BaseTransformer(nn.Module):
                 raise ValueError(f"Unknown model type: {config.model_type}")
 
         logger.info(f"Loading model from {path}, config: {config}")
-        # Initialize model without passing tokenizer explicitly to __init__
         model = model_cls(config)
-        # Attach tokenizer to model instance for inference convenience (optional, but good for user scripts)
+
         model.tokenizer = tokenizer
 
         if load_weights is False:
@@ -7841,7 +9226,7 @@ class BaseTransformer(nn.Module):
                 state_dict.pop(key)
 
         torch.save(state_dict, path / "model.pth")
-        if hasattr(self, "tokenizer"):
+        if hasattr(self, "tokenizer") and self.tokenizer is not None:
             self.tokenizer.save_pretrained(path)
 
 
@@ -7862,7 +9247,6 @@ class NaiveTransformer(BaseTransformer):
         token_logits = result.logits
         x = result.hidden_states
 
-        # Codebook
         codebook_logits = self.codebook_output(self.codebook_norm(x))
         codebook_logits = rearrange(
             codebook_logits, "b n (c d) -> b n c d", c=self.config.num_codebooks
@@ -7895,16 +9279,13 @@ class DualARTransformer(BaseTransformer):
     def __init__(self, config: NaiveModelArgs) -> None:
         super().__init__(config, init_weights=False)
 
-        # Project to fast dim if needed
         if config.fast_dim is not None and config.fast_dim != config.dim:
             self.fast_project_in = nn.Linear(config.dim, config.fast_dim)
         else:
             self.fast_project_in = nn.Identity()
 
-        # Fast transformer
         self.fast_embeddings = nn.Embedding(config.codebook_size, config.fast_dim)
 
-        # The equivalent bs is so large that sdpa doesn't work
         override_config = dataclasses.replace(
             config,
             dim=config.fast_dim,
@@ -7918,7 +9299,7 @@ class DualARTransformer(BaseTransformer):
         )
 
         self.fast_layers = nn.ModuleList(
-            TransformerBlock(override_config, use_sdpa=False)
+            TransformerBlock(override_config, use_sdpa=True)
             for _ in range(config.n_fast_layer)
         )
         self.fast_norm = RMSNorm(config.fast_dim, eps=config.norm_eps)
@@ -7944,8 +9325,6 @@ class DualARTransformer(BaseTransformer):
     ):
         super().setup_caches(max_batch_size, max_seq_len, dtype)
 
-        # Fast transformer
-        # The max seq len here is the number of codebooks
         for b in self.fast_layers:
             b.attention.kv_cache = KVCache(
                 max_batch_size,
@@ -7978,26 +9357,20 @@ class DualARTransformer(BaseTransformer):
         token_logits = parent_result.logits
         x = parent_result.hidden_states
 
-        # Fast transformer
         fast_seq_len = self.config.num_codebooks
         fast_mask = self.causal_mask[
             None, None, :fast_seq_len, :fast_seq_len
-        ]  # (B, N, Q, K)
+        ]
         fast_freqs_cis = self.fast_freqs_cis[:fast_seq_len]
 
-        # Extract corresponding parts with labels
         token_labels = labels[:, 0]
-
-        # [MODIFIED] Use config instead of tokenizer
         codebook_mask = (token_labels >= self.config.semantic_begin_id) & (
             token_labels <= self.config.semantic_end_id
         )
 
-        # This gives where input token is <|semantic|>
         x = x[codebook_mask]
 
         if x.shape[0] == 0:
-            # Use dummy input when no vq is required
             x = torch.zeros(
                 (4, self.config.dim),
                 device=x.device,
@@ -8024,7 +9397,6 @@ class DualARTransformer(BaseTransformer):
             else:
                 x = layer(x, fast_freqs_cis, fast_mask)
 
-        # unflatten the batch and num_codebooks
         fast_out = self.fast_norm(x)
         codebook_logits = self.fast_output(fast_out)
 
@@ -8038,19 +9410,17 @@ class DualARTransformer(BaseTransformer):
     def forward_generate_fast(
         self, x: Tensor, input_pos: Optional[Tensor] = None
     ) -> Tensor:
-        # Fast transformer
         x = x.view(x.shape[0], 1, -1)
 
         fast_mask = self.causal_mask[
             None, None, input_pos, : self.config.num_codebooks
-        ]  # (B, N, Q, K)
+        ]
         fast_freqs_cis = self.fast_freqs_cis[input_pos]
 
         for layer in self.fast_layers:
             x = layer(x, fast_freqs_cis, fast_mask, input_pos=input_pos)
 
-        # unflatten the batch and num_codebooks
-        fast_out = self.fast_norm(x)  # only take the last token
+        fast_out = self.fast_norm(x)
         codebook_logits = self.fast_output(fast_out)
 
         return codebook_logits
@@ -8089,7 +9459,6 @@ class Attention(nn.Module):
         assert config.dim % config.n_head == 0
 
         total_head_dim = (config.n_head + 2 * config.n_local_heads) * config.head_dim
-        # key, query, value projections for all heads, but in a batch
         self.wqkv = nn.Linear(
             config.dim, total_head_dim, bias=config.attention_qkv_bias
         )
@@ -8120,6 +9489,248 @@ class Attention(nn.Module):
             wv = state_dict.pop(prefix + "wv.weight")
             state_dict[prefix + "wqkv.weight"] = torch.cat([wq, wk, wv])
 
+    def _gqa_repeat_factor(self) -> int:
+        return self.n_head // self.n_local_heads
+
+    def _repeat_kv_for_gqa(self, tensor: Tensor) -> Tensor:
+        repeat_factor = self._gqa_repeat_factor()
+        if repeat_factor == 1:
+            return tensor
+        return tensor.repeat_interleave(repeat_factor, dim=1)
+
+    @staticmethod
+    def _is_oom_error(exc: BaseException) -> bool:
+        return isinstance(exc, torch.OutOfMemoryError) or "out of memory" in str(
+            exc
+        ).lower()
+
+    @staticmethod
+    def _is_sdpa_support_error(exc: BaseException) -> bool:
+        if isinstance(exc, (TypeError, NotImplementedError)):
+            return True
+
+        msg = str(exc).lower()
+        needles = (
+            "enable_gqa",
+            "not implemented",
+            "not supported",
+            "does not support",
+            "no available kernel",
+            "scaled_dot_product_attention",
+            "sdpa",
+        )
+        return any(x in msg for x in needles)
+
+    def _make_sdpa_context(self, force_math: bool):
+        return sdpa_kernel(SDPBackend.MATH) if force_math else nullcontext()
+
+    def _normalize_mask_for_manual_gqa(self, attn_mask: Tensor) -> Tensor:
+        if attn_mask.dim() == 5:
+            return attn_mask
+        if attn_mask.dim() == 4:
+            return attn_mask.unsqueeze(2)
+        if attn_mask.dim() == 3:
+            return attn_mask.unsqueeze(1).unsqueeze(1)
+        if attn_mask.dim() == 2:
+            return attn_mask.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+        raise ValueError(
+            f"Unsupported attn_mask rank for manual GQA: {attn_mask.dim()}"
+        )
+
+    def _manual_gqa_attention(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attn_mask: Optional[Tensor] = None,
+        dropout_p: float = 0.0,
+    ) -> Tensor:
+        # query: [B, Hq, Lq, D]
+        # key  : [B, Hkv, Lk, D]
+        # value: [B, Hkv, Lk, D]
+        bsz, hq, q_len, head_dim = query.shape
+        _, hkv, _, _ = key.shape
+
+        assert hq % hkv == 0, f"n_head={hq} must be divisible by n_local_heads={hkv}"
+        groups = hq // hkv
+
+        # [B, Hkv, G, Lq, D]
+        q = query.view(bsz, hkv, groups, q_len, head_dim).float()
+        k = key.float()
+        v = value.float()
+
+        # [B, Hkv, G, Lq, Lk]
+        attn_weight = torch.einsum("bhgld,bhsd->bhgls", q, k)
+        attn_weight *= 1.0 / math.sqrt(head_dim)
+
+        if attn_mask is not None:
+            attn_mask = self._normalize_mask_for_manual_gqa(attn_mask)
+            if attn_mask.dtype == torch.bool:
+                attn_weight = attn_weight.masked_fill(
+                    attn_mask.logical_not(), float("-inf")
+                )
+            else:
+                attn_weight = attn_weight + attn_mask
+
+        attn_weight = torch.softmax(attn_weight, dim=-1)
+
+        if dropout_p > 0.0:
+            attn_weight = torch.dropout(attn_weight, dropout_p, train=self.training)
+
+        # [B, Hkv, G, Lq, D]
+        y = torch.einsum("bhgls,bhsd->bhgld", attn_weight.to(v.dtype), v)
+        y = y.reshape(bsz, hq, q_len, head_dim)
+
+        return y.type_as(query)
+
+    def _single_token_low_mem_attention(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attn_mask: Optional[Tensor] = None,
+        dropout_p: float = 0.0,
+    ) -> Tensor:
+        # Для streaming decode (q_len=1) не используем SDPA вообще:
+        # он может просить лишний workspace и падать при низком free VRAM.
+        if self.n_head != self.n_local_heads:
+            return self._manual_gqa_attention(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+            )
+
+        return self.eq_scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+        )
+
+    def _sdpa_with_optional_gqa(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        *,
+        attn_mask: Optional[Tensor] = None,
+        dropout_p: float = 0.0,
+        is_causal: bool = False,
+        force_math: bool = False,
+    ) -> Tensor:
+        enable_gqa = self.n_head != self.n_local_heads
+
+        # Ключевая правка:
+        # если это incremental decode (обычно Lq=1), идём в low-memory реализацию,
+        # а не в SDPA. Это именно ваш кейс из логов.
+        if query.size(-2) == 1 and not self.training:
+            return self._single_token_low_mem_attention(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+            )
+
+        call_kwargs = {
+            "dropout_p": dropout_p,
+            "is_causal": is_causal,
+        }
+        if attn_mask is not None:
+            call_kwargs["attn_mask"] = attn_mask
+
+        if enable_gqa:
+            try:
+                with self._make_sdpa_context(force_math):
+                    return F.scaled_dot_product_attention(
+                        query,
+                        key,
+                        value,
+                        enable_gqa=True,
+                        **call_kwargs,
+                    )
+            except Exception as e:
+                # На OOM тоже уходим в manual GQA, а не падаем сразу.
+                if self._is_oom_error(e) or self._is_sdpa_support_error(e):
+                    return self._manual_gqa_attention(
+                        query,
+                        key,
+                        value,
+                        attn_mask=attn_mask,
+                        dropout_p=dropout_p,
+                    )
+                raise
+
+        try:
+            with self._make_sdpa_context(force_math):
+                return F.scaled_dot_product_attention(
+                    query,
+                    key,
+                    value,
+                    **call_kwargs,
+                )
+        except Exception as e:
+            if self._is_oom_error(e) or self._is_sdpa_support_error(e):
+                return self.eq_scaled_dot_product_attention(
+                    query,
+                    key,
+                    value,
+                    attn_mask=attn_mask,
+                    dropout_p=dropout_p,
+                )
+            raise
+
+    def _math_attention(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attn_mask: Optional[Tensor] = None,
+        dropout_p: float = 0.0,
+    ) -> Tensor:
+        # Тот же low-memory shortcut для single-token decode
+        if query.size(-2) == 1 and not self.training:
+            return self._single_token_low_mem_attention(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+            )
+
+        try:
+            return self._sdpa_with_optional_gqa(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=attn_mask is None,
+                force_math=True,
+            )
+        except Exception as e:
+            if self._is_oom_error(e) or self._is_sdpa_support_error(e):
+                if self.n_head != self.n_local_heads:
+                    return self._manual_gqa_attention(
+                        query,
+                        key,
+                        value,
+                        attn_mask=attn_mask,
+                        dropout_p=dropout_p,
+                    )
+
+                return self.eq_scaled_dot_product_attention(
+                    query,
+                    key,
+                    value,
+                    attn_mask=attn_mask,
+                    dropout_p=dropout_p,
+                )
+            raise
+
     def forward(
         self,
         x: Tensor,
@@ -8144,27 +9755,22 @@ class Attention(nn.Module):
         q = apply_rotary_emb(q, freqs_cis)
         k = apply_rotary_emb(k, freqs_cis)
 
-        q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
+        q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))
 
         if self.kv_cache is not None:
             k, v = self.kv_cache.update(input_pos, k, v)
 
-        k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-        v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-
         if self.use_sdpa:
             if mask is None:
-                with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-                    y = F.scaled_dot_product_attention(
-                        q,
-                        k,
-                        v,
-                        dropout_p=self.dropout if self.training else 0.0,
-                        is_causal=True,
-                        # No third party attn_mask here to use flash_attention
-                    )
+                y = self._sdpa_with_optional_gqa(
+                    q,
+                    k,
+                    v,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=True,
+                )
             else:
-                y = F.scaled_dot_product_attention(
+                y = self._sdpa_with_optional_gqa(
                     q,
                     k,
                     v,
@@ -8172,7 +9778,7 @@ class Attention(nn.Module):
                     dropout_p=self.dropout if self.training else 0.0,
                 )
         else:
-            y = self.eq_scaled_dot_product_attention(
+            y = self._math_attention(
                 q,
                 k,
                 v,
@@ -8181,7 +9787,6 @@ class Attention(nn.Module):
             )
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, q_size)
-
         return self.wo(y)
 
     def eq_scaled_dot_product_attention(
@@ -8192,9 +9797,6 @@ class Attention(nn.Module):
         attn_mask=None,
         dropout_p=0.0,
     ) -> torch.Tensor:
-        # This is a standard scaled dot product attention
-        # It's low efficient, but it doesn't raise cuda error
-
         L, S = query.size(-2), key.size(-2)
         scale_factor = 1 / math.sqrt(query.size(-1))
         attn_bias = torch.zeros(1, 1, L, S, dtype=query.dtype, device=query.device)
@@ -8210,7 +9812,9 @@ class Attention(nn.Module):
         attn_weight = query @ key.transpose(-2, -1) * scale_factor
         attn_weight += attn_bias
         attn_weight = torch.softmax(attn_weight, dim=-1)
-        attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+
+        if dropout_p > 0.0:
+            attn_weight = torch.dropout(attn_weight, dropout_p, train=self.training)
 
         return attn_weight @ value
 
@@ -8241,17 +9845,6 @@ class RMSNorm(nn.Module):
 
 
 def precompute_freqs_cis(seq_len: int, n_elem: int, base: int = 10000) -> Tensor:
-    """
-    Precomputes frequency tensors for complex exponentials (cis)
-
-    Args:
-        seq_len: Length of the sequence for which positional embeddings are needed.
-        n_elem: Number of elements in the frequency tensor.
-        base: Base value for the frequency scaling (default: 10000).
-
-    Returns:
-        A tensor containing the precomputed frequencies in real and imaginary parts (bfloat16).
-    """
     freqs = 1.0 / (
         base ** (torch.arange(0, n_elem, 2)[: (n_elem // 2)].float() / n_elem)
     )
@@ -8466,9 +10059,8 @@ def clean_text(text):
 
 path: /tokenizer.py
 ----------------------------------------
-import json
+import inspect
 import logging
-from pathlib import Path
 from typing import TYPE_CHECKING, List, Union
 
 import torch
@@ -8479,7 +10071,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Constants definitions
 EOS_TOKEN = "<|endoftext|>"
 PAD_TOKEN = "<|pad|>"
 IM_START_TOKEN = "<|im_start|>"
@@ -8525,6 +10116,14 @@ class FishTokenizer:
         self._tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.semantic_id_to_token_id = {}
 
+        try:
+            self._supports_allowed_special = (
+                "allowed_special"
+                in inspect.signature(self._tokenizer.encode).parameters
+            )
+        except (TypeError, ValueError):
+            self._supports_allowed_special = False
+
         vocab = self._tokenizer.get_vocab()
         valid_ids = []
 
@@ -8541,12 +10140,10 @@ class FishTokenizer:
             )
             self.semantic_begin_id = 0
             self.semantic_end_id = 0
-            # Dummy tensor to prevent crash, though generation will fail
             self.semantic_map_tensor = torch.zeros(4096, dtype=torch.long)
         else:
             self.semantic_begin_id = min(valid_ids)
             self.semantic_end_id = max(valid_ids)
-            # Create a lookup tensor to handle potential gaps in token IDs safely
             self.semantic_map_tensor = torch.zeros(4096, dtype=torch.long)
             for k, v in self.semantic_id_to_token_id.items():
                 self.semantic_map_tensor[k] = v
@@ -8573,11 +10170,7 @@ class FishTokenizer:
     def encode(
         self, text: str, add_special_tokens: bool = False, **kwargs
     ) -> List[int]:
-        # [FIX] Force Qwen/Tiktoken backends to parse special tokens inline
-        import inspect
-
-        sig = inspect.signature(self._tokenizer.encode)
-        if "allowed_special" in sig.parameters and "allowed_special" not in kwargs:
+        if self._supports_allowed_special and "allowed_special" not in kwargs:
             kwargs["allowed_special"] = "all"
         return self._tokenizer.encode(
             text, add_special_tokens=add_special_tokens, **kwargs
@@ -9037,7 +10630,6 @@ VIDEO_EXTENSIONS = {
 
 
 def get_latest_checkpoint(path: Path | str) -> Path | None:
-    # Find the latest checkpoint
     ckpt_dir = Path(path)
 
     if ckpt_dir.exists() is False:
@@ -9068,29 +10660,38 @@ def read_ref_text(ref_text):
 
 def list_files(
     path: Union[Path, str],
-    extensions: set[str] = set(),
+    extensions: set[str] | None = None,
     recursive: bool = False,
     sort: bool = True,
 ) -> list[Path]:
-    """List files in a directory.
+    """
+    List files in a directory.
 
     Args:
-        path (Path): Path to the directory.
-        extensions (set, optional): Extensions to filter. Defaults to None.
-        recursive (bool, optional): Whether to search recursively. Defaults to False.
-        sort (bool, optional): Whether to sort the files. Defaults to True.
+        path: Path to the directory.
+        extensions: Extensions to filter. If empty or None, returns all files.
+        recursive: Whether to search recursively.
+        sort: Whether to sort the files.
 
     Returns:
-        list: List of files.
+        List of files.
     """
-
     if isinstance(path, str):
         path = Path(path)
 
     if not path.exists():
         raise FileNotFoundError(f"Directory {path} does not exist.")
 
-    files = [file for ext in extensions for file in path.rglob(f"*{ext}")]
+    files: list[Path] = []
+
+    if not extensions:
+        iterator = path.rglob("*") if recursive else path.glob("*")
+        files = [file for file in iterator if file.is_file()]
+    else:
+        for ext in extensions:
+            pattern = f"*{ext}"
+            iterator = path.rglob(pattern) if recursive else path.glob(pattern)
+            files.extend(file for file in iterator if file.is_file())
 
     if sort:
         files = natsorted(files)
@@ -9268,7 +10869,9 @@ path: /utils/logging_utils.py
 ----------------------------------------
 from lightning.pytorch.utilities import rank_zero_only
 
-from fish_speech.utils import logger as log
+from .logger import RankedLogger
+
+log = RankedLogger(__name__, rank_zero_only=True)
 
 
 @rank_zero_only
@@ -9291,7 +10894,6 @@ def log_hyperparameters(object_dict: dict) -> None:
 
     hparams["model"] = cfg["model"]
 
-    # save number of model parameters
     hparams["model/params/total"] = sum(p.numel() for p in model.parameters())
     hparams["model/params/trainable"] = sum(
         p.numel() for p in model.parameters() if p.requires_grad
@@ -9311,9 +10913,8 @@ def log_hyperparameters(object_dict: dict) -> None:
     hparams["ckpt_path"] = cfg.get("ckpt_path")
     hparams["seed"] = cfg.get("seed")
 
-    # send hparams to all loggers
-    for logger in trainer.loggers:
-        logger.log_hyperparams(hparams)
+    for trainer_logger in trainer.loggers:
+        trainer_logger.log_hyperparams(hparams)
 
 
 path: /utils/rich_utils.py
@@ -9329,7 +10930,9 @@ from lightning.pytorch.utilities import rank_zero_only
 from omegaconf import DictConfig, OmegaConf, open_dict
 from rich.prompt import Prompt
 
-from fish_speech.utils import logger as log
+from .logger import RankedLogger
+
+log = RankedLogger(__name__, rank_zero_only=True)
 
 
 @rank_zero_only
@@ -9347,37 +10950,24 @@ def print_config_tree(
     resolve: bool = False,
     save_to_file: bool = False,
 ) -> None:
-    """Prints content of DictConfig using Rich library and its tree structure.
-
-    Args:
-        cfg (DictConfig): Configuration composed by Hydra.
-        print_order (Sequence[str], optional): Determines in what order config components are printed.
-        resolve (bool, optional): Whether to resolve reference fields of DictConfig.
-        save_to_file (bool, optional): Whether to export config to the hydra output folder.
-    """  # noqa: E501
-
+    """Prints content of DictConfig using Rich library and its tree structure."""
     style = "dim"
     tree = rich.tree.Tree("CONFIG", style=style, guide_style=style)
 
     queue = []
 
-    # add fields from `print_order` to queue
     for field in print_order:
-        (
+        if field in cfg:
             queue.append(field)
-            if field in cfg
-            else log.warning(
-                f"Field '{field}' not found in config. "
-                + f"Skipping '{field}' config printing..."
+        else:
+            log.warning(
+                f"Field '{field}' not found in config. Skipping '{field}' config printing..."
             )
-        )
 
-    # add all the other fields to queue (not specified in `print_order`)
     for field in cfg:
         if field not in queue:
             queue.append(field)
 
-    # generate config tree from queue
     for field in queue:
         branch = tree.add(field, style=style, guide_style=style)
 
@@ -9389,10 +10979,8 @@ def print_config_tree(
 
         branch.add(rich.syntax.Syntax(branch_content, "yaml"))
 
-    # print config tree
     rich.print(tree)
 
-    # save config tree to file
     if save_to_file:
         with open(Path(cfg.paths.output_dir, "config_tree.log"), "w") as file:
             rich.print(tree, file=file)
@@ -9400,8 +10988,7 @@ def print_config_tree(
 
 @rank_zero_only
 def enforce_tags(cfg: DictConfig, save_to_file: bool = False) -> None:
-    """Prompts user to input tags from command line if no tags are provided in config."""  # noqa: E501
-
+    """Prompts user to input tags from command line if no tags are provided in config."""
     if not cfg.get("tags"):
         if "id" in HydraConfig().cfg.hydra.job:
             raise ValueError("Specify tags before launching a multirun!")
@@ -9502,7 +11089,7 @@ class ServeReferenceAudio(BaseModel):
 
 
 class ServeTTSRequest(BaseModel):
-    text: str
+    text: str = ""
     chunk_length: Annotated[int, conint(ge=100, le=300, strict=True)] = 200
 
     # Audio format
@@ -9868,7 +11455,7 @@ def set_seed(seed: int):
 
 === SUMMARY ===
 included: 54
-skipped(binary): 0
+skipped(binary): 8
 skipped(size): 0
 skipped(ext): 0
-totalBytes(approx): 342223
+totalBytes(approx): 398200

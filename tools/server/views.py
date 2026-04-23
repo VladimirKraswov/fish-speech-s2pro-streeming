@@ -183,6 +183,30 @@ def _is_no_audio_generated_error(exc: Exception | str | None) -> bool:
     return "No audio generated, please check the input text." in str(exc)
 
 
+def _log_preview(text: str, limit: int = 180) -> str:
+    text = text.replace("\n", "\\n")
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
+
+
+def _log_word_count(text: str) -> int:
+    return len(re.findall(r"\b\w+\b", text, flags=re.UNICODE))
+
+
+def _effective_token_budget(requested: int) -> tuple[int, str | None]:
+    cap_env = os.getenv("FISH_MAX_NEW_TOKENS_CAP", "").strip()
+    if not cap_env:
+        return requested, None
+    try:
+        cap = int(cap_env)
+    except ValueError:
+        return requested, cap_env
+    if cap < 1:
+        return requested, cap_env
+    return min(requested, cap), cap_env
+
+
 def _collect_non_streaming_audio(engine, req) -> np.ndarray:
     """
     Собирает аудио из engine.inference(req) для non-streaming режима.
@@ -305,11 +329,36 @@ async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
     Generate speech from text using TTS model.
     """
     try:
+        req_id = hex(id(req))[-6:]
         # Get the model from the app
         app_state = request.app.state
         model_manager: ModelManager = app_state.model_manager
         engine = model_manager.tts_inference_engine
         sample_rate = engine.decoder_model.sample_rate
+        effective_budget, cap_env = _effective_token_budget(req.max_new_tokens)
+
+        logger.info(
+            "tts_request_started req={} control={} streaming={} format={} stream_tokens={} chars={} words={} stream_chunk_size={} initial_stream_chunk_size={} cleanup_mode={} original_text=\"{}\" normalized_text=\"{}\"",
+            req_id,
+            req.control,
+            req.streaming,
+            req.format,
+            req.stream_tokens,
+            len(req.text),
+            _log_word_count(req.text),
+            req.stream_chunk_size,
+            req.initial_stream_chunk_size,
+            req.cleanup_mode,
+            _log_preview(req.text),
+            _log_preview(req.text),
+        )
+        logger.info(
+            "semantic_budget req={} requested={} effective={} cap_env={}",
+            req_id,
+            req.max_new_tokens,
+            effective_budget,
+            cap_env,
+        )
 
         # Check if the text is too long
         if app_state.max_text_length > 0 and len(req.text) > app_state.max_text_length:

@@ -19,9 +19,9 @@ class BufferConfig(SessionBaseModel):
     Настройки накопления текста перед отправкой в TTS.
     """
 
-    min_words: int = Field(default=3, ge=1, le=64)
-    soft_limit_chars: int = Field(default=120, ge=16, le=4000)
-    hard_limit_chars: int = Field(default=220, ge=16, le=8000)
+    min_words: int = Field(default=5, ge=1, le=64)
+    soft_limit_chars: int = Field(default=180, ge=16, le=4000)
+    hard_limit_chars: int = Field(default=320, ge=16, le=8000)
 
     @model_validator(mode="after")
     def validate_limits(self) -> "BufferConfig":
@@ -41,7 +41,8 @@ class TTSForwardConfig(SessionBaseModel):
     format: Literal["wav", "pcm"] = "pcm"
     streaming: bool = True
     stream_tokens: bool = True
-    stream_chunk_size: int = Field(default=8, ge=1, le=200)
+    stream_chunk_size: int = Field(default=12, ge=1, le=200)
+    initial_stream_chunk_size: int | None = Field(default=16, ge=1, le=200)
 
     max_new_tokens: int = Field(default=512, ge=16, le=4096)
     top_p: float = Field(default=0.8, ge=0.1, le=1.0)
@@ -78,7 +79,7 @@ class SessionPolicyConfig(SessionBaseModel):
 
     session_idle_timeout_sec: float = Field(default=15.0, ge=1.0, le=3600.0)
     cleanup_after_idle_sec: float = Field(default=2.0, ge=0.0, le=300.0)
-    force_flush_after_sec: float = Field(default=1.0, ge=0.0, le=10.0)
+    force_flush_after_sec: float = Field(default=0.85, ge=0.0, le=10.0)
     max_pending_emit_chunks: int = Field(default=32, ge=1, le=4096)
     close_tts_stream_on_new_text: bool = False
 
@@ -119,6 +120,12 @@ class ClientTextDelta(SessionBaseModel):
     """
     Очередная дельта текста от LLM/оркестратора.
     """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        str_strip_whitespace=False,
+        validate_assignment=True,
+    )
 
     type: Literal["text_delta"] = "text_delta"
     text: str = Field(min_length=1, max_length=20000)
@@ -188,6 +195,8 @@ class TTSChunkRequest(SessionBaseModel):
 
     trace_id: str | None = None
     final: bool = False
+    starts_with_full_word: bool = True
+    ends_with_full_word: bool = True
 
     @model_validator(mode="after")
     def validate_text_metrics(self) -> "TTSChunkRequest":
@@ -219,6 +228,7 @@ class ServerTextAccepted(SessionBaseModel):
     session_id: str
     buffered_text_len: int = Field(ge=0)
     buffered_words: int = Field(ge=0)
+    buffered_text: str = ""
     trace_id: str | None = None
     final: bool = False
 
@@ -270,6 +280,16 @@ class ServerTTSFinished(SessionBaseModel):
     final: bool = False
 
 
+class ServerAudioDebugSaved(SessionBaseModel):
+    event: Literal["audio_debug_saved"] = "audio_debug_saved"
+    session_id: str
+    chunk_id: str
+    wav_path: str
+    total_bytes: int = Field(ge=0)
+    duration_ms: float = Field(ge=0.0)
+    trace_id: str | None = None
+
+
 class ServerBufferCleared(SessionBaseModel):
     event: Literal["buffer_cleared"] = "buffer_cleared"
     session_id: str
@@ -312,6 +332,7 @@ ServerEvent = (
     | ServerAudioMeta
     | ServerAudioChunk
     | ServerTTSFinished
+    | ServerAudioDebugSaved
     | ServerBufferCleared
     | ServerCleanupDone
     | ServerPong

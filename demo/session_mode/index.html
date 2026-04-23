@@ -219,6 +219,17 @@
       font-size: 12px;
     }
 
+    .debug-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .debug-grid .mini-log {
+      min-height: 92px;
+      max-height: 180px;
+    }
+
     .log {
       height: 320px;
       overflow: auto;
@@ -572,6 +583,7 @@
       .layout { grid-template-columns: 1fr; }
       .stats { grid-template-columns: repeat(2, 1fr); }
       .commit-grid { grid-template-columns: 1fr; }
+      .debug-grid { grid-template-columns: 1fr; }
       .lane { grid-template-columns: 1fr; }
     }
   </style>
@@ -613,22 +625,33 @@
           <div class="row">
             <div>
               <label for="streamChunkSize">stream_chunk_size</label>
-              <input id="streamChunkSize" type="number" min="1" max="200" value="8" />
+              <input id="streamChunkSize" type="number" min="1" max="200" value="12" />
             </div>
             <div>
-              <label for="minWords">buffer.min_words</label>
-              <input id="minWords" type="number" min="1" max="32" value="3" />
+              <label for="initialStreamChunkSize">initial_stream_chunk_size</label>
+              <input id="initialStreamChunkSize" type="number" min="1" max="200" value="16" />
             </div>
           </div>
 
           <div class="row">
             <div>
-              <label for="softLimit">buffer.soft_limit_chars</label>
-              <input id="softLimit" type="number" min="16" max="2000" value="120" />
+              <label for="minWords">buffer.min_words</label>
+              <input id="minWords" type="number" min="1" max="32" value="5" />
             </div>
             <div>
+              <label for="softLimit">buffer.soft_limit_chars</label>
+              <input id="softLimit" type="number" min="16" max="2000" value="180" />
+            </div>
+          </div>
+
+          <div class="row">
+            <div>
               <label for="hardLimit">buffer.hard_limit_chars</label>
-              <input id="hardLimit" type="number" min="16" max="4000" value="220" />
+              <input id="hardLimit" type="number" min="16" max="4000" value="320" />
+            </div>
+            <div>
+              <label>quality profile</label>
+              <input type="text" value="clarity-balanced" readonly />
             </div>
           </div>
 
@@ -792,6 +815,30 @@
               <div id="actualCommits" class="commit-list"></div>
             </div>
           </div>
+
+          <div class="row-1" style="margin-top:14px;">
+            <div>
+              <label>Debug panel: session buffer, TTS queue, playback</label>
+              <div class="debug-grid">
+                <div>
+                  <div class="muted">real session buffer</div>
+                  <div id="debugBuffer" class="mini-log">—</div>
+                </div>
+                <div>
+                  <div class="muted">queued text chunks</div>
+                  <div id="debugQueuedChunks" class="mini-log">—</div>
+                </div>
+                <div>
+                  <div class="muted">active TTS chunk</div>
+                  <div id="debugActiveChunk" class="mini-log">—</div>
+                </div>
+                <div>
+                  <div class="muted">playback events</div>
+                  <div id="debugPlaybackEvents" class="mini-log">—</div>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
 
         <div class="card">
@@ -813,9 +860,10 @@
     const els = {
       wsUrl: document.getElementById("wsUrl"),
       ttsBaseUrl: document.getElementById("ttsBaseUrl"),
-      cleanupMode: document.getElementById("cleanupMode"),
-      streamChunkSize: document.getElementById("streamChunkSize"),
-      minWords: document.getElementById("minWords"),
+	      cleanupMode: document.getElementById("cleanupMode"),
+	      streamChunkSize: document.getElementById("streamChunkSize"),
+	      initialStreamChunkSize: document.getElementById("initialStreamChunkSize"),
+	      minWords: document.getElementById("minWords"),
       softLimit: document.getElementById("softLimit"),
       hardLimit: document.getElementById("hardLimit"),
 
@@ -834,10 +882,14 @@
       bufferFill: document.getElementById("bufferFill"),
       bufferMeterLeft: document.getElementById("bufferMeterLeft"),
       bufferMeterRight: document.getElementById("bufferMeterRight"),
-      mirrorCommits: document.getElementById("mirrorCommits"),
-      actualCommits: document.getElementById("actualCommits"),
-      timeline: document.getElementById("timeline"),
-      chunkLanesCanvas: document.getElementById("chunkLanesCanvas"),
+	      mirrorCommits: document.getElementById("mirrorCommits"),
+	      actualCommits: document.getElementById("actualCommits"),
+	      timeline: document.getElementById("timeline"),
+	      chunkLanesCanvas: document.getElementById("chunkLanesCanvas"),
+	      debugBuffer: document.getElementById("debugBuffer"),
+	      debugQueuedChunks: document.getElementById("debugQueuedChunks"),
+	      debugActiveChunk: document.getElementById("debugActiveChunk"),
+	      debugPlaybackEvents: document.getElementById("debugPlaybackEvents"),
 
       connectBtn: document.getElementById("connectBtn"),
       disconnectBtn: document.getElementById("disconnectBtn"),
@@ -868,10 +920,24 @@
       connected: false,
       sessionId: null,
 
-      audioCtx: null,
-      playback: {
-        nextStartTime: 0
-      },
+	      audioCtx: null,
+	      gainNode: null,
+	      processor: null,
+	      playback: {
+	        nextStartTime: 0,
+	        pcmQueue: [],
+	        currentChunk: null,
+	        currentOffset: 0,
+	        queuedSamples: 0,
+	        expectingAudio: false,
+	        active: false,
+	        underruns: 0,
+	        gaps: 0,
+	        overlaps: 0,
+	        lastUnderrunLogAt: 0,
+	        sampleRateMismatchLogged: false,
+	        events: []
+	      },
 
       simRunning: false,
       stopRequested: false,
@@ -896,8 +962,11 @@
         isFirstChunk: true
       },
 
-      actualCommits: [],
-      timeline: [],
+	      actualCommits: [],
+	      queuedChunks: [],
+	      activeTtsChunk: null,
+	      realBufferText: "",
+	      timeline: [],
 
       pendingAudioEvent: null,
       chunkLanes: new Map()
@@ -941,13 +1010,14 @@
       els.audioInfo.textContent =
         `audio: ${state.audioMeta.format} ${state.audioMeta.sampleRate}Hz ch=${state.audioMeta.channels}`;
 
-      const ctx = state.audioCtx;
-      if (ctx) {
-        const scheduled = Math.max(0, state.playback.nextStartTime - ctx.currentTime);
-        els.queueInfo.textContent = `scheduled: ${scheduled.toFixed(3)}s`;
-      } else {
-        els.queueInfo.textContent = "scheduled: 0.000s";
-      }
+	      const ctx = state.audioCtx;
+	      if (ctx) {
+	        const queued = state.playback.queuedSamples / Math.max(1, ctx.sampleRate);
+	        els.queueInfo.textContent =
+	          `audio queue: ${queued.toFixed(3)}s · underruns=${state.playback.underruns}`;
+	      } else {
+	        els.queueInfo.textContent = "audio queue: 0.000s";
+	      }
 
       const hardLimit = Number(els.hardLimit.value);
       const chars = state.mirror.buffer.length;
@@ -968,20 +1038,36 @@
       state.mirror.buffer = "";
       state.mirror.commits = [];
       state.mirror.isFirstChunk = true;
-      state.actualCommits = [];
-      state.timeline = [];
-      state.chunkLanes = new Map();
-      state.pendingAudioEvent = null;
-      state.playback.nextStartTime = state.audioCtx ? state.audioCtx.currentTime : 0;
-      els.ttfa.textContent = "—";
+	      state.actualCommits = [];
+	      state.queuedChunks = [];
+	      state.activeTtsChunk = null;
+	      state.realBufferText = "";
+	      state.timeline = [];
+	      state.chunkLanes = new Map();
+	      state.pendingAudioEvent = null;
+	      state.playback.nextStartTime = state.audioCtx ? state.audioCtx.currentTime : 0;
+	      state.playback.pcmQueue = [];
+	      state.playback.currentChunk = null;
+	      state.playback.currentOffset = 0;
+	      state.playback.queuedSamples = 0;
+	      state.playback.expectingAudio = false;
+	      state.playback.active = false;
+	      state.playback.underruns = 0;
+	      state.playback.gaps = 0;
+	      state.playback.overlaps = 0;
+	      state.playback.lastUnderrunLogAt = 0;
+	      state.playback.sampleRateMismatchLogged = false;
+	      state.playback.events = [];
+	      els.ttfa.textContent = "—";
       renderPreview();
       renderBuffer();
       renderMirrorCommits();
       renderActualCommits();
-      renderTimeline();
-      renderChunkLanes();
-      refreshStats();
-    }
+	      renderTimeline();
+	      renderChunkLanes();
+	      renderDebugPanel();
+	      refreshStats();
+	    }
 
     function renderPreview() {
       els.preview.textContent = state.previewText;
@@ -1043,10 +1129,10 @@
       els.timeline.parentElement.scrollLeft = els.timeline.parentElement.scrollWidth;
     }
 
-    function renderChunkLanes() {
-      if (!state.chunkLanes.size) {
-        els.chunkLanesCanvas.innerHTML = `<div class="mini-log">Пока нет chunk дорожек.</div>`;
-        return;
+	    function renderChunkLanes() {
+	      if (!state.chunkLanes.size) {
+	        els.chunkLanesCanvas.innerHTML = `<div class="mini-log">Пока нет chunk дорожек.</div>`;
+	        return;
       }
 
       const lanes = [...state.chunkLanes.values()];
@@ -1096,9 +1182,51 @@
           </div>
         `;
       }).join("");
+	
+	      els.chunkLanesCanvas.innerHTML = axisHtml + lanesHtml;
+	    }
 
-      els.chunkLanesCanvas.innerHTML = axisHtml + lanesHtml;
-    }
+	    function pushPlaybackEvent(kind, details) {
+	      const base = state.firstDeltaSentAt || nowMs();
+	      const item = {
+	        kind,
+	        details: details || "",
+	        t: nowMs() - base
+	      };
+	      state.playback.events.push(item);
+	      if (state.playback.events.length > 60) {
+	        state.playback.events = state.playback.events.slice(-60);
+	      }
+	      log(`${kind}${details ? ": " + details : ""}`);
+	      renderDebugPanel();
+	    }
+
+	    function renderDebugPanel() {
+	      els.debugBuffer.textContent = state.realBufferText || state.mirror.buffer || "—";
+
+	      els.debugQueuedChunks.textContent = state.queuedChunks.length
+	        ? state.queuedChunks.map(item =>
+	            `${item.chunkId.slice(0, 8)} ${item.reason || "-"} ${item.chars || 0}c/${item.words || 0}w: ${truncate(item.text || "", 120)}`
+	          ).join("\n")
+	        : "—";
+
+	      els.debugActiveChunk.textContent = state.activeTtsChunk
+	        ? `${state.activeTtsChunk.chunkId}\n${state.activeTtsChunk.text}`
+	        : "—";
+
+	      const queueSec = state.audioCtx
+	        ? state.playback.queuedSamples / Math.max(1, state.audioCtx.sampleRate)
+	        : 0;
+	      const eventLines = [
+	        `audio_queue_depth=${state.playback.pcmQueue.length}`,
+	        `queued_sec=${queueSec.toFixed(3)}`,
+	        `underruns=${state.playback.underruns} gaps=${state.playback.gaps} overlaps=${state.playback.overlaps}`,
+	        ...state.playback.events.slice(-18).map(item =>
+	          `+${Math.round(item.t)}ms ${item.kind}${item.details ? " " + item.details : ""}`
+	        )
+	      ];
+	      els.debugPlaybackEvents.textContent = eventLines.join("\n");
+	    }
 
     function pickTickStep(maxT) {
       if (maxT <= 1500) return 200;
@@ -1169,17 +1297,98 @@
         .replaceAll(">", "&gt;");
     }
 
-    async function ensureAudio() {
-      if (!state.audioCtx) {
-        state.audioCtx = new (window.AudioContext || window.webkitAudioContext)({
-          latencyHint: "interactive"
-        });
-      }
-      if (state.audioCtx.state !== "running") {
-        await state.audioCtx.resume();
-      }
-      refreshStats();
-    }
+	    async function ensureAudio() {
+	      if (!state.audioCtx) {
+	        state.audioCtx = new (window.AudioContext || window.webkitAudioContext)({
+	          latencyHint: "interactive"
+	        });
+	      }
+
+	      if (!state.gainNode) {
+	        state.gainNode = state.audioCtx.createGain();
+	        state.gainNode.gain.value = 1.0;
+	        state.gainNode.connect(state.audioCtx.destination);
+	      }
+
+	      if (!state.processor) {
+	        state.processor = state.audioCtx.createScriptProcessor(2048, 0, 1);
+	        state.processor.onaudioprocess = (event) => {
+	          const out = event.outputBuffer.getChannelData(0);
+	          out.fill(0);
+
+	          let writePos = 0;
+	          while (writePos < out.length) {
+	            if (!state.playback.currentChunk) {
+	              if (state.playback.pcmQueue.length === 0) {
+	                break;
+	              }
+	              state.playback.currentChunk = state.playback.pcmQueue.shift();
+	              state.playback.currentOffset = 0;
+	            }
+
+	            const remainingChunk =
+	              state.playback.currentChunk.length - state.playback.currentOffset;
+	            const remainingOut = out.length - writePos;
+	            const n = Math.min(remainingChunk, remainingOut);
+
+	            out.set(
+	              state.playback.currentChunk.subarray(
+	                state.playback.currentOffset,
+	                state.playback.currentOffset + n
+	              ),
+	              writePos
+	            );
+
+	            state.playback.currentOffset += n;
+	            state.playback.queuedSamples = Math.max(0, state.playback.queuedSamples - n);
+	            writePos += n;
+
+	            if (state.playback.currentOffset >= state.playback.currentChunk.length) {
+	              state.playback.currentChunk = null;
+	              state.playback.currentOffset = 0;
+	            }
+	          }
+
+	          if (writePos > 0 && !state.playback.active) {
+	            state.playback.active = true;
+	            pushPlaybackEvent("audio_play_started", `queued=${state.playback.pcmQueue.length}`);
+	          }
+
+	          if (
+	            writePos < out.length
+	            && state.playback.expectingAudio
+	            && state.playback.active
+	          ) {
+	            const now = nowMs();
+	            state.playback.underruns += 1;
+	            state.playback.gaps += 1;
+	            if (now - state.playback.lastUnderrunLogAt > 350) {
+	              state.playback.lastUnderrunLogAt = now;
+	              pushPlaybackEvent(
+	                "underrun_detected",
+	                `missing_samples=${out.length - writePos}`
+	              );
+	            }
+	          }
+
+	          if (
+	            writePos > 0
+	            && !state.playback.expectingAudio
+	            && state.playback.queuedSamples === 0
+	            && !state.playback.currentChunk
+	            && state.playback.active
+	          ) {
+	            state.playback.active = false;
+	            pushPlaybackEvent("audio_play_finished", "queue drained");
+	          }
+	        };
+	        state.processor.connect(state.gainNode);
+	      }
+	      if (state.audioCtx.state !== "running") {
+	        await state.audioCtx.resume();
+	      }
+	      refreshStats();
+	    }
 
     function countWords(text) {
       const cleaned = text.replace(/<\|speaker:\d+\|>/g, " ");
@@ -1197,12 +1406,15 @@
 
     function smartJoin(left, right) {
       if (!left) return right;
-      if (!right) return left;
-      if (/\s$/.test(left) || /^\s/.test(right)) return left + right;
-      if (/^[,.!?;:)\]}]/.test(right)) return left + right;
-      if (/[([{]$/.test(left)) return left + right;
-      return left + " " + right;
-    }
+	      if (!right) return left;
+	      if (/\s$/.test(left) || /^\s/.test(right)) return left + right;
+	      if (/^[,.!?;:)\]}]/.test(right)) return left + right;
+	      if (/[([{]$/.test(left)) return left + right;
+	      if (/[0-9A-Za-zА-Яа-яЁё]$/.test(left) && /^[0-9A-Za-zА-Яа-яЁё]/.test(right)) {
+	        return left + right;
+	      }
+	      return left + " " + right;
+	    }
 
     function findLastRegexBefore(regex, text, limit) {
       const sub = text.slice(0, limit);
@@ -1240,21 +1452,22 @@
         }
       }
 
-      if (isFirstChunk && words >= 1 && !force && !final) {
-        // Optimization for TTFA: emit the very first chunk as soon as we have at least one word.
-        // Try punctuation first.
-        const preferredLimit = Math.min(chars, hardLimitChars);
-        const preferredPunct = /[.!?…;\n]/g;
-        const punctCut = findLastRegexBefore(preferredPunct, raw, preferredLimit);
-        if (punctCut !== null) {
-          const chunk = trimRight(raw.slice(0, punctCut));
-          const rest = trimLeft(raw.slice(punctCut));
-          if (chunk) return { chunk, remaining: rest, reason: "punct" };
-        }
+	      if (isFirstChunk && words >= minWords && !force && !final) {
+	        const preferredLimit = Math.min(chars, hardLimitChars);
+	        const preferredPunct = /[.!?…;\n]/g;
+	        const punctCut = findLastRegexBefore(preferredPunct, raw, preferredLimit);
+	        if (punctCut !== null) {
+	          const chunk = trimRight(raw.slice(0, punctCut));
+	          const rest = trimLeft(raw.slice(punctCut));
+	          if (chunk && countWords(chunk) >= minWords) {
+	            return { chunk, remaining: rest, reason: "punct" };
+	          }
+	        }
 
-        // Just split it all if no punct.
-        return { chunk: trimRight(raw), remaining: "", reason: "force" };
-      }
+	        if (chars < hardLimitChars) {
+	          return { chunk: null, remaining: raw, reason: null };
+	        }
+	      }
 
       const stripped = raw.replace(/\s+$/, "");
       if (final) {
@@ -1283,15 +1496,31 @@
         }
       }
 
-      if (force && stripped) {
-        return { chunk: stripped, remaining: "", reason: "force" };
-      }
+	      if (force && stripped) {
+	        if (/[\s.!?…;:,]$/.test(raw) && countWords(stripped) >= minWords) {
+	          return { chunk: stripped, remaining: "", reason: "force" };
+	        }
 
-      if (chars >= hardLimitChars) {
-        const wsCut = findLastWhitespaceBefore(raw, hardLimitChars);
-        const cut = wsCut || hardLimitChars;
-        const chunk = trimRight(raw.slice(0, cut));
-        const rest = trimLeft(raw.slice(cut));
+	        const wsCut = findLastWhitespaceBefore(raw, raw.length);
+	        if (wsCut !== null) {
+	          const chunk = trimRight(raw.slice(0, wsCut));
+	          const rest = trimLeft(raw.slice(wsCut));
+	          if (chunk && countWords(chunk) >= minWords) {
+	            return { chunk, remaining: rest, reason: "force" };
+	          }
+	        }
+
+	        return { chunk: null, remaining: raw, reason: null };
+	      }
+
+	      if (chars >= hardLimitChars) {
+	        const wsCut = findLastWhitespaceBefore(raw, hardLimitChars);
+	        if (wsCut === null && chars < hardLimitChars + 80) {
+	          return { chunk: null, remaining: raw, reason: null };
+	        }
+	        const cut = wsCut || Math.min(chars, hardLimitChars + 80);
+	        const chunk = trimRight(raw.slice(0, cut));
+	        const rest = trimLeft(raw.slice(cut));
         if (chunk) {
           return { chunk, remaining: rest, reason: "hard_limit" };
         }
@@ -1301,19 +1530,8 @@
         return { chunk: stripped, remaining: "", reason: "punct" };
       }
 
-      if (chars >= softLimitChars) {
-        const wsCut = findLastWhitespaceBefore(raw, Math.min(chars, softLimitChars));
-        if (wsCut !== null) {
-          const chunk = trimRight(raw.slice(0, wsCut));
-          const rest = trimLeft(raw.slice(wsCut));
-          if (chunk && (countWords(chunk) >= minWords || force)) {
-            return { chunk, remaining: rest, reason: "force" };
-          }
-        }
-      }
-
-      return { chunk: null, remaining: raw, reason: null };
-    }
+	      return { chunk: null, remaining: raw, reason: null };
+	    }
 
     function applyMirrorDelta(text, final) {
       state.mirror.buffer = smartJoin(state.mirror.buffer, text);
@@ -1401,10 +1619,11 @@
                 tts: {
                   base_url: els.ttsBaseUrl.value.trim(),
                   format: "pcm",
-                  streaming: true,
-                  stream_tokens: true,
-                  stream_chunk_size: Number(els.streamChunkSize.value),
-                  cleanup_mode: els.cleanupMode.value,
+	                  streaming: true,
+	                  stream_tokens: true,
+	                  stream_chunk_size: Number(els.streamChunkSize.value),
+	                  initial_stream_chunk_size: Number(els.initialStreamChunkSize.value),
+	                  cleanup_mode: els.cleanupMode.value,
                   use_memory_cache: "off",
                   normalize: true
                 },
@@ -1412,10 +1631,10 @@
                   min_words: Number(els.minWords.value),
                   soft_limit_chars: Number(els.softLimit.value),
                   hard_limit_chars: Number(els.hardLimit.value)
-                },
-                policy: {
-                  force_flush_after_sec: 0.30,
-                  cleanup_after_idle_sec: 2.0,
+	                },
+	                policy: {
+	                  force_flush_after_sec: 0.85,
+	                  cleanup_after_idle_sec: 2.0,
                   session_idle_timeout_sec: 15.0,
                   close_tts_stream_on_new_text: false
                 }
@@ -1488,22 +1707,31 @@
           log(`session_started session_id=${state.sessionId}`);
           break;
 
-        case "config_patched":
-          log("config_patched");
-          break;
+	        case "config_patched":
+	          log("config_patched");
+	          break;
 
-        case "chunk_queued": {
-          state.actualCommitsCount += 1;
-          if (msg.chunk) {
-            const item = {
+	        case "text_accepted":
+	          state.realBufferText = msg.buffered_text || "";
+	          log(
+	            `delta_received accepted buffer_after=${msg.buffered_text_len} words=${msg.buffered_words}`
+	          );
+	          renderDebugPanel();
+	          break;
+
+	        case "chunk_queued": {
+	          state.actualCommitsCount += 1;
+	          if (msg.chunk) {
+	            const item = {
               chunkId: msg.chunk.chunk_id || "",
               text: msg.chunk.text || "",
               reason: msg.chunk.reason || "unknown",
               chars: Number(msg.chunk.chars || (msg.chunk.text || "").length),
-              words: Number(msg.chunk.words || countWords(msg.chunk.text || ""))
-            };
-            state.actualCommits.push(item);
-            ensureChunkLane(item.chunkId, {
+	              words: Number(msg.chunk.words || countWords(msg.chunk.text || ""))
+	            };
+	            state.actualCommits.push(item);
+	            state.queuedChunks.push(item);
+	            ensureChunkLane(item.chunkId, {
               text: item.text,
               reason: item.reason
             });
@@ -1518,29 +1746,68 @@
           break;
         }
 
-        case "tts_started":
-          pushTimeline("tts_started", msg.text || "");
+	        case "tts_started":
+	          state.activeTtsChunk = {
+	            chunkId: msg.chunk_id,
+	            text: msg.text || ""
+	          };
+	          state.queuedChunks = state.queuedChunks.filter(item => item.chunkId !== msg.chunk_id);
+	          pushTimeline("tts_started", msg.text || "");
           pushChunkEvent(msg.chunk_id, "tts_started", "tts_started", {
             text: msg.text || ""
           });
-          log(`tts_started chunk_id=${msg.chunk_id} text="${truncate(msg.text || "", 90)}"`);
-          break;
+	          log(`tts_started chunk_id=${msg.chunk_id} text="${truncate(msg.text || "", 90)}"`);
+	          renderDebugPanel();
+	          break;
 
-        case "audio_meta":
-          state.audioMeta.sampleRate = Number(msg.meta?.sample_rate || 44100);
-          state.audioMeta.channels = Number(msg.meta?.channels || 1);
-          state.audioMeta.format = String(msg.meta?.format || "pcm");
-          break;
+	        case "audio_meta":
+	          state.audioMeta.sampleRate = Number(msg.meta?.sample_rate || 44100);
+	          state.audioMeta.channels = Number(msg.meta?.channels || 1);
+	          state.audioMeta.format = String(msg.meta?.format || "pcm");
+	          if (
+	            state.audioCtx
+	            && state.audioMeta.format === "pcm"
+	            && state.audioMeta.sampleRate !== state.audioCtx.sampleRate
+	            && !state.playback.sampleRateMismatchLogged
+	          ) {
+	            state.playback.sampleRateMismatchLogged = true;
+	            pushPlaybackEvent(
+	              "sample_rate_mismatch",
+	              `pcm=${state.audioMeta.sampleRate}Hz audio_ctx=${state.audioCtx.sampleRate}Hz; linear resampler enabled`
+	            );
+	          }
+	          break;
 
-        case "audio_chunk":
-          state.pendingAudioEvent = msg;
-          break;
+	        case "audio_chunk":
+	          state.pendingAudioEvent = msg;
+	          pushPlaybackEvent(
+	            "audio_chunk_received",
+	            `chunk=${String(msg.chunk_id || "").slice(0, 8)} seq=${msg.seq} bytes=${msg.size_bytes}`
+	          );
+	          break;
 
-        case "tts_finished":
-          pushTimeline("tts_finished", `chunk=${msg.chunk_id} bytes=${msg.total_bytes}`);
-          pushChunkEvent(msg.chunk_id, "tts_finished", "tts_finished");
-          log(`tts_finished chunk_id=${msg.chunk_id} chunks=${msg.total_chunks} bytes=${msg.total_bytes}`);
-          break;
+	        case "tts_finished":
+	          pushTimeline("tts_finished", `chunk=${msg.chunk_id} bytes=${msg.total_bytes}`);
+	          pushChunkEvent(msg.chunk_id, "tts_finished", "tts_finished");
+	          state.queuedChunks = state.queuedChunks.filter(item => item.chunkId !== msg.chunk_id);
+	          if (state.activeTtsChunk?.chunkId === msg.chunk_id) {
+	            state.activeTtsChunk = null;
+	          }
+	          state.playback.expectingAudio =
+	            state.queuedChunks.length > 0 || state.activeTtsChunk !== null;
+	          if (state.playback.queuedSamples === 0 && !state.playback.currentChunk) {
+	            if (state.playback.active) {
+	              pushPlaybackEvent("audio_play_finished", `chunk=${String(msg.chunk_id || "").slice(0, 8)}`);
+	            }
+	            state.playback.active = false;
+	          }
+	          log(`tts_finished chunk_id=${msg.chunk_id} chunks=${msg.total_chunks} bytes=${msg.total_bytes}`);
+	          renderDebugPanel();
+	          break;
+
+	        case "audio_debug_saved":
+	          log(`audio_saved_debug chunk_id=${msg.chunk_id} wav_path=${msg.wav_path}`);
+	          break;
 
         case "cleanup_done":
           log(`cleanup_done reason=${msg.reason || "-"}`);
@@ -1583,45 +1850,73 @@
         pushChunkEvent(audioEvent.chunk_id, "first_audio", "first_audio");
       }
 
-      if (state.audioMeta.format === "pcm") {
-        schedulePcmChunk(arrayBuffer, state.audioMeta.sampleRate, state.audioMeta.channels);
-      } else {
-        scheduleWavChunk(arrayBuffer);
-      }
+	      if (state.audioMeta.format === "pcm") {
+	        schedulePcmChunk(arrayBuffer, state.audioMeta.sampleRate, state.audioMeta.channels);
+	      } else {
+	        scheduleWavChunk(arrayBuffer);
+	      }
 
       refreshStats();
     }
 
-    function schedulePcmChunk(arrayBuffer, sampleRate, channels) {
-      if (!state.audioCtx) return;
+	    function pcm16ToMonoFloat32(arrayBuffer, channels) {
+	      const bytes = new Uint8Array(arrayBuffer);
+	      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	      const bytesPerSample = 2;
+	      const frameCount = Math.floor(bytes.byteLength / (bytesPerSample * channels));
+	      const out = new Float32Array(frameCount);
 
-      const ctx = state.audioCtx;
-      const bytes = new Uint8Array(arrayBuffer);
-      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-      const bytesPerSample = 2;
-      const frameCount = Math.floor(bytes.byteLength / (bytesPerSample * channels));
-      if (frameCount <= 0) return;
+	      for (let i = 0; i < frameCount; i++) {
+	        let acc = 0;
+	        for (let ch = 0; ch < channels; ch++) {
+	          const offset = (i * channels + ch) * 2;
+	          acc += view.getInt16(offset, true) / 32768;
+	        }
+	        out[i] = Math.max(-1, Math.min(1, acc / channels));
+	      }
 
-      const audioBuffer = ctx.createBuffer(channels, frameCount, sampleRate);
+	      return out;
+	    }
 
-      for (let ch = 0; ch < channels; ch++) {
-        const out = audioBuffer.getChannelData(ch);
-        for (let i = 0; i < frameCount; i++) {
-          const offset = (i * channels + ch) * 2;
-          const sample = view.getInt16(offset, true);
-          out[i] = Math.max(-1, Math.min(1, sample / 32768));
-        }
-      }
+	    function resampleLinear(input, fromRate, toRate) {
+	      if (!input.length || fromRate === toRate) {
+	        return input;
+	      }
 
-      const source = ctx.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(ctx.destination);
+	      const ratio = toRate / fromRate;
+	      const outLength = Math.max(1, Math.round(input.length * ratio));
+	      const out = new Float32Array(outLength);
 
-      const lead = 0.015;
-      const startAt = Math.max(ctx.currentTime + lead, state.playback.nextStartTime || 0);
-      source.start(startAt);
-      state.playback.nextStartTime = startAt + audioBuffer.duration;
-    }
+	      for (let i = 0; i < outLength; i++) {
+	        const srcPos = i / ratio;
+	        const i0 = Math.floor(srcPos);
+	        const i1 = Math.min(input.length - 1, i0 + 1);
+	        const frac = srcPos - i0;
+	        out[i] = input[i0] * (1 - frac) + input[i1] * frac;
+	      }
+
+	      return out;
+	    }
+
+	    function schedulePcmChunk(arrayBuffer, sampleRate, channels) {
+	      if (!state.audioCtx) return;
+
+	      const ctx = state.audioCtx;
+	      const mono = pcm16ToMonoFloat32(arrayBuffer, channels);
+	      if (!mono.length) return;
+
+	      const playable = resampleLinear(mono, sampleRate, ctx.sampleRate);
+	      state.playback.pcmQueue.push(playable);
+	      state.playback.queuedSamples += playable.length;
+	      state.playback.expectingAudio = true;
+
+	      const queuedSec = state.playback.queuedSamples / Math.max(1, ctx.sampleRate);
+	      pushPlaybackEvent(
+	        "audio_chunk_queued",
+	        `samples=${playable.length} queue=${state.playback.pcmQueue.length} queued_sec=${queuedSec.toFixed(3)}`
+	      );
+	      refreshStats();
+	    }
 
     async function scheduleWavChunk(arrayBuffer) {
       if (!state.audioCtx) return;
@@ -1629,18 +1924,24 @@
       try {
         const ctx = state.audioCtx;
         const decoded = await ctx.decodeAudioData(arrayBuffer.slice(0));
-        const source = ctx.createBufferSource();
-        source.buffer = decoded;
-        source.connect(ctx.destination);
+	        const source = ctx.createBufferSource();
+	        source.buffer = decoded;
+	        source.connect(state.gainNode || ctx.destination);
 
-        const lead = 0.015;
-        const startAt = Math.max(ctx.currentTime + lead, state.playback.nextStartTime || 0);
-        source.start(startAt);
-        state.playback.nextStartTime = startAt + decoded.duration;
-      } catch (err) {
-        log(`wav decode error: ${err.message || err}`);
-      }
-    }
+	        const lead = 0.015;
+	        const startAt = Math.max(ctx.currentTime + lead, state.playback.nextStartTime || 0);
+	        const gap = Math.max(0, startAt - (state.playback.nextStartTime || ctx.currentTime));
+	        if (gap > 0.035) {
+	          state.playback.gaps += 1;
+	          pushPlaybackEvent("gap_detected", `${Math.round(gap * 1000)}ms before wav chunk`);
+	        }
+	        source.start(startAt);
+	        state.playback.nextStartTime = startAt + decoded.duration;
+	        pushPlaybackEvent("audio_chunk_queued", `wav_duration=${decoded.duration.toFixed(3)}s`);
+	      } catch (err) {
+	        pushPlaybackEvent("decode_error", err.message || String(err));
+	      }
+	    }
 
     function tokenizeForDemo(text) {
       return text.match(/\S+\s*/g) || [];

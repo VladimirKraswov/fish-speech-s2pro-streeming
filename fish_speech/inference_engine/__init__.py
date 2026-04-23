@@ -77,6 +77,9 @@ class AudioChunk:
     text: str | None = None
     decode_ms: float = 0.0
     microchunk_size: int = 1
+    microchunk_count: int = 0
+    retries: int = 0
+    cleanup_count: int = 0
 
 
 @dataclass
@@ -625,6 +628,9 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                         text=item.text,
                         decode_ms=stats.decode_ms,
                         microchunk_size=stats.microchunk_size,
+                        microchunk_count=stats.microchunk_count,
+                        retries=stats.retries,
+                        cleanup_count=stats.cleanup_count,
                     ),
                     cancel_event=cancel_event,
                     req_tag=req_tag,
@@ -791,6 +797,16 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         produced_segments = 0
         terminal_signal: PipelineSignal | None = None
         sender_wait_since: float | None = None
+        ttfa_ms: float | None = None
+        sender_wait_ms_total = 0.0
+        sender_underruns = 0
+        codes_high_water = codes_queue.qsize()
+        audio_high_water = audio_queue.qsize()
+        dac_decode_ms_total = 0.0
+        dac_retries_total = 0
+        dac_cleanup_total = 0
+        dac_microchunk_parts_total = 0
+        samples_total = 0
         start_buffer_chunks = (
             0
             if not req.streaming
@@ -805,18 +821,29 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                 next_expected_sequence += 1
 
         def _emit_ready_chunks() -> Generator[InferenceResult, None, None]:
-            nonlocal ttfa_logged, produced_segments
+            nonlocal ttfa_logged, produced_segments, ttfa_ms
+            nonlocal dac_decode_ms_total, dac_retries_total, dac_cleanup_total
+            nonlocal dac_microchunk_parts_total, samples_total
 
             while ready_to_send:
                 ready = ready_to_send.pop(0)
 
                 if not ttfa_logged:
+                    ttfa_ms = (time.perf_counter() - t_start) * 1000.0
                     logger.info(
                         "pipeline: ttfa req={} ttfa_ms={:.1f}",
                         req_tag,
-                        (time.perf_counter() - t_start) * 1000.0,
+                        ttfa_ms,
                     )
                     ttfa_logged = True
+
+                duration_ms = (len(ready.audio) / max(1, sample_rate)) * 1000.0
+                byte_count = len(ready.audio) * 2
+                dac_decode_ms_total += ready.decode_ms
+                dac_retries_total += ready.retries
+                dac_cleanup_total += ready.cleanup_count
+                dac_microchunk_parts_total += ready.microchunk_count
+                samples_total += len(ready.audio)
 
                 logger.info(
                     "sender: segment req={} sequence_id={} samples={} decode_ms={:.1f} microchunk={} codes_depth={} audio_depth={}",
@@ -827,6 +854,20 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                     ready.microchunk_size,
                     codes_queue.qsize(),
                     audio_queue.qsize(),
+                )
+                logger.info(
+                    "audio_generated req={} sequence_id={} duration_ms={:.1f} sample_rate={} samples={} bytes={} decode_ms={:.1f} microchunk={} parts={} retries={} cleanup={}",
+                    req_tag,
+                    ready.sequence_id,
+                    duration_ms,
+                    sample_rate,
+                    len(ready.audio),
+                    byte_count,
+                    ready.decode_ms,
+                    ready.microchunk_size,
+                    ready.microchunk_count,
+                    ready.retries,
+                    ready.cleanup_count,
                 )
 
                 produced_segments += 1
@@ -850,9 +891,15 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             while True:
                 try:
                     item = audio_queue.get(timeout=QUEUE_POLL_TIMEOUT_SEC)
+                    if sender_wait_since is not None:
+                        sender_wait_ms_total += (
+                            time.perf_counter() - sender_wait_since
+                        ) * 1000.0
                     sender_wait_since = None
                 except queue.Empty:
                     _fill_ready_chunks()
+                    codes_high_water = max(codes_high_water, codes_queue.qsize())
+                    audio_high_water = max(audio_high_water, audio_queue.qsize())
 
                     if (
                         req.streaming
@@ -882,6 +929,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                             producer_done.is_set(),
                             dac_done.is_set(),
                         )
+                        sender_underruns += 1
                         sender_wait_since = time.perf_counter()
                     continue
 
@@ -900,6 +948,8 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                     break
                 else:
                     pending_audio[item.sequence_id] = item
+                    codes_high_water = max(codes_high_water, codes_queue.qsize())
+                    audio_high_water = max(audio_high_water, audio_queue.qsize())
 
                 _fill_ready_chunks()
 
@@ -999,13 +1049,25 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             dac_thread.join(timeout=THREAD_JOIN_TIMEOUT_SEC)
 
             logger.info(
-                "pipeline: finished req={} producer_alive={} dac_alive={} codes_depth={} audio_depth={} total_ms={:.1f}",
+                "pipeline: finished req={} status={} producer_alive={} dac_alive={} codes_depth={} audio_depth={} codes_hwm={} audio_hwm={} segments={} samples={} ttfa_ms={} total_ms={:.1f} sender_wait_ms={:.1f} underruns={} dac_decode_ms={:.1f} dac_parts={} dac_retries={} dac_cleanup={}",
                 req_tag,
+                terminal_signal.kind if terminal_signal is not None else "unknown",
                 producer_thread.is_alive(),
                 dac_thread.is_alive(),
                 codes_queue.qsize(),
                 audio_queue.qsize(),
+                codes_high_water,
+                audio_high_water,
+                produced_segments,
+                samples_total,
+                f"{ttfa_ms:.1f}" if ttfa_ms is not None else "na",
                 (time.perf_counter() - t_start) * 1000.0,
+                sender_wait_ms_total,
+                sender_underruns,
+                dac_decode_ms_total,
+                dac_microchunk_parts_total,
+                dac_retries_total,
+                dac_cleanup_total,
             )
 
     def send_Llama_request(

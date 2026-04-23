@@ -76,6 +76,11 @@
     let pcmQueue = [];
     let currentChunk = null;
     let currentChunkOffset = 0;
+    let queuedSamples = 0;
+    let playbackActive = false;
+    let underruns = 0;
+    let lastUnderrunLog = 0;
+    let sampleRateMismatchLogged = false;
 
     function log(msg) {
       const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
@@ -92,6 +97,11 @@
       pcmQueue = [];
       currentChunk = null;
       currentChunkOffset = 0;
+      queuedSamples = 0;
+      playbackActive = false;
+      underruns = 0;
+      lastUnderrunLog = 0;
+      sampleRateMismatchLogged = false;
       streamMeta = null;
       lastSeq = 0;
       firstSoundLogged = false;
@@ -138,11 +148,26 @@
             );
 
             currentChunkOffset += n;
+            queuedSamples = Math.max(0, queuedSamples - n);
             writePos += n;
 
             if (currentChunkOffset >= currentChunk.length) {
               currentChunk = null;
               currentChunkOffset = 0;
+            }
+          }
+
+          if (writePos > 0 && !playbackActive) {
+            playbackActive = true;
+            log(`audio_play_started queue=${pcmQueue.length}`);
+          }
+
+          if (writePos < out.length && playbackActive) {
+            underruns += 1;
+            const now = performance.now();
+            if (now - lastUnderrunLog > 350) {
+              lastUnderrunLog = now;
+              log(`underrun_detected missing_samples=${out.length - writePos} underruns=${underruns}`);
             }
           }
         };
@@ -171,14 +196,36 @@
       return bytes;
     }
 
-    function pcm16ToFloat32(bytes) {
+    function pcm16ToFloat32(bytes, channels) {
       const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-      const samples = bytes.byteLength / 2;
-      const out = new Float32Array(samples);
+      const frames = Math.floor(bytes.byteLength / (2 * channels));
+      const out = new Float32Array(frames);
 
-      for (let i = 0; i < samples; i++) {
-        const s = view.getInt16(i * 2, true);
-        out[i] = Math.max(-1, Math.min(1, s / 32768));
+      for (let i = 0; i < frames; i++) {
+        let acc = 0;
+        for (let ch = 0; ch < channels; ch++) {
+          const s = view.getInt16((i * channels + ch) * 2, true);
+          acc += s / 32768;
+        }
+        out[i] = Math.max(-1, Math.min(1, acc / channels));
+      }
+
+      return out;
+    }
+
+    function resampleLinear(input, fromRate, toRate) {
+      if (!input.length || fromRate === toRate) return input;
+
+      const ratio = toRate / fromRate;
+      const outLength = Math.max(1, Math.round(input.length * ratio));
+      const out = new Float32Array(outLength);
+
+      for (let i = 0; i < outLength; i++) {
+        const srcPos = i / ratio;
+        const i0 = Math.floor(srcPos);
+        const i1 = Math.min(input.length - 1, i0 + 1);
+        const frac = srcPos - i0;
+        out[i] = input[i0] * (1 - frac) + input[i1] * frac;
       }
 
       return out;
@@ -194,6 +241,9 @@
       }
 
       pcmQueue.push(float32Chunk);
+      queuedSamples += float32Chunk.length;
+      const queuedSec = audioCtx ? queuedSamples / Math.max(1, audioCtx.sampleRate) : 0;
+      log(`audio_chunk_queued seq=${seq ?? '-'} samples=${float32Chunk.length} queue=${pcmQueue.length} queued_sec=${queuedSec.toFixed(3)}`);
 
       if (!firstSoundLogged) {
         firstSoundLogged = true;
@@ -278,6 +328,14 @@
             if (event.type === 'meta') {
               streamMeta = event;
               log(`run=${runId} meta sr=${event.sample_rate} ch=${event.channels}`);
+              if (
+                audioCtx
+                && Number(event.sample_rate) !== audioCtx.sampleRate
+                && !sampleRateMismatchLogged
+              ) {
+                sampleRateMismatchLogged = true;
+                log(`sample_rate_mismatch pcm=${event.sample_rate}Hz audio_ctx=${audioCtx.sampleRate}Hz; linear resampler enabled`);
+              }
               continue;
             }
 
@@ -288,7 +346,13 @@
               }
 
               const bytes = base64ToUint8Array(event.data);
-              const floatChunk = pcm16ToFloat32(bytes);
+              log(`audio_chunk_received seq=${event.seq ?? '-'} bytes=${bytes.byteLength}`);
+              const mono = pcm16ToFloat32(bytes, Number(streamMeta.channels || 1));
+              const floatChunk = resampleLinear(
+                mono,
+                Number(streamMeta.sample_rate || 44100),
+                audioCtx.sampleRate
+              );
               pushPcmChunk(floatChunk, event.seq ?? null);
 
               log(`run=${runId} pcm seq=${event.seq ?? '-'} bytes=${bytes.byteLength}`);

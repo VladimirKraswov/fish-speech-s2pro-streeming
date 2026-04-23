@@ -1,3 +1,4 @@
+# tools/memory_metrics.py
 #!/usr/bin/env python3
 """
 Poll /v1/debug/memory at a fixed interval; append one JSON line only when metrics change.

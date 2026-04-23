@@ -1,3 +1,4 @@
+# scripts/warmup_5090.sh
 #!/usr/bin/env bash
 set -euo pipefail
 

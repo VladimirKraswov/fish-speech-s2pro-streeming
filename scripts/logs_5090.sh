@@ -1,3 +1,4 @@
+# scripts/logs_5090.sh
 #!/usr/bin/env bash
 set -euo pipefail
 

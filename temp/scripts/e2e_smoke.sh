@@ -1,3 +1,4 @@
+# scripts/e2e_smoke.sh
 #!/usr/bin/env bash
 # E2E smoke: server must be running (e.g. ./scripts/run_server_32gb.sh).
 # Waits for health, runs TTS (streaming + oneshot), checks /v1/debug/memory.

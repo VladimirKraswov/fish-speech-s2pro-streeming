@@ -1,3 +1,4 @@
+# mkdocs.yml
 site_name: Fish Audio
 site_description: Targeting SOTA TTS solutions.
 site_url: https://speech.fish.audio

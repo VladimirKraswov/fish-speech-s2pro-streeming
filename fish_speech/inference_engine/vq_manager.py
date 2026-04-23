@@ -1,3 +1,4 @@
+# fish_speech/inference_engine/vq_manager.py
 from typing import Callable
 
 import torch

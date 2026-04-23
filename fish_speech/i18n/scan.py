@@ -1,3 +1,4 @@
+# fish_speech/i18n/scan.py
 import ast
 import glob
 import json

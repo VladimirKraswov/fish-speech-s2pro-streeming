@@ -1,3 +1,4 @@
+# scripts/e2e_memory.sh
 #!/usr/bin/env bash
 # E2E memory check: two TTS requests to verify VRAM is freed between requests (no OOM on 32GB).
 # Server must be running. Usage: PORT=8080 ./scripts/e2e_memory.sh   or: make e2e-memory

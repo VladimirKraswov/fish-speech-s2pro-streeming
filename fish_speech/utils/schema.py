@@ -1,3 +1,4 @@
+# fish_speech/utils/schema.py
 import base64
 import os
 import queue

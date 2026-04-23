@@ -1,3 +1,4 @@
+# fish_speech/configs/modded_dac_vq.yaml
 _target_: fish_speech.models.dac.modded_dac.DAC
 # Model setup
 sample_rate: 44100

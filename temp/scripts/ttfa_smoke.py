@@ -1,3 +1,4 @@
+# scripts/ttfa_smoke.py
 #!/usr/bin/env python3
 """One TTS request (streaming or oneshot): measure TTFA and save WAV. Prints ttfa_s, ttfa_audio_s, total_s."""
 

@@ -1,3 +1,4 @@
+# compose.yml
 name: fish-speech
 
 services:

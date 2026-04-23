@@ -1,3 +1,4 @@
+# entrypoint.sh
 #!/bin/bash
 
 CUDA_ENABLED=${CUDA_ENABLED:-true}

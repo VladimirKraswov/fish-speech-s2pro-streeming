@@ -11,6 +11,7 @@ web/
 datasets/
 smoke-test/
 fish_speech/i18n/
+temp/
 
 
 package-lock.json

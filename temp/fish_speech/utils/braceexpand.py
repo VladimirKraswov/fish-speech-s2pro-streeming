@@ -1,3 +1,4 @@
+# fish_speech/utils/braceexpand.py
 """
 Bash-style brace expansion
 Copied from: https://github.com/trendels/braceexpand/blob/main/src/braceexpand/__init__.py

@@ -1,3 +1,4 @@
+# tools/preencode_references.py
 #!/usr/bin/env python3
 """
 Pre-encode reference audio to .codes.pt so the server skips DAC encode at runtime.

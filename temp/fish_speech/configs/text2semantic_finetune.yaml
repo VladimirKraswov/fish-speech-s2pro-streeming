@@ -1,3 +1,4 @@
+# fish_speech/configs/text2semantic_finetune.yaml
 defaults:
   - base
   - _self_

@@ -1,3 +1,4 @@
+# scripts/run_server_32gb.sh
 #!/usr/bin/env bash
 # Minimal repro: run API server in Docker for 32GB VRAM (e.g. RTX 5090).
 # From repo root: ./scripts/run_server_32gb.sh

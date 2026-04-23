@@ -1,3 +1,4 @@
+# scripts/preencode.sh
 #!/usr/bin/env bash
 # Pre-encode reference WAV+txt to references/. Optional: upload to server.
 # Env: PREENCODE_INPUT_DIR, PREENCODE_OUTPUT_DIR, PREENCODE_CHECKPOINT, PREENCODE_REF_ID, UPLOAD, SERVER_URL

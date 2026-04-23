@@ -1,3 +1,4 @@
+# scripts/upload_references.sh
 #!/usr/bin/env bash
 # Upload existing references/ to server (no encoding). Server skips if hash matches.
 # Env: PREENCODE_OUTPUT_DIR, SERVER_URL (or BASE_URL)

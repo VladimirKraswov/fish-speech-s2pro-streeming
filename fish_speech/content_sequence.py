@@ -1,3 +1,4 @@
+# fish_speech/content_sequence.py
 from dataclasses import dataclass, field
 from typing import List, Literal, Union
 

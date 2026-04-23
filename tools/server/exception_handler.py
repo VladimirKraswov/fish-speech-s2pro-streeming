@@ -1,3 +1,4 @@
+# tools/server/exception_handler.py
 import traceback
 from http import HTTPStatus
 

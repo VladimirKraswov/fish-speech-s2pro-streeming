@@ -1,3 +1,4 @@
+# fish_speech/i18n/core.py
 import json
 import locale
 from pathlib import Path

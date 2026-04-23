@@ -1,3 +1,4 @@
+# fish_speech/i18n/README.md
 ## i18n Folder Attribution
 
 The `i18n` folder within the `fish_speech` directory contains files initially sourced from the RVC project. In compliance with the MIT license under which these files were released, we acknowledge the original authors and sources below:

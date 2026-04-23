@@ -1,3 +1,4 @@
+# codebundle.txt
 === CODE BUNDLE ===
 root: /Volumes/Extend/work/fish-speech-s2pro-streeming
 ignore: .codebundleignore

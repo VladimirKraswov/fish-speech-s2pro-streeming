@@ -1,6 +1,7 @@
 import dataclasses
 import json
 import math
+import warnings
 from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -17,6 +18,12 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 
 from fish_speech.models.text2semantic.lora import LoraConfig, setup_lora
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"Logical operators 'and' and 'or' are deprecated for non-scalar tensors.*",
+    module=r"torch\._inductor\.runtime\.triton_helpers",
+)
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -673,7 +680,7 @@ class DualARTransformer(BaseTransformer):
         )
 
         self.fast_layers = nn.ModuleList(
-            TransformerBlock(override_config, use_sdpa=False)
+            TransformerBlock(override_config, use_sdpa=True)
             for _ in range(config.n_fast_layer)
         )
         self.fast_norm = RMSNorm(config.fast_dim, eps=config.norm_eps)
@@ -872,8 +879,82 @@ class Attention(nn.Module):
             return tensor
         return tensor.repeat_interleave(repeat_factor, dim=1)
 
+    @staticmethod
+    def _is_oom_error(exc: BaseException) -> bool:
+        return isinstance(exc, torch.OutOfMemoryError) or "out of memory" in str(
+            exc
+        ).lower()
+
+    @staticmethod
+    def _is_sdpa_support_error(exc: BaseException) -> bool:
+        if isinstance(exc, (TypeError, NotImplementedError)):
+            return True
+
+        msg = str(exc).lower()
+        needles = (
+            "enable_gqa",
+            "not implemented",
+            "not supported",
+            "does not support",
+            "no available kernel",
+            "scaled_dot_product_attention",
+            "sdpa",
+        )
+        return any(x in msg for x in needles)
+
     def _make_sdpa_context(self, force_math: bool):
         return sdpa_kernel(SDPBackend.MATH) if force_math else nullcontext()
+
+    def _normalize_mask_for_manual_gqa(self, attn_mask: Tensor) -> Tensor:
+        if attn_mask.dim() == 5:
+            return attn_mask
+        if attn_mask.dim() == 4:
+            return attn_mask.unsqueeze(2)
+        if attn_mask.dim() == 3:
+            return attn_mask.unsqueeze(1).unsqueeze(1)
+        if attn_mask.dim() == 2:
+            return attn_mask.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+        raise ValueError(f"Unsupported attn_mask rank for manual GQA: {attn_mask.dim()}")
+
+    def _manual_gqa_attention(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attn_mask: Optional[Tensor] = None,
+        dropout_p: float = 0.0,
+    ) -> Tensor:
+        bsz, hq, q_len, head_dim = query.shape
+        _, hkv, _, _ = key.shape
+
+        assert hq % hkv == 0, f"n_head={hq} must be divisible by n_local_heads={hkv}"
+        groups = hq // hkv
+
+        q = query.view(bsz, hkv, groups, q_len, head_dim).float()
+        k = key.float()
+        v = value.float()
+
+        attn_weight = torch.einsum("bhgld,bhsd->bhgls", q, k)
+        attn_weight *= 1.0 / math.sqrt(head_dim)
+
+        if attn_mask is not None:
+            attn_mask = self._normalize_mask_for_manual_gqa(attn_mask)
+            if attn_mask.dtype == torch.bool:
+                attn_weight = attn_weight.masked_fill(
+                    attn_mask.logical_not(), float("-inf")
+                )
+            else:
+                attn_weight = attn_weight + attn_mask
+
+        attn_weight = torch.softmax(attn_weight, dim=-1)
+
+        if dropout_p > 0.0:
+            attn_weight = torch.dropout(attn_weight, dropout_p, train=self.training)
+
+        y = torch.einsum("bhgls,bhsd->bhgld", attn_weight.to(v.dtype), v)
+        y = y.reshape(bsz, hq, q_len, head_dim)
+
+        return y.type_as(query)
 
     def _sdpa_with_optional_gqa(
         self,
@@ -905,9 +986,20 @@ class Attention(nn.Module):
                         enable_gqa=True,
                         **call_kwargs,
                     )
-            except (TypeError, RuntimeError, NotImplementedError):
-                key = self._repeat_kv_for_gqa(key)
-                value = self._repeat_kv_for_gqa(value)
+            except Exception as e:
+                if self._is_oom_error(e):
+                    raise
+
+                if not self._is_sdpa_support_error(e):
+                    raise
+
+                return self._manual_gqa_attention(
+                    query,
+                    key,
+                    value,
+                    attn_mask=attn_mask,
+                    dropout_p=dropout_p,
+                )
 
         with self._make_sdpa_context(force_math):
             return F.scaled_dot_product_attention(
@@ -935,18 +1027,29 @@ class Attention(nn.Module):
                 is_causal=attn_mask is None,
                 force_math=True,
             )
-        except RuntimeError:
-            if self.n_head != self.n_local_heads:
-                key = self._repeat_kv_for_gqa(key)
-                value = self._repeat_kv_for_gqa(value)
+        except Exception as e:
+            if self._is_oom_error(e):
+                raise
 
-            return self.eq_scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                attn_mask=attn_mask,
-                dropout_p=dropout_p,
-            )
+            if self._is_sdpa_support_error(e):
+                if self.n_head != self.n_local_heads:
+                    return self._manual_gqa_attention(
+                        query,
+                        key,
+                        value,
+                        attn_mask=attn_mask,
+                        dropout_p=dropout_p,
+                    )
+
+                return self.eq_scaled_dot_product_attention(
+                    query,
+                    key,
+                    value,
+                    attn_mask=attn_mask,
+                    dropout_p=dropout_p,
+                )
+
+            raise
 
     def forward(
         self,
@@ -972,7 +1075,7 @@ class Attention(nn.Module):
         q = apply_rotary_emb(q, freqs_cis)
         k = apply_rotary_emb(k, freqs_cis)
 
-        q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
+        q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))
 
         if self.kv_cache is not None:
             k, v = self.kv_cache.update(input_pos, k, v)
@@ -1004,7 +1107,6 @@ class Attention(nn.Module):
             )
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, q_size)
-
         return self.wo(y)
 
     def eq_scaled_dot_product_attention(

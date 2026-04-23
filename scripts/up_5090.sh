@@ -17,7 +17,8 @@ EXTRA_WARMUP="${EXTRA_WARMUP:-1}"
 
 CUDA_VER="${CUDA_VER:-12.9.0}"
 UV_EXTRA="${UV_EXTRA:-cu129}"
-CHECKPOINTS_DIR="${CHECKPOINTS_DIR:-checkpoints/s2-pro}"
+LLAMA_CHECKPOINTS_DIR="${LLAMA_CHECKPOINTS_DIR:-checkpoints/fs-1.2-int8-s2-pro-int8}"
+DECODER_CHECKPOINT_PATH="${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}"
 DEFAULT_REFERENCE_ID="${DEFAULT_REFERENCE_ID:-ref}"
 
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -43,12 +44,18 @@ echo "  CONTAINER=$CONTAINER"
 echo "  PORT=$PORT"
 echo "  PROXY_PORT=$PROXY_PORT"
 echo "  COMPILE=$COMPILE"
-echo "  CHECKPOINTS_DIR=$CHECKPOINTS_DIR"
+echo "  LLAMA_CHECKPOINTS_DIR=$LLAMA_CHECKPOINTS_DIR"
+echo "  DECODER_CHECKPOINT_PATH=$DECODER_CHECKPOINT_PATH"
 echo "  DEFAULT_REFERENCE_ID=$DEFAULT_REFERENCE_ID"
 echo
 
-if [[ ! -d "$CHECKPOINTS_DIR" ]] || [[ -z "$(ls -A "$CHECKPOINTS_DIR" 2>/dev/null)" ]]; then
-  echo "ERROR: checkpoints not found in $CHECKPOINTS_DIR" >&2
+if [[ ! -d "$LLAMA_CHECKPOINTS_DIR" ]] || [[ -z "$(ls -A "$LLAMA_CHECKPOINTS_DIR" 2>/dev/null)" ]]; then
+  echo "ERROR: llama checkpoints not found in $LLAMA_CHECKPOINTS_DIR" >&2
+  exit 1
+fi
+
+if [[ ! -f "$DECODER_CHECKPOINT_PATH" ]]; then
+  echo "ERROR: decoder checkpoint not found at $DECODER_CHECKPOINT_PATH" >&2
   exit 1
 fi
 
@@ -86,8 +93,8 @@ CID="$(
     /workspace/tools/api_server.py \
     --listen 0.0.0.0:8080 \
     --device cuda \
-    --llama-checkpoint-path "/workspace/$CHECKPOINTS_DIR" \
-    --decoder-checkpoint-path "/workspace/$CHECKPOINTS_DIR/codec.pth" \
+    --llama-checkpoint-path "/workspace/$LLAMA_CHECKPOINTS_DIR" \
+    --decoder-checkpoint-path "/workspace/$DECODER_CHECKPOINT_PATH" \
     $([[ "$COMPILE" == "1" ]] && echo --compile || true)
 )"
 

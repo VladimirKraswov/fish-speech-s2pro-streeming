@@ -25,7 +25,7 @@ def parse_args():
     parser.add_argument(
         "--llama-checkpoint-path",
         type=str,
-        default="checkpoints/s2-pro",
+        default="checkpoints/fs-1.2-int8-s2-pro-int8",
     )
     parser.add_argument(
         "--decoder-checkpoint-path",

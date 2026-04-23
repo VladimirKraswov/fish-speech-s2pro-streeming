@@ -13,7 +13,7 @@ WORD_RE = re.compile(r"\b\w+\b", flags=re.UNICODE)
 _SENTENCE_ENDINGS = {".", "!", "?", ";", "…", "。", "！", "？", "；"}
 _HARD_BREAKS = {"\n"}
 _BOUNDARY_CHARS = _SENTENCE_ENDINGS.union(_HARD_BREAKS).union(
-    {",", ":", "，", "："}
+    {" ", "\t"}
 )
 
 EmitReason = Literal["punct", "hard_limit", "force", "final"]
@@ -159,7 +159,10 @@ class StreamingTextBuffer:
         # Первый чанк можно отдать раньше, но только если последний входной
         # фрагмент закончился на безопасной границе. Это защищает от озвучки
         # обрезков слов вроде "Hel" / "при".
-        if self._is_first_chunk and total_words >= self.min_words:
+        if self._is_first_chunk:
+            if total_words < self.min_words:
+                return None
+
             punct_split = self._find_sentence_boundary(buf)
             if punct_split is not None:
                 return self._map_stripped_index_to_raw_index(punct_split), "punct"

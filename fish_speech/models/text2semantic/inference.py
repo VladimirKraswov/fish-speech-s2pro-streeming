@@ -546,6 +546,11 @@ def decode_n_tokens(
         if (i + 1) % 4 == 0:
             free_gb = _cuda_free_gb(cur_token.device)
             if free_gb is not None and free_gb < llm_critical_free_gb:
+                logger.warning(
+                    "stream: low VRAM during generation ({:.2f} GB < {} GB), triggering cleanup",
+                    free_gb,
+                    llm_critical_free_gb,
+                )
                 _light_cuda_cleanup()
 
         if i == 0 and do_stream_log:

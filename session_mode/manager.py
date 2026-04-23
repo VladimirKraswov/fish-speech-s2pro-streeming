@@ -240,6 +240,12 @@ class SessionManager:
             )
 
     async def _handle_text_delta(self, message: ClientTextDelta) -> None:
+        logger.info(
+            "delta_received text={!r} len={} buffer_before={!r}",
+            message.text,
+            len(message.text),
+            self._buffer.text,
+        )
         self._touch_activity()
         self._last_buffer_append_at = _now_monotonic()
         self._cleanup_sent_for_idle_window = False
@@ -260,6 +266,7 @@ class SessionManager:
                 final=message.final,
             )
         )
+        logger.info("delta_processed buffer_after={!r}", self._buffer.text)
 
         await self._enqueue_emits(emits=emits, trace_id=message.trace_id)
 
@@ -323,6 +330,13 @@ class SessionManager:
         trace_id: str | None,
     ) -> None:
         for emit in emits:
+            logger.info(
+                "commit_decision reason={} full_text={!r} chars={} words={}",
+                emit.reason,
+                emit.text,
+                emit.chars,
+                emit.words,
+            )
             if self._pending_tts.qsize() >= self.config.policy.max_pending_emit_chunks:
                 await self._emit_error(
                     code="pending_tts_overflow",
@@ -354,6 +368,12 @@ class SessionManager:
                     queue_size=self._pending_tts.qsize(),
                 )
             )
+            logger.info(
+                "tts_enqueue chunk_id={} text={!r} queue_depth={}",
+                chunk.chunk_id,
+                chunk.text,
+                self._pending_tts.qsize(),
+            )
 
     async def _drop_pending_chunks(self) -> None:
         while True:
@@ -377,6 +397,14 @@ class SessionManager:
                 return
 
             chunk = item
+
+            logger.info(
+                "tts_request_started chunk_id={} original_text={!r} chars={} words={}",
+                chunk.chunk_id,
+                chunk.text,
+                chunk.chars,
+                chunk.words,
+            )
 
             try:
                 self._active_tts_request_task = asyncio.create_task(
@@ -480,6 +508,14 @@ class SessionManager:
 
                 seq += 1
                 total_bytes += len(data)
+
+                logger.info(
+                    "audio_generated chunk_id={} seq={} bytes={} total_bytes={}",
+                    chunk.chunk_id,
+                    seq,
+                    len(data),
+                    total_bytes,
+                )
 
                 await self._emit_audio(
                     ServerAudioChunk(

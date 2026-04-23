@@ -674,6 +674,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
     def inference(self, req: ServeTTSRequest) -> Generator[InferenceResult, None, None]:
         profile = _env_flag("FISH_PROFILE_INFERENCE", False)
+        debug_save = _env_flag("FISH_DEBUG_SAVE_AUDIO", False)
         req_tag = hex(id(req))[-6:]
         t_start = time.perf_counter()
         ttfa_logged = False
@@ -849,7 +850,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                         ttfa_logged = True
 
                     logger.info(
-                        "sender: segment req={} sequence_id={} samples={} decode_ms={:.1f} microchunk={} codes_depth={} audio_depth={}",
+                        "sender: segment req={} sequence_id={} samples={} decode_ms={:.1f} microchunk={} codes_depth={} audio_depth={} text={!r}",
                         req_tag,
                         ready.sequence_id,
                         len(ready.audio),
@@ -857,7 +858,19 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                         ready.microchunk_size,
                         codes_queue.qsize(),
                         audio_queue.qsize(),
+                        ready.text,
                     )
+
+                    if debug_save:
+                        try:
+                            import soundfile as sf
+                            os.makedirs("run/debug_audio", exist_ok=True)
+                            path = f"run/debug_audio/req_{req_tag}_seg_{ready.sequence_id}.wav"
+                            sf.write(path, ready.audio, sample_rate)
+                            logger.info("audio_saved_debug path={}", path)
+                        except Exception as e:
+                            logger.warning("failed to save debug audio: {}", e)
+
                     yield InferenceResult(
                         code="segment",
                         audio=(sample_rate, ready.audio),

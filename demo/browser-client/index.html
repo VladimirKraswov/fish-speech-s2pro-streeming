@@ -42,6 +42,19 @@
       font-family: ui-monospace, monospace;
       font-size: 13px;
     }
+    #debug {
+      margin-top: 14px;
+      padding: 12px;
+      background: #f0f0f0;
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      font-family: ui-monospace, monospace;
+      font-size: 12px;
+    }
+    .debug-label {
+      font-weight: bold;
+      color: #555;
+    }
   </style>
 </head>
 <body>
@@ -51,6 +64,13 @@
   </div>
 
   <div id="status">Готово</div>
+
+  <div id="debug">
+    <div><span class="debug-label">Queue depth:</span> <span id="debug-queue">0</span></div>
+    <div><span class="debug-label">Last event:</span> <span id="debug-event">-</span></div>
+    <div><span class="debug-label">Gaps/Overlaps:</span> <span id="debug-timing">0</span></div>
+  </div>
+
   <div id="log"></div>
 
   <script>
@@ -60,6 +80,9 @@
     const button = document.getElementById('ok');
     const statusEl = document.getElementById('status');
     const logEl = document.getElementById('log');
+    const debugQueueEl = document.getElementById('debug-queue');
+    const debugEventEl = document.getElementById('debug-event');
+    const debugTimingEl = document.getElementById('debug-timing');
 
     let audioCtx = null;
     let processor = null;
@@ -76,6 +99,8 @@
     let pcmQueue = [];
     let currentChunk = null;
     let currentChunkOffset = 0;
+    let timingIssues = 0;
+    let lastChunkEndTime = 0;
 
     function log(msg) {
       const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
@@ -88,6 +113,11 @@
       statusEl.textContent = msg;
     }
 
+    function updateDebug(event) {
+      debugQueueEl.textContent = pcmQueue.length + (currentChunk ? 1 : 0);
+      if (event) debugEventEl.textContent = event;
+    }
+
     function resetPlaybackQueue() {
       pcmQueue = [];
       currentChunk = null;
@@ -95,6 +125,10 @@
       streamMeta = null;
       lastSeq = 0;
       firstSoundLogged = false;
+      timingIssues = 0;
+      lastChunkEndTime = 0;
+      debugTimingEl.textContent = '0';
+      updateDebug('reset');
     }
 
     async function ensureAudio() {
@@ -122,10 +156,14 @@
           while (writePos < out.length) {
             if (!currentChunk) {
               if (pcmQueue.length === 0) {
+                if (writePos === 0 && lastChunkEndTime > 0) {
+                    // Possible underrun
+                }
                 break;
               }
               currentChunk = pcmQueue.shift();
               currentChunkOffset = 0;
+              updateDebug('playing_chunk');
             }
 
             const remainingChunk = currentChunk.length - currentChunkOffset;
@@ -194,6 +232,7 @@
       }
 
       pcmQueue.push(float32Chunk);
+      updateDebug(`received_seq_${seq}`);
 
       if (!firstSoundLogged) {
         firstSoundLogged = true;

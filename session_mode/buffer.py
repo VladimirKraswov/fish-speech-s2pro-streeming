@@ -159,7 +159,7 @@ class StreamingTextBuffer:
         # Первый чанк можно отдать раньше, но только если последний входной
         # фрагмент закончился на безопасной границе. Это защищает от озвучки
         # обрезков слов вроде "Hel" / "при".
-        if self._is_first_chunk and total_words >= 1:
+        if self._is_first_chunk and total_words >= self.min_words:
             punct_split = self._find_sentence_boundary(buf)
             if punct_split is not None:
                 return self._map_stripped_index_to_raw_index(punct_split), "punct"

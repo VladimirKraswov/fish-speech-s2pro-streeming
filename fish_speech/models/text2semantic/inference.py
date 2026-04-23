@@ -540,6 +540,11 @@ def decode_n_tokens(
             current_stream_chunk_size = stream_chunk_size
 
     for i in tqdm(range(num_new_tokens)):
+        if (i + 1) % 16 == 0:
+            free_gb = _cuda_free_gb(cur_token.device)
+            if free_gb is not None and free_gb < 1.5:
+                _light_cuda_cleanup()
+
         if i == 0 and do_stream_log:
             logger.info("stream: decode_n_tokens started generating first token")
 
@@ -744,6 +749,10 @@ def generate(
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
     stream_chunk_size = sampling_kwargs.pop("stream_chunk_size", None)
     initial_stream_chunk_size = sampling_kwargs.pop("initial_stream_chunk_size", None)
+
+    if stream_chunk_size is not None and initial_stream_chunk_size is None:
+        initial_stream_chunk_size = 8
+
     compile = sampling_kwargs.pop("compile", False)
 
     decode_iter = decode_n_tokens(
@@ -1040,6 +1049,8 @@ def generate_long(
     if stream_tokens:
         batches = [text]
         logger.info("Token streaming: single batch (no text split)")
+        if initial_stream_chunk_size is None:
+            initial_stream_chunk_size = 8
     elif turns:
         batches = group_turns_into_batches(
             turns, max_speakers=5, max_bytes=chunk_length

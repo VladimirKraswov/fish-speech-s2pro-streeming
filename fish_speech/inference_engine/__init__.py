@@ -375,12 +375,6 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                         )
                         break
 
-                    self._safe_ack(
-                        ack_queue,
-                        ACK_CONTINUE,
-                        req_tag=req_tag,
-                        reason="eos_forwarded",
-                    )
                     sent_terminal = True
                     break
 
@@ -922,13 +916,20 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             logger.info("pipeline: generator_closed req={}", req_tag)
             raise
         finally:
-            if terminal_signal is None or terminal_signal.kind != "eos":
+            if terminal_signal is not None and terminal_signal.kind == "eos":
+                self._safe_ack(
+                    ack_queue,
+                    ACK_CONTINUE,
+                    req_tag=req_tag,
+                    reason="inference_finally_eos",
+                )
+            else:
                 cancel_event.set()
                 self._safe_ack(
                     ack_queue,
                     ACK_ABORT,
                     req_tag=req_tag,
-                    reason="inference_finally",
+                    reason="inference_finally_abort",
                 )
 
             self._drain_pipeline_queue(audio_queue)

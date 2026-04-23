@@ -2,6 +2,7 @@ import dataclasses
 import json
 import math
 from collections import OrderedDict
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -862,6 +863,89 @@ class Attention(nn.Module):
             wv = state_dict.pop(prefix + "wv.weight")
             state_dict[prefix + "wqkv.weight"] = torch.cat([wq, wk, wv])
 
+    def _gqa_repeat_factor(self) -> int:
+        return self.n_head // self.n_local_heads
+
+    def _repeat_kv_for_gqa(self, tensor: Tensor) -> Tensor:
+        repeat_factor = self._gqa_repeat_factor()
+        if repeat_factor == 1:
+            return tensor
+        return tensor.repeat_interleave(repeat_factor, dim=1)
+
+    def _sdpa_with_optional_gqa(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        *,
+        attn_mask: Optional[Tensor] = None,
+        dropout_p: float = 0.0,
+        is_causal: bool = False,
+        force_math: bool = False,
+    ) -> Tensor:
+        enable_gqa = self.n_head != self.n_local_heads
+        context = sdpa_kernel(SDPBackend.MATH) if force_math else nullcontext()
+
+        call_kwargs = {
+            "dropout_p": dropout_p,
+            "is_causal": is_causal,
+        }
+        if attn_mask is not None:
+            call_kwargs["attn_mask"] = attn_mask
+
+        if enable_gqa:
+            try:
+                with context:
+                    return F.scaled_dot_product_attention(
+                        query,
+                        key,
+                        value,
+                        enable_gqa=True,
+                        **call_kwargs,
+                    )
+            except (TypeError, RuntimeError, NotImplementedError):
+                key = self._repeat_kv_for_gqa(key)
+                value = self._repeat_kv_for_gqa(value)
+
+        with context:
+            return F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                **call_kwargs,
+            )
+
+    def _math_attention(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attn_mask: Optional[Tensor] = None,
+        dropout_p: float = 0.0,
+    ) -> Tensor:
+        try:
+            return self._sdpa_with_optional_gqa(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=attn_mask is None,
+                force_math=True,
+            )
+        except RuntimeError:
+            if self.n_head != self.n_local_heads:
+                key = self._repeat_kv_for_gqa(key)
+                value = self._repeat_kv_for_gqa(value)
+
+            return self.eq_scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+            )
+
     def forward(
         self,
         x: Tensor,
@@ -891,21 +975,17 @@ class Attention(nn.Module):
         if self.kv_cache is not None:
             k, v = self.kv_cache.update(input_pos, k, v)
 
-        k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-        v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-
         if self.use_sdpa:
             if mask is None:
-                with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-                    y = F.scaled_dot_product_attention(
-                        q,
-                        k,
-                        v,
-                        dropout_p=self.dropout if self.training else 0.0,
-                        is_causal=True,
-                    )
+                y = self._sdpa_with_optional_gqa(
+                    q,
+                    k,
+                    v,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=True,
+                )
             else:
-                y = F.scaled_dot_product_attention(
+                y = self._sdpa_with_optional_gqa(
                     q,
                     k,
                     v,
@@ -913,7 +993,7 @@ class Attention(nn.Module):
                     dropout_p=self.dropout if self.training else 0.0,
                 )
         else:
-            y = self.eq_scaled_dot_product_attention(
+            y = self._math_attention(
                 q,
                 k,
                 v,

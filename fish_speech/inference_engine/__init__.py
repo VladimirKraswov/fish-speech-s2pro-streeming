@@ -785,11 +785,59 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         dac_thread.start()
 
         pending_audio: dict[int, AudioChunk] = {}
+        ready_to_send: list[AudioChunk] = []
         next_expected_sequence = 0
         segments: list[np.ndarray] = []
         produced_segments = 0
         terminal_signal: PipelineSignal | None = None
         sender_wait_since: float | None = None
+        start_buffer_chunks = (
+            0
+            if not req.streaming
+            else max(1, _env_int("FISH_STREAM_START_BUFFER_CHUNKS", 2))
+        )
+        playback_started = not req.streaming
+
+        def _fill_ready_chunks() -> None:
+            nonlocal next_expected_sequence
+            while next_expected_sequence in pending_audio:
+                ready_to_send.append(pending_audio.pop(next_expected_sequence))
+                next_expected_sequence += 1
+
+        def _emit_ready_chunks() -> Generator[InferenceResult, None, None]:
+            nonlocal ttfa_logged, produced_segments
+
+            while ready_to_send:
+                ready = ready_to_send.pop(0)
+
+                if not ttfa_logged:
+                    logger.info(
+                        "pipeline: ttfa req={} ttfa_ms={:.1f}",
+                        req_tag,
+                        (time.perf_counter() - t_start) * 1000.0,
+                    )
+                    ttfa_logged = True
+
+                logger.info(
+                    "sender: segment req={} sequence_id={} samples={} decode_ms={:.1f} microchunk={} codes_depth={} audio_depth={}",
+                    req_tag,
+                    ready.sequence_id,
+                    len(ready.audio),
+                    ready.decode_ms,
+                    ready.microchunk_size,
+                    codes_queue.qsize(),
+                    audio_queue.qsize(),
+                )
+
+                produced_segments += 1
+                if not req.streaming:
+                    segments.append(ready.audio)
+
+                yield InferenceResult(
+                    code="segment",
+                    audio=(sample_rate, ready.audio),
+                    error=None,
+                )
 
         try:
             if req.streaming and req.format == "wav":
@@ -804,6 +852,20 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                     item = audio_queue.get(timeout=QUEUE_POLL_TIMEOUT_SEC)
                     sender_wait_since = None
                 except queue.Empty:
+                    _fill_ready_chunks()
+
+                    if (
+                        req.streaming
+                        and not playback_started
+                        and ready_to_send
+                        and producer_done.is_set()
+                        and dac_done.is_set()
+                    ):
+                        playback_started = True
+
+                    if playback_started or not req.streaming:
+                        yield from _emit_ready_chunks()
+
                     if producer_done.is_set() and dac_done.is_set():
                         break
 
@@ -825,9 +887,9 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
                 if isinstance(item, PipelineSignal):
                     terminal_signal = item
-                    break
-
-                if not isinstance(item, AudioChunk):
+                    if item.kind != "eos":
+                        break
+                elif not isinstance(item, AudioChunk):
                     terminal_signal = PipelineSignal(
                         kind="error",
                         error=TypeError(
@@ -836,37 +898,27 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                         reason="invalid_audio_item",
                     )
                     break
+                else:
+                    pending_audio[item.sequence_id] = item
 
-                pending_audio[item.sequence_id] = item
-                while next_expected_sequence in pending_audio:
-                    ready = pending_audio.pop(next_expected_sequence)
-                    if not ttfa_logged:
-                        logger.info(
-                            "pipeline: ttfa req={} ttfa_ms={:.1f}",
-                            req_tag,
-                            (time.perf_counter() - t_start) * 1000.0,
-                        )
-                        ttfa_logged = True
+                _fill_ready_chunks()
 
-                    logger.info(
-                        "sender: segment req={} sequence_id={} samples={} decode_ms={:.1f} microchunk={} codes_depth={} audio_depth={}",
-                        req_tag,
-                        ready.sequence_id,
-                        len(ready.audio),
-                        ready.decode_ms,
-                        ready.microchunk_size,
-                        codes_queue.qsize(),
-                        audio_queue.qsize(),
+                if req.streaming and not playback_started:
+                    enough_buffered = len(ready_to_send) >= start_buffer_chunks
+                    should_force_start = (
+                        terminal_signal is not None
+                        and terminal_signal.kind == "eos"
+                        and len(ready_to_send) > 0
                     )
-                    yield InferenceResult(
-                        code="segment",
-                        audio=(sample_rate, ready.audio),
-                        error=None,
-                    )
-                    produced_segments += 1
-                    if not req.streaming:
-                        segments.append(ready.audio)
-                    next_expected_sequence += 1
+                    if enough_buffered or should_force_start:
+                        playback_started = True
+                    else:
+                        continue
+
+                yield from _emit_ready_chunks()
+
+                if terminal_signal is not None and terminal_signal.kind == "eos":
+                    break
 
             if terminal_signal is None and producer_done.is_set() and dac_done.is_set():
                 terminal_signal = PipelineSignal(kind="cancel", reason="pipeline_stopped")
@@ -906,24 +958,32 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                 error=None,
             )
         except GeneratorExit:
-            cancel_event.set()
-            self._safe_ack(
-                ack_queue,
-                ACK_ABORT,
-                req_tag=req_tag,
-                reason="generator_closed",
-            )
-            logger.info("pipeline: generator_closed req={}", req_tag)
+            normal_eos = terminal_signal is not None and terminal_signal.kind == "eos"
+            pipeline_settled = producer_done.is_set() and dac_done.is_set()
+
+            if not normal_eos and not pipeline_settled:
+                cancel_event.set()
+                self._safe_ack(
+                    ack_queue,
+                    ACK_ABORT,
+                    req_tag=req_tag,
+                    reason="generator_closed",
+                )
+                logger.info("pipeline: generator_closed req={}", req_tag)
+
             raise
         finally:
-            if terminal_signal is not None and terminal_signal.kind == "eos":
+            normal_eos = terminal_signal is not None and terminal_signal.kind == "eos"
+            pipeline_settled = producer_done.is_set() and dac_done.is_set()
+
+            if normal_eos:
                 self._safe_ack(
                     ack_queue,
                     ACK_CONTINUE,
                     req_tag=req_tag,
                     reason="inference_finally_eos",
                 )
-            else:
+            elif not pipeline_settled:
                 cancel_event.set()
                 self._safe_ack(
                     ack_queue,

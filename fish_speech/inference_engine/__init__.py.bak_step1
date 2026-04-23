@@ -106,7 +106,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                 logger.warning(f"set seed: {req.seed}")
 
             # Get the symbolic tokens from the LLAMA model
-            stream_tokens = bool(getattr(req, "stream_tokens", False))
+            stream_tokens = getattr(req, "stream_tokens", False) or req.streaming
             # Back-pressure: worker waits for ack after each chunk so DAC decode and LLM don't run on GPU concurrently (avoids OOM on 32 GB).
             ack_queue = queue.Queue() if stream_tokens else None
             response_queue = self.send_Llama_request(
@@ -306,7 +306,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
         # Prepare the request
         # When streaming API is used, enable token-level streaming for low TTFA
-        stream_tokens = bool(getattr(req, "stream_tokens", False))
+        stream_tokens = getattr(req, "stream_tokens", False) or req.streaming
         request = dict(
             device=self.decoder_model.device,
             req_tag=req_tag,

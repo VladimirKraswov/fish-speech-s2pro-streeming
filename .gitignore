@@ -73,8 +73,6 @@ filelists/
 
 # Audio Files
 # -----------
-*.wav
-*.mp3
 *.flac
 *.ogg
 *.m4a
@@ -85,7 +83,6 @@ filelists/
 *.npz
 *.pkl
 *.pickle
-*.lab
 /fish_speech/text/cmudict_cache.pickle
 
 # Cache and Temporary Files
@@ -121,6 +118,9 @@ asr-label*
 __pycache__/
 *.pyc
 *.log
-*.wav
 out.wav
 short.wav
+
+codebundle.txt
+bundle-code.js
+node_modules/

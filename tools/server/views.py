@@ -269,6 +269,10 @@ async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
     """
     Generate speech from text using TTS model.
     """
+    # Подстановка референса по умолчанию
+    if req.reference_id is None:
+        req.reference_id = "ref"
+
     try:
         # Get the model from the app
         app_state = request.app.state

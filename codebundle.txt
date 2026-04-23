@@ -1,8 +1,7 @@
-# codebundle.txt
 === CODE BUNDLE ===
 root: /Volumes/Extend/work/fish-speech-s2pro-streeming
 ignore: .codebundleignore
-generated: 2026-04-21T11:00:12.337Z
+generated: 2026-04-23T21:47:13.027Z
 
 
 
@@ -168,15 +167,6 @@ azure-pipelines.yml
 # .venv
 
 
-path: /.env
-----------------------------------------
-BACKEND=cuda
-COMPILE=0
-API_PORT=8080
-CUDA_VER=12.9.0
-UV_EXTRA=cu129
-
-
 path: /.gitignore
 ----------------------------------------
 # =============================================================================
@@ -307,102 +297,408 @@ out.wav
 short.wav
 
 
-path: /.pre-commit-config.yaml
-----------------------------------------
-ci:
-  autoupdate_schedule: monthly
-
-repos:
-  - repo: https://github.com/pycqa/isort
-    rev: 8.0.1
-    hooks:
-      - id: isort
-        args: [--profile=black]
-
-  - repo: https://github.com/psf/black-pre-commit-mirror
-    rev: 26.1.0
-    hooks:
-      - id: black
-
-  - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v6.0.0
-    hooks:
-      - id: end-of-file-fixer
-      - id: check-yaml
-      - id: check-json
-      - id: mixed-line-ending
-        args: ["--fix=lf"]
-      - id: check-added-large-files
-        args: ["--maxkb=5000"]
-
-
 path: /.project-root
 ----------------------------------------
 
 
 
-path: /.readthedocs.yaml
+path: /clear.py
 ----------------------------------------
-# Read the Docs configuration file for MkDocs projects
-# See https://docs.readthedocs.io/en/stable/config-file/v2.html for details
+# clear.py
+#!/usr/bin/env python3
+"""
+Скрипт для вычистки проекта Fish Speech до минимальной версии,
+необходимой для работы streaming API и прокси (скрипты up_5090.sh, run_proxy.sh).
 
-# Required
-version: 2
+Все удаляемые файлы и папки перемещаются в папку `temp` в корне проекта.
+Для каждого перемещаемого текстового файла в начало добавляется комментарий
+с его исходным полным путём от корня проекта перед перемещением.
+Файлы, которые нужно отредактировать (pyproject.toml, __init__.py и др.),
+копируются в `temp` (с добавлением пути), а затем заменяются минимальным содержимым.
+Для всех оставшихся текстовых файлов (не удаляемых и не редактируемых)
+также добавляется комментарий с путём (на месте).
+"""
 
-# Set the version of Python and other tools you might need
-build:
-  os: ubuntu-22.04
-  tools:
-    python: "3.12"
-
-mkdocs:
-  configuration: mkdocs.yml
-
-# Optionally declare the Python requirements required to build your docs
-python:
-  install:
-  - requirements: docs/requirements.txt
+import os
+import shutil
+import sys
+from pathlib import Path
+from typing import List, Tuple, Set
 
 
-path: /.vscode/c_cpp_properties.json
-----------------------------------------
-{
-  "configurations": [
-    {
-      "name": "STM32",
-      "includePath": [
-        "${workspaceFolder}/Core/Inc",
-        "${workspaceFolder}/Drivers/STM32F4xx_HAL_Driver/Inc",
-        "${workspaceFolder}/Drivers/CMSIS/Include",
-        "${workspaceFolder}/Drivers/CMSIS/Device/ST/STM32F4xx/Include",
-        "${workspaceFolder}/Drivers/STM32F4xx_HAL_Driver/Inc/Legacy"
-      ],
-      "defines": [
-        "USE_HAL_DRIVER",
-        "STM32F407xx"
-      ],
-      "compilerPath": "/Applications/STM32CubeIDE.app/Contents/Eclipse/plugins/com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32.13.3.rel1.macos64_1.0.100.202509120712/tools/bin/arm-none-eabi-gcc",
-      "cStandard": "c11",
-      "cppStandard": "c++17",
-      "intelliSenseMode": "gcc-arm",
-      "browse": {
-        "path": [
-          "${workspaceFolder}/Core/Inc",
-          "${workspaceFolder}/Drivers/STM32F4xx_HAL_Driver/Inc",
-          "${workspaceFolder}/Drivers/CMSIS/Include",
-          "${workspaceFolder}/Drivers/CMSIS/Device/ST/STM32F4xx/Include",
-          "${workspaceFolder}/Drivers/STM32F4xx_HAL_Driver/Inc/Legacy"
-        ],
-        "limitSymbolsToIncludedHeaders": true
-      }
-    }
+# ----------------------------------------------------------------------
+# Конфигурация
+# ----------------------------------------------------------------------
+# Список относительных путей (файлов и директорий), которые нужно ПОЛНОСТЬЮ УДАЛИТЬ (переместить в temp)
+DELETE_PATHS: List[str] = [
+    # Директории
+    "fish_speech/callbacks",
+    "fish_speech/datasets",
+    "fish_speech/text",
+    "fish_speech/configs/lora",
+    "docs",
+    "tests",
+    "tools/llama",
+    "tools/vqgan",
+    "tools/webui",
+    ".vscode",
+    ".github",
+    "__pycache__",       # удалить все __pycache__
+    # Файлы
+    "fish_speech/scheduler.py",
+    "fish_speech/train.py",
+    "fish_speech/utils/braceexpand.py",
+    "fish_speech/utils/rich_utils.py",
+    "fish_speech/utils/logging_utils.py",
+    "fish_speech/utils/instantiators.py",
+    "fish_speech/utils/spectrogram.py",
+    "fish_speech/configs/base.yaml",
+    "fish_speech/configs/text2semantic_finetune.yaml",
+    "inference.ipynb",
+    "mkdocs.yml",
+    ".readthedocs.yaml",
+    ".pre-commit-config.yaml",
+    "tools/run_webui.py",
+    "entrypoint.sh",
+    "dockerfile.dev",
+    "Makefile",
+    ".env",
+    ".project-root",
+    "pyrightconfig.json",
+    "scripts/e2e_smoke.sh",
+    "scripts/e2e_memory.sh",
+    "scripts/preencode.sh",
+    "scripts/upload_references.sh",
+    "scripts/ttfa_smoke.py",
+    "fish_speech/i18n.py",   # если не нужен webui
+]
+
+# Список файлов, которые нужно ОТРЕДАКТИРОВАТЬ (заменить содержимым из констант)
+EDIT_PATHS: List[str] = [
+    "pyproject.toml",
+    "fish_speech/utils/__init__.py",
+    "fish_speech/__init__.py",
+]
+
+# Минимальное содержимое для редактируемых файлов
+NEW_CONTENTS = {
+    "pyproject.toml": '''[project]
+name = "fish-speech"
+version = "2.0.0"
+description = "Fish Speech (streaming-only)"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "torch==2.8.0",
+    "torchaudio==2.8.0",
+    "transformers<=4.57.3",
+    "hydra-core>=1.3.2",
+    "omegaconf>=2.3.0",
+    "einops>=0.7.0",
+    "loguru>=0.6.0",
+    "pydantic==2.9.2",
+    "ormsgpack",
+    "uvicorn>=0.30.0",
+    "kui>=1.6.0",
+    "cachetools",
+    "safetensors",
+    "tiktoken>=0.8.0",
+    "click>=8.0.0",
+    "pyrootutils>=1.0.4",
+    "natsort>=8.4.0",
+    "soundfile>=0.12.0",
+    "fastapi",
+    "httpx",
+]
+
+[project.optional-dependencies]
+cpu = ["torch==2.8.0", "torchaudio"]
+cu126 = ["torch==2.8.0", "torchaudio"]
+cu128 = ["torch==2.8.0", "torchaudio"]
+cu129 = ["torch==2.8.0", "torchaudio"]
+
+[tool.uv]
+conflicts = [
+  [
+    { extra = "cpu" },
+    { extra = "cu126" },
+    { extra = "cu128" },
+    { extra = "cu129" },
   ],
-  "version": 4
+]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu126", extra = "cu126" },
+  { index = "pytorch-cu128", extra = "cu128" },
+  { index = "pytorch-cu129", extra = "cu129" },
+]
+torchaudio = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu126", extra = "cu126" },
+  { index = "pytorch-cu128", extra = "cu128" },
+  { index = "pytorch-cu129", extra = "cu129" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[build-system]
+requires = ["setuptools", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["fish_speech", "tools"]
+''',
+
+    "fish_speech/utils/__init__.py": '''from .context import autocast_exclude_mps
+from .file import get_latest_checkpoint
+from .logger import RankedLogger
+from .utils import extras, get_metric_value, set_seed, task_wrapper
+
+__all__ = [
+    "extras",
+    "get_metric_value",
+    "RankedLogger",
+    "task_wrapper",
+    "get_latest_checkpoint",
+    "autocast_exclude_mps",
+    "set_seed",
+]
+''',
+
+    "fish_speech/__init__.py": "# Minimal __init__ for streaming\n",
 }
+
+# Расширения текстовых файлов, в которые можно безопасно добавить комментарий
+TEXT_EXTENSIONS = {
+    ".py", ".yaml", ".yml", ".sh", ".md", ".txt", ".toml",
+    ".gitignore", ".dockerignore", ".env", "Dockerfile", "compose.yml", "compose.base.yml"
+}
+# Дополнительные имена файлов без расширения (например, Dockerfile)
+SPECIFIC_FILES = {"Dockerfile", "compose.yml", "compose.base.yml", ".gitignore", ".dockerignore", ".env"}
+
+
+# ----------------------------------------------------------------------
+# Вспомогательные функции
+# ----------------------------------------------------------------------
+def is_text_file(file_path: Path) -> bool:
+    """Определяет, является ли файл текстовым (по расширению или имени)."""
+    if file_path.name in SPECIFIC_FILES:
+        return True
+    if file_path.suffix in TEXT_EXTENSIONS:
+        return True
+    return False
+
+
+def add_path_comment(file_path: Path, root_dir: Path) -> None:
+    """Добавляет комментарий с относительным путём в начало текстового файла."""
+    if not is_text_file(file_path):
+        return
+
+    rel_path = file_path.relative_to(root_dir)
+    comment_line = f"# {rel_path}\n"
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            first_line = f.readline()
+    except (UnicodeDecodeError, OSError):
+        # Не текстовый или не читается – пропускаем
+        return
+
+    # Если уже есть такой комментарий в первой строке – пропускаем (чтобы не дублировать)
+    if first_line.rstrip("\n") == comment_line.rstrip("\n"):
+        return
+
+    # Читаем всё содержимое
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Записываем комментарий + оригинальное содержимое
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(comment_line)
+        f.write(content)
+
+
+def move_to_temp_with_path_comment(src_rel: str, root_dir: Path, temp_dir: Path) -> None:
+    """
+    Перемещает файл или директорию в temp_dir, сохраняя относительную структуру.
+    Для текстовых файлов перед перемещением добавляет комментарий с исходным путём.
+    """
+    src_path = root_dir / src_rel
+    if not src_path.exists():
+        print(f"⚠️  Пропуск: {src_rel} не существует")
+        return
+
+    dst_path = temp_dir / src_rel
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Если это файл и текстовый – добавить комментарий перед перемещением
+    if src_path.is_file() and is_text_file(src_path):
+        # Временно копируем, добавляем комментарий, затем перемещаем?
+        # Проще: прочитать оригинал, создать новый файл в temp с комментарием, затем удалить оригинал.
+        # Но по условию нужно переместить с подписью. Сделаем:
+        # 1. Прочитаем оригинал
+        with open(src_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        # 2. Сформируем новый контент с комментарием
+        rel_path = src_path.relative_to(root_dir)
+        comment_line = f"# {rel_path}\n"
+        new_content = comment_line + content
+        # 3. Запишем в целевой файл (уже внутри temp)
+        with open(dst_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        # 4. Удалим оригинал
+        src_path.unlink()
+        print(f"🗑️  Перемещён с подписью: {src_rel} -> {dst_path}")
+    else:
+        # Для бинарных или директорий – просто перемещаем
+        shutil.move(str(src_path), str(dst_path))
+        print(f"🗑️  Перемещён: {src_rel}")
+
+
+def remove_empty_dirs(root_dir: Path) -> None:
+    """Рекурсивно удаляет пустые директории."""
+    for dirpath, dirnames, filenames in os.walk(root_dir, topdown=False):
+        try:
+            if not dirnames and not filenames:
+                os.rmdir(dirpath)
+                print(f"🧹 Удалена пустая папка: {Path(dirpath).relative_to(root_dir)}")
+        except OSError:
+            pass
+
+
+# ----------------------------------------------------------------------
+# Основная функция
+# ----------------------------------------------------------------------
+def main():
+    # Определяем корень проекта (скрипт должен лежать в корне, либо передан аргумент)
+    if len(sys.argv) > 1:
+        root_dir = Path(sys.argv[1]).resolve()
+    else:
+        root_dir = Path(__file__).parent.resolve()
+
+    if not (root_dir / "fish_speech").exists():
+        print(f"❌ Ошибка: {root_dir} не похож на корень проекта Fish Speech (нет папки fish_speech)")
+        sys.exit(1)
+
+    print(f"📁 Корень проекта: {root_dir}")
+
+    # Создаём папку temp в корне
+    temp_dir = root_dir / "temp"
+    if temp_dir.exists():
+        print(f"⚠️  Папка {temp_dir} уже существует. Очищаем её...")
+        shutil.rmtree(temp_dir)
+    temp_dir.mkdir(parents=True)
+    print(f"📦 Создана временная папка: {temp_dir}")
+
+    # 1. Перемещаем все удаляемые пути в temp (с добавлением подписи)
+    print("\n--- 1. Перемещение ненужных файлов и папок в temp ---")
+    for rel_path in DELETE_PATHS:
+        # Если путь оканчивается на __pycache__, обработаем все такие папки рекурсивно
+        if rel_path == "__pycache__":
+            for pycache in root_dir.rglob("__pycache__"):
+                rel = pycache.relative_to(root_dir)
+                move_to_temp_with_path_comment(str(rel), root_dir, temp_dir)
+            continue
+        move_to_temp_with_path_comment(rel_path, root_dir, temp_dir)
+
+    # 2. Редактируем выбранные файлы (с сохранением копии в temp с подписью)
+    print("\n--- 2. Редактирование файлов ---")
+    for rel_path in EDIT_PATHS:
+        src_path = root_dir / rel_path
+        if not src_path.exists():
+            print(f"⚠️  Файл {rel_path} не существует, пропуск")
+            continue
+
+        # Создаём копию в temp с добавлением комментария (как при перемещении)
+        dst_backup = temp_dir / rel_path
+        dst_backup.parent.mkdir(parents=True, exist_ok=True)
+
+        # Копируем оригинал в temp (добавляем комментарий)
+        with open(src_path, "r", encoding="utf-8") as f:
+            original_content = f.read()
+        rel_for_comment = Path(rel_path)
+        comment_line = f"# {rel_for_comment}\n"
+        backup_content = comment_line + original_content
+        with open(dst_backup, "w", encoding="utf-8") as f:
+            f.write(backup_content)
+        print(f"📑 Копия с подписью сохранена: {rel_path} -> {dst_backup}")
+
+        # Заменяем содержимое оригинала минимальным содержимым
+        new_content = NEW_CONTENTS.get(rel_path)
+        if new_content is None:
+            print(f"⚠️  Не найдено новое содержимое для {rel_path}, пропуск")
+            continue
+
+        with open(src_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        print(f"✏️  Обновлён: {rel_path}")
+
+    # 2b. Удаляем пустые папки, которые могли образоваться после перемещения
+    print("\n--- 2b. Очистка пустых директорий ---")
+    remove_empty_dirs(root_dir)
+
+    # 3. Добавляем комментарий-путь во все оставшиеся текстовые файлы (которые не были перемещены и не редактировались)
+    print("\n--- 3. Добавление комментария с путём в оставшиеся файлы ---")
+    # Получаем множество путей, которые были обработаны (удалены или отредактированы)
+    processed = set(DELETE_PATHS) | set(EDIT_PATHS)
+    # Также добавим все сработавшие __pycache__ директории (их не нужно комментировать на месте, т.к. они удалены)
+    # Просто обойдём все файлы в корне, кроме temp
+    for file_path in root_dir.rglob("*"):
+        if file_path.is_dir():
+            continue
+        # Пропускаем файлы внутри temp
+        if temp_dir in file_path.parents:
+            continue
+        # Пропускаем .git
+        if ".git" in str(file_path):
+            continue
+        # Получаем относительный путь
+        try:
+            rel = file_path.relative_to(root_dir)
+        except ValueError:
+            continue
+        # Если файл в списке удаляемых или редактируемых – он уже обработан (удалён или обновлён)
+        # Но для отредактированных файлов мы уже заменили содержимое, и новое содержимое не содержит комментарий.
+        # Поэтому нужно добавить комментарий и для них (после замены).
+        if str(rel) in processed:
+            continue
+        # Для всех остальных – добавить комментарий
+        add_path_comment(file_path, root_dir)
+        print(f"📝 Добавлен путь: {rel}")
+
+    print("\n✅ Готово!")
+    print(f"   Все удалённые/заменённые файлы находятся в: {temp_dir}")
+    print("   Проект теперь содержит только минимальный набор для streaming.")
+    print("   *Внимание:* перед повторным запуском скрипта удалите папку temp или скрипт пересоздаст её заново.")
+
+
+if __name__ == "__main__":
+    main()
 
 
 path: /compose.base.yml
 ----------------------------------------
+# compose.base.yml
 services:
   app-base:
     build:
@@ -430,6 +726,7 @@ services:
 
 path: /compose.yml
 ----------------------------------------
+# compose.yml
 name: fish-speech
 
 services:
@@ -860,324 +1157,9 @@ RUN uv sync --extra ${UV_EXTRA} --dev
 ENTRYPOINT ["/bin/bash"]
 
 
-path: /dockerfile.dev
-----------------------------------------
-ARG VERSION=dev
-ARG BASE_IMAGE=ghcr.io/fishaudio/fish-speech:${VERSION}
-
-FROM ${BASE_IMAGE}
-
-ARG TOOLS="               \
-        git               \
-        curl              \
-        build-essential   \
-        ffmpeg            \
-        libsm6            \
-        libxext6          \
-        libjpeg-dev       \
-        zlib1g-dev        \
-        aria2             \
-        zsh               \
-        openssh-server    \
-        sudo              \
-        protobuf-compiler \
-        libasound-dev     \
-        portaudio19-dev   \
-        libportaudio2     \
-        libportaudiocpp0  \
-        cmake"
-
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    set -ex \
-    && apt-get update \
-    && apt-get -y install --no-install-recommends ${TOOLS}
-
-# Install oh-my-zsh so your terminal looks nice
-RUN sh -c "$(curl https://raw.githubusercontent.com/robbyrussell/oh-my-zsh/master/tools/install.sh)" "" --unattended
-
-# Set zsh as default shell
-RUN chsh -s /usr/bin/zsh
-ENV SHELL=/usr/bin/zsh
-
-
-path: /docs/assets/logo.svg
-----------------------------------------
-<svg xmlns="http://www.w3.org/2000/svg" version="1.2" viewBox="0 0 512 512" width="512" height="512">
-    <style>
-        .bar { fill: #000; }
-        .lbar { fill: #b1b3b4; }
-    </style>
-
-    <rect class="lbar" x="456.7" y="249.9" width="16" height="27.1" rx="8"/>
-    <rect class="lbar" x="424.7" y="256.6" width="16" height="47.4" rx="8"/>
-    <rect class="lbar" x="392.9" y="264.3" width="16" height="52.1" rx="8"/>
-    <rect class="lbar" x="360.9" y="270.7" width="16" height="51.6" rx="8"/>
-    <rect class="lbar" x="328.9" y="276.4" width="16" height="46" rx="8"/>
-    <rect class="lbar" x="297.1" y="299.3" width="16" height="21.4" rx="8"/>
-
-    <rect class="bar" x="38.1" y="200" width="16" height="19.4" rx="8"/>
-    <rect class="bar" x="71" y="202.7" width="16" height="30.7" rx="8"/>
-    <rect class="bar" x="103.9" y="198.4" width="16" height="77.4" rx="8"/>
-    <rect class="bar" x="136.9" y="192" width="16" height="20" rx="8"/>
-    <rect class="bar" x="136.9" y="245.4" width="16" height="58.3" rx="8"/>
-    <rect class="bar" x="424.7" y="185.2" width="16" height="60.2" rx="8"/>
-    <rect class="bar" x="392.9" y="178.1" width="16" height="75.4" rx="8"/>
-    <rect class="bar" x="360.9" y="175" width="16" height="86.6" rx="8"/>
-    <rect class="bar" x="328.9" y="177" width="16" height="87.8" rx="8"/>
-    <rect class="bar" x="297.1" y="181.9" width="16" height="107.1" rx="8"/>
-    <rect class="bar" x="264.5" y="190.2" width="16" height="120.1" rx="8"/>
-    <rect class="bar" x="232.6" y="204.1" width="16" height="115.8" rx="8"/>
-    <rect class="bar" x="200.6" y="222.4" width="16" height="102.2" rx="8"/>
-    <rect class="bar" x="456.7" y="204.1" width="16" height="38" rx="8"/>
-    <rect class="bar" x="168.6" y="235.1" width="16" height="100.8" rx="8"/>
-</svg>
-
-
-path: /docs/CNAME
-----------------------------------------
-speech.fish.audio
-
-
-path: /entrypoint.sh
-----------------------------------------
-#!/bin/bash
-
-CUDA_ENABLED=${CUDA_ENABLED:-true}
-DEVICE=""
-
-if [ "${CUDA_ENABLED}" != "true" ]; then
-    DEVICE="--device cpu"
-fi
-
-exec python tools/run_webui.py ${DEVICE}
-
-
-path: /fish_speech/callbacks/__init__.py
-----------------------------------------
-from .grad_norm import GradNormMonitor
-
-__all__ = ["GradNormMonitor"]
-
-
-path: /fish_speech/callbacks/grad_norm.py
-----------------------------------------
-from typing import Optional, Union
-
-import lightning.pytorch as pl
-import torch
-from lightning import LightningModule, Trainer
-from lightning.pytorch.callbacks import Callback
-from torch import Tensor, nn
-from torch.utils._foreach_utils import (
-    _group_tensors_by_device_and_dtype,
-    _has_foreach_support,
-)
-
-
-@torch.no_grad()
-def grad_norm(
-    parameters: Union[Tensor, list[Tensor]],
-    norm_type: float = 2.0,
-) -> float:
-    """
-    Returns the norm of the gradients of the given parameters.
-
-    Args:
-        parameters (Iterable[Tensor] or Tensor): an iterable of Tensors or a
-            single Tensor that will have gradients normalized
-        norm_type (float): type of the used p-norm.
-
-    Returns:
-        Total norm of the parameter gradients (viewed as a single vector).
-    """  # noqa: E501
-
-    if isinstance(parameters, Tensor):
-        parameters = [parameters]
-
-    grads = [p.grad for p in parameters if p.grad is not None]
-    if len(grads) == 0:
-        return None
-
-    first_device = grads[0].device
-    grouped_grads: dict[
-        tuple[torch.device, torch.dtype], list[list[Tensor]]
-    ] = _group_tensors_by_device_and_dtype(
-        [[g.detach() for g in grads]]
-    )  # type: ignore[assignment]
-
-    norms = []
-    for (device, _), ([grads], _) in grouped_grads.items():
-        if _has_foreach_support(grads, device=device):
-            norms.extend(torch._foreach_norm(grads, norm_type))
-        else:
-            norms.extend([torch.norm(g, norm_type) for g in grads])
-
-    return torch.norm(torch.stack([norm.to(first_device) for norm in norms]), norm_type)
-
-
-class GradNormMonitor(Callback):
-    """
-    Callback that computes the gradient norm of the model parameters.
-    """
-
-    def __init__(
-        self,
-        norm_type: float = 2.0,
-        logging_interval: str = "step",
-        sub_module: Optional[Union[str, list[str]]] = None,
-    ) -> None:
-        """
-        Args:
-            norm_type (float): type of the used p-norm.
-            logging_interval (str): "step" or "epoch".
-        """
-        super().__init__()
-
-        self.norm_type = norm_type
-        self.logging_interval = logging_interval
-        self.sub_module = sub_module
-
-    def on_after_backward(self, trainer: Trainer, model: LightningModule) -> None:
-        """
-        Computes the gradient norm of the model parameters and logs it to the logger.
-
-        Args:
-            trainer (Trainer): The trainer object
-            model (LightningModule): The current lightningModule
-        """
-
-        lightning_model = model
-
-        if self.sub_module is None:
-            return self.log_sub_module_grad_norm(lightning_model, model, "")
-
-        sub_modules = self.sub_module
-        if isinstance(sub_modules, str):
-            sub_modules = [sub_modules]
-
-        for sub_module in sub_modules:
-            self.log_sub_module_grad_norm(
-                lightning_model, getattr(model, sub_module), f"/{sub_module}"
-            )
-
-    def log_sub_module_grad_norm(
-        self, lightning_model: LightningModule, model: nn.Module, path: str
-    ) -> None:
-        grad_norm_val = grad_norm(model.parameters(), self.norm_type)
-        if grad_norm_val is None:
-            return
-
-        on_step = self.logging_interval == "step"
-        lightning_model.log(
-            f"train{path}/grad_norm",
-            grad_norm_val,
-            on_step=on_step,
-            on_epoch=not on_step,
-        )
-
-
-path: /fish_speech/configs/base.yaml
-----------------------------------------
-# Base configuration for training a model
-paths:
-  run_dir: results/${project}
-  ckpt_dir: ${paths.run_dir}/checkpoints
-
-hydra:
-  run:
-    dir: ${paths.run_dir}
-
-# Lightning Trainer
-trainer:
-  _target_: lightning.pytorch.trainer.Trainer
-
-  default_root_dir: ${paths.run_dir}
-  accelerator: gpu
-  num_nodes: 1
-  devices: auto
-  strategy:
-    _target_: lightning.pytorch.strategies.DDPStrategy
-    process_group_backend: nccl  # This should be override when training on windows
-
-  precision: bf16-mixed
-
-  # disable validation by epoch end
-  check_val_every_n_epoch: null
-  val_check_interval: 5000
-  max_steps: 100_000
-
-  # Use torch.backends.cudnn.benchmark to speed up training
-  benchmark: true
-
-# Callbacks
-callbacks:
-  model_checkpoint:
-    _target_: lightning.pytorch.callbacks.ModelCheckpoint
-    dirpath: ${paths.ckpt_dir}
-    filename: "step_{step:09d}"
-    save_last: false # additionally always save an exact copy of the last checkpoint to a file last.ckpt
-    save_top_k: 5 # save 5 latest checkpoints
-    monitor: step # use step to monitor checkpoints
-    mode: max # save the latest checkpoint with the highest global_step
-    every_n_epochs: null # don't save checkpoints by epoch end
-    every_n_train_steps: 5000 # save checkpoints every 5000 steps
-    auto_insert_metric_name: false
-
-  model_summary:
-    _target_: lightning.pytorch.callbacks.ModelSummary
-    max_depth: 2 # the maximum depth of layer nesting that the summary will include
-
-  learning_rate_monitor:
-    _target_: lightning.pytorch.callbacks.LearningRateMonitor
-    logging_interval: step
-    log_momentum: false
-
-  grad_norm_monitor:
-    _target_: fish_speech.callbacks.GradNormMonitor
-    norm_type: 2
-    logging_interval: step
-
-# Logger
-logger:
-  tensorboard:
-    _target_: lightning.pytorch.loggers.tensorboard.TensorBoardLogger
-    save_dir: "${paths.run_dir}/tensorboard/"
-    name: null
-    log_graph: false
-    default_hp_metric: true
-    prefix: ""
-
-  # wandb:
-  #   _target_: lightning.pytorch.loggers.wandb.WandbLogger
-  #   # name: "" # name of the run (normally generated by wandb)
-  #   save_dir: "${paths.run_dir}"
-  #   offline: False
-  #   id: null # pass correct id to resume experiment!
-  #   anonymous: null # enable anonymous logging
-  #   project: "fish-speech"
-  #   log_model: False # upload lightning ckpts
-  #   prefix: "" # a string to put at the beginning of metric keys
-  #   # entity: "" # set to name of your wandb team
-  #   group: ""
-  #   tags: ["vq", "hq", "finetune"]
-  #   job_type: ""
-    
-# Loop
-train: true
-test: false
-
-
-path: /fish_speech/configs/lora/r_8_alpha_16.yaml
-----------------------------------------
-_target_: fish_speech.models.text2semantic.lora.LoraConfig
-r: 8
-lora_alpha: 16
-lora_dropout: 0.01
-
-
 path: /fish_speech/configs/modded_dac_vq.yaml
 ----------------------------------------
+# fish_speech/configs/modded_dac_vq.yaml
 _target_: fish_speech.models.dac.modded_dac.DAC
 # Model setup
 sample_rate: 44100
@@ -1230,98 +1212,9 @@ quantizer:
   semantic_codebook_size: 4096
 
 
-path: /fish_speech/configs/text2semantic_finetune.yaml
-----------------------------------------
-defaults:
-  - base
-  - _self_
-
-project: text2semantic_finetune_dual_ar
-max_length: 4096
-pretrained_ckpt_path: checkpoints/openaudio-s1-mini
-
-# Lightning Trainer
-trainer:
-  accumulate_grad_batches: 1
-  gradient_clip_val: 1.0
-  gradient_clip_algorithm: "norm"
-  max_steps: 10000
-  precision: bf16-true
-  limit_val_batches: 10
-  val_check_interval: 100
-  # strategy:
-  #   find_unused_parameters: true
-  #   static_graph: true 
-
-# Dataset Configuration
-tokenizer:
-  _target_: fish_speech.tokenizer.FishTokenizer
-  model_path: ${pretrained_ckpt_path}/tokenizer.tiktoken
-
-# Dataset Configuration
-train_dataset:
-  _target_: fish_speech.datasets.semantic.AutoTextSemanticInstructionIterableDataset
-  proto_files:
-    - data/protos
-  tokenizer: ${tokenizer}
-  causal: true
-  max_length: ${max_length}
-  use_speaker: false
-  interactive_prob: 0.7
-
-val_dataset:
-  _target_: fish_speech.datasets.semantic.AutoTextSemanticInstructionIterableDataset
-  proto_files:
-    - data/protos
-  tokenizer: ${tokenizer}
-  causal: true
-  max_length: ${max_length}
-  use_speaker: false
-  interactive_prob: 0.7
-
-data:
-  _target_: fish_speech.datasets.semantic.SemanticDataModule
-  train_dataset: ${train_dataset}
-  val_dataset: ${val_dataset}
-  num_workers: 4
-  batch_size: 4
-  tokenizer: ${tokenizer}
-  max_length: ${max_length}
-
-# Model Configuration
-model:
-  _target_: fish_speech.models.text2semantic.lit_module.TextToSemantic
-  model: 
-    _target_: fish_speech.models.text2semantic.llama.BaseTransformer.from_pretrained
-    path: ${pretrained_ckpt_path}
-    load_weights: true
-    max_length: ${max_length}
-    lora_config: null
-
-  optimizer:
-    _target_: torch.optim.AdamW
-    _partial_: true
-    lr: 1e-4
-    weight_decay: 0
-    betas: [0.9, 0.95]
-    eps: 1e-5
-
-  lr_scheduler:
-    _target_: torch.optim.lr_scheduler.LambdaLR
-    _partial_: true
-    lr_lambda:
-      _target_: fish_speech.scheduler.get_constant_schedule_with_warmup_lr_lambda
-      _partial_: true
-      num_warmup_steps: 10
-
-# Callbacks
-callbacks:
-  model_checkpoint:
-    every_n_train_steps: ${trainer.val_check_interval}
-
-
 path: /fish_speech/content_sequence.py
 ----------------------------------------
+# fish_speech/content_sequence.py
 from dataclasses import dataclass, field
 from typing import List, Literal, Union
 
@@ -1729,6 +1622,7 @@ class ContentSequence:
 
 path: /fish_speech/conversation.py
 ----------------------------------------
+# fish_speech/conversation.py
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Literal
@@ -1907,6 +1801,7 @@ if __name__ == "__main__":
 
 path: /fish_speech/inference_engine/__init__.py
 ----------------------------------------
+# fish_speech/inference_engine/__init__.py
 import gc
 import os
 import queue
@@ -2229,7 +2124,8 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             prompt_tokens=prompt_tokens,
             prompt_text=prompt_texts,
             stream_tokens=stream_tokens,
-            stream_chunk_size=getattr(req, "stream_chunk_size", 20),
+            stream_chunk_size=getattr(req, "stream_chunk_size", 8),
+            initial_stream_chunk_size=getattr(req, "initial_stream_chunk_size", 10),
             ack_queue=ack_queue,
         )
 
@@ -2264,6 +2160,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
 path: /fish_speech/inference_engine/reference_loader.py
 ----------------------------------------
+# fish_speech/inference_engine/reference_loader.py
 import io
 from hashlib import sha256
 from pathlib import Path
@@ -2622,6 +2519,7 @@ class ReferenceLoader:
 
 path: /fish_speech/inference_engine/utils.py
 ----------------------------------------
+# fish_speech/inference_engine/utils.py
 import io
 import wave
 from dataclasses import dataclass
@@ -2655,6 +2553,7 @@ def wav_chunk_header(
 
 path: /fish_speech/inference_engine/vq_manager.py
 ----------------------------------------
+# fish_speech/inference_engine/vq_manager.py
 from typing import Callable
 
 import torch
@@ -2724,11 +2623,12 @@ class VQManager:
 
 path: /fish_speech/models/dac/__init__.py
 ----------------------------------------
-
+# fish_speech/models/dac/__init__.py
 
 
 path: /fish_speech/models/dac/inference.py
 ----------------------------------------
+# fish_speech/models/dac/inference.py
 from pathlib import Path
 
 import click
@@ -2859,6 +2759,7 @@ if __name__ == "__main__":
 
 path: /fish_speech/models/dac/modded_dac.py
 ----------------------------------------
+# fish_speech/models/dac/modded_dac.py
 import math
 import typing as tp
 from dataclasses import dataclass
@@ -3908,6 +3809,7 @@ if __name__ == "__main__":
 
 path: /fish_speech/models/dac/rvq.py
 ----------------------------------------
+# fish_speech/models/dac/rvq.py
 import math
 import typing as tp
 from dataclasses import dataclass
@@ -4311,11 +4213,12 @@ if __name__ == "__main__":
 
 path: /fish_speech/models/text2semantic/__init__.py
 ----------------------------------------
-
+# fish_speech/models/text2semantic/__init__.py
 
 
 path: /fish_speech/models/text2semantic/inference.py
 ----------------------------------------
+# fish_speech/models/text2semantic/inference.py
 import gc
 import os
 import queue
@@ -4540,12 +4443,20 @@ def decode_n_tokens(
     audio_parts: torch.Tensor,
     decode_one_token=decode_one_token_ar,
     stream_chunk_size: Optional[int] = None,
+    initial_stream_chunk_size: Optional[int] = None,
+    initial_token_chunk: Optional[torch.Tensor] = None,
     compile: bool = False,
 ) -> Iterator[torch.Tensor]:
     """
-    Generate tokens autoregressively. When stream_chunk_size is None, yields once
-    with the full tensor (backward compatible). When stream_chunk_size is set, yields
-    every stream_chunk_size tokens for low-TTFA streaming.
+    Generate tokens autoregressively.
+
+    Non-streaming mode:
+      - yields once with the full tensor (backward compatible)
+
+    Streaming mode:
+      - keeps the very first emitted chunk slightly larger than steady-state chunks,
+        so the browser/player has a safer startup buffer and starts playback earlier
+        without underrun.
     """
     need_normal_state = stream_chunk_size is not None
     # Streaming path: all state must be normal tensors (not inference tensors) so AOT
@@ -4573,7 +4484,25 @@ def decode_n_tokens(
         if need_normal_state
         else _prev_zeros
     )
+
     new_tokens: list[torch.Tensor] = []
+    first_chunk_emitted = stream_chunk_size is None
+
+    if stream_chunk_size is not None:
+        if initial_stream_chunk_size is None:
+            initial_stream_chunk_size = stream_chunk_size
+        initial_stream_chunk_size = max(1, int(initial_stream_chunk_size))
+        stream_chunk_size = max(1, int(stream_chunk_size))
+
+        if initial_token_chunk is not None:
+            if need_normal_state:
+                initial_token_chunk = cast(
+                    torch.Tensor, _to_normal_tensor(initial_token_chunk)
+                )
+            else:
+                initial_token_chunk = initial_token_chunk.detach().clone()
+            new_tokens.append(initial_token_chunk)
+
     # [MODIFIED] Pre-fetch ID for efficiency loop
     im_end_id = model.tokenizer.get_token_id(IM_END_TOKEN)
     do_stream_log = stream_chunk_size is not None
@@ -4657,16 +4586,22 @@ def decode_n_tokens(
             )[:, 0].clone()
         new_tokens.append(next_token)
 
-        if stream_chunk_size is not None and len(new_tokens) >= stream_chunk_size:
-            chunk_out = torch.cat(new_tokens, dim=1).detach().clone()
-            if do_stream_log:
-                logger.info(
-                    "stream: decode_n_tokens yielding chunk shape={} after iter={}",
-                    chunk_out.shape,
-                    i,
-                )
-            yield chunk_out
-            new_tokens = []
+        if stream_chunk_size is not None:
+            target_chunk_size = (
+                initial_stream_chunk_size if not first_chunk_emitted else stream_chunk_size
+            )
+            if len(new_tokens) >= target_chunk_size:
+                chunk_out = torch.cat(new_tokens, dim=1).detach().clone()
+                if do_stream_log:
+                    logger.info(
+                        "stream: decode_n_tokens yielding chunk shape={} after iter={} target_chunk_size={}",
+                        chunk_out.shape,
+                        i,
+                        target_chunk_size,
+                    )
+                yield chunk_out
+                new_tokens = []
+                first_chunk_emitted = True
 
         if cur_token[0, 0, -1] == im_end_id:
             if do_stream_log:
@@ -4788,13 +4723,14 @@ def generate(
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
     stream_chunk_size = sampling_kwargs.pop("stream_chunk_size", None)
+    initial_stream_chunk_size = sampling_kwargs.pop("initial_stream_chunk_size", None)
     compile = sampling_kwargs.pop("compile", False)
 
     decode_iter = decode_n_tokens(
         model,
         first_token.view(1, codebook_dim, -1),
         input_pos,
-        max_new_tokens - 1,
+        max(0, max_new_tokens - 1),
         temperature=temperature,
         top_p=top_p,
         top_k=top_k_val,
@@ -4803,23 +4739,28 @@ def generate(
         audio_parts=audio_parts,
         decode_one_token=decode_one_token,
         stream_chunk_size=stream_chunk_size,
+        initial_stream_chunk_size=initial_stream_chunk_size,
+        initial_token_chunk=first_token.clone() if stream_chunk_size is not None else None,
         compile=compile,
     )
 
     if stream_chunk_size is None:
-        # Non-streaming: single chunk from decode_n_tokens
-        x = next(iter(decode_iter))
+        # Non-streaming: single chunk from decode_n_tokens.
+        # When max_new_tokens == 1, decode_iter yields nothing, so just return the first token.
+        try:
+            x = next(iter(decode_iter))
+        except StopIteration:
+            seq = seq[:, : T + 1]
+            del first_token, prompt, empty, input_pos
+            return seq
         seq = seq[:, : T + 1 + x.size(1)]
         seq[:, T + 1 :] = x
         del first_token, x, prompt, empty, input_pos
         return seq
 
-    # Streaming: return a generator (no yield in this branch so generate() still returns when non-streaming)
-    def _stream():
-        yield first_token
-        yield from decode_iter
-
-    return _stream()
+    # Streaming: do NOT yield the single first token immediately.
+    # decode_n_tokens already buffers it and emits a larger first chunk.
+    return decode_iter
 
 
 def init_model(checkpoint_path, device, precision, compile=False):
@@ -5027,7 +4968,8 @@ def generate_long(
     prompt_text: Optional[Union[str, list[str]]] = None,
     prompt_tokens: Optional[Union[torch.Tensor, list[torch.Tensor]]] = None,
     stream_tokens: bool = False,
-    stream_chunk_size: int = 20,
+    stream_chunk_size: int = 8,
+    initial_stream_chunk_size: int = 10,
 ):
     assert 0 < top_p <= 1, "top_p must be in (0, 1]"
     assert 0 < temperature < 2, "temperature must be in (0, 2)"
@@ -5197,8 +5139,9 @@ def generate_long(
             if stream_tokens:
                 # Token-level streaming: yield chunks as they're generated for low TTFA
                 logger.info(
-                    "stream: generate_long starting token stream batch_idx={} stream_chunk_size={}",
+                    "stream: generate_long starting token stream batch_idx={} initial_stream_chunk_size={} stream_chunk_size={}",
                     batch_idx,
+                    initial_stream_chunk_size,
                     stream_chunk_size,
                 )
                 gen = generate(
@@ -5212,6 +5155,7 @@ def generate_long(
                     top_p=top_p,
                     top_k=top_k,
                     stream_chunk_size=stream_chunk_size,
+                    initial_stream_chunk_size=initial_stream_chunk_size,
                     compile=compile,
                 )
                 codes_list: list[torch.Tensor] = []
@@ -5400,8 +5344,9 @@ def launch_thread_safe_queue(
             put_count = 0
             if stream_tokens:
                 logger.info(
-                    "stream: worker got request req={} stream_chunk_size={}",
+                    "stream: worker got request req={} initial_stream_chunk_size={} stream_chunk_size={}",
                     req_tag,
+                    kwargs.get("initial_stream_chunk_size"),
                     kwargs.get("stream_chunk_size"),
                 )
 
@@ -5673,6 +5618,7 @@ if __name__ == "__main__":
 
 path: /fish_speech/models/text2semantic/lit_module.py
 ----------------------------------------
+# fish_speech/models/text2semantic/lit_module.py
 from typing import Any, Optional
 
 import lightning as L
@@ -5887,6 +5833,7 @@ class TextToSemantic(L.LightningModule):
 
 path: /fish_speech/models/text2semantic/llama.py
 ----------------------------------------
+# fish_speech/models/text2semantic/llama.py
 import dataclasses
 import json
 import math
@@ -6943,6 +6890,7 @@ def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
 
 path: /fish_speech/models/text2semantic/lora.py
 ----------------------------------------
+# fish_speech/models/text2semantic/lora.py
 from dataclasses import dataclass
 
 import loralib as lora
@@ -7036,100 +6984,9 @@ def get_merged_state_dict(model):
     return state_dict
 
 
-path: /fish_speech/scheduler.py
-----------------------------------------
-import math
-
-
-def get_cosine_schedule_with_warmup_lr_lambda(
-    current_step: int,
-    *,
-    num_warmup_steps: int | float,
-    num_training_steps: int,
-    num_cycles: float = 0.5,
-    final_lr_ratio: float = 0.0,
-):
-    if 0 < num_warmup_steps < 1:  # float mode
-        num_warmup_steps = int(num_warmup_steps * num_training_steps)
-
-    if current_step < num_warmup_steps:
-        return float(current_step) / float(max(1, num_warmup_steps))
-
-    progress = float(current_step - num_warmup_steps) / float(
-        max(1, num_training_steps - num_warmup_steps)
-    )
-
-    return max(
-        final_lr_ratio,
-        0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)),
-    )
-
-
-def get_constant_schedule_with_warmup_lr_lambda(
-    current_step: int,
-    *,
-    num_warmup_steps: int | float,
-    num_training_steps: int | None = None,
-):
-    if 0 < num_warmup_steps < 1:  # float mode
-        num_warmup_steps = int(num_warmup_steps * num_training_steps)
-
-    if current_step < num_warmup_steps:
-        return float(current_step) / float(max(1, num_warmup_steps))
-
-    return 1.0
-
-
-path: /fish_speech/text/__init__.py
-----------------------------------------
-from .clean import clean_text
-
-__all__ = ["clean_text"]
-
-
-path: /fish_speech/text/clean.py
-----------------------------------------
-import re
-
-SYMBOLS_MAPPING = {
-    "‘": "'",
-    "’": "'",
-}
-
-REPLACE_SYMBOL_REGEX = re.compile(
-    "|".join(re.escape(p) for p in SYMBOLS_MAPPING.keys())
-)
-
-
-EMOJI_REGEX = re.compile(
-    "["
-    "\U0001f600-\U0001f64f"  # emoticons
-    "\U0001f300-\U0001f5ff"  # symbols & pictographs
-    "\U0001f680-\U0001f6ff"  # transport & map symbols
-    "\U0001f1e0-\U0001f1ff"  # flags (iOS)
-    "]+",
-    flags=re.UNICODE,
-)
-
-
-def clean_text(text):
-    # Clean the text
-    text = text.strip()
-
-    # Replace all chinese symbols with their english counterparts
-    text = REPLACE_SYMBOL_REGEX.sub(lambda x: SYMBOLS_MAPPING[x.group()], text)
-
-    # Remove emojis
-    text = EMOJI_REGEX.sub(r"", text)
-
-    # Remove continuous periods (...) and commas (,,,)
-    text = re.sub(r"[,]{2,}", lambda m: m.group()[0], text)
-
-    return text
-
-
 path: /fish_speech/tokenizer.py
 ----------------------------------------
+# fish_speech/tokenizer.py
 import json
 import logging
 from pathlib import Path
@@ -7261,402 +7118,27 @@ class FishTokenizer:
         return getattr(self._tokenizer, name)
 
 
-path: /fish_speech/train.py
-----------------------------------------
-import os
-
-os.environ["USE_LIBUV"] = "0"
-import sys
-from typing import Optional
-
-import hydra
-import lightning as L
-import pyrootutils
-import torch
-from lightning import Callback, LightningDataModule, LightningModule, Trainer
-from lightning.pytorch.loggers import Logger
-from lightning.pytorch.strategies import DDPStrategy
-from omegaconf import DictConfig, OmegaConf
-
-os.environ.pop("SLURM_NTASKS", None)
-os.environ.pop("SLURM_JOB_NAME", None)
-os.environ.pop("SLURM_NTASKS_PER_NODE", None)
-
-# register eval resolver and root
-pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
-
-# Allow TF32 on Ampere GPUs
-torch.set_float32_matmul_precision("high")
-torch.backends.cudnn.allow_tf32 = True
-
-# register eval resolver
-OmegaConf.register_new_resolver("eval", eval)
-
-import fish_speech.utils as utils
-
-log = utils.RankedLogger(__name__, rank_zero_only=True)
-
-
-@utils.task_wrapper
-def train(cfg: DictConfig) -> tuple[dict, dict]:
-    """Trains the model. Can additionally evaluate on a testset, using best weights obtained during
-    training.
-    This method is wrapped in optional @task_wrapper decorator, that controls the behavior during
-    failure. Useful for multiruns, saving info about the crash, etc.
-    Args:
-        cfg (DictConfig): Configuration composed by Hydra.
-    Returns:
-        Tuple[dict, dict]: Dict with metrics and dict with all instantiated objects.
-    """  # noqa: E501
-
-    # set seed for random number generators in pytorch, numpy and python.random
-    if cfg.get("seed"):
-        L.seed_everything(cfg.seed, workers=False)
-
-    if cfg.get("deterministic"):
-        torch.use_deterministic_algorithms(True)
-
-    log.info(f"Instantiating datamodule <{cfg.data._target_}>")
-    datamodule: LightningDataModule = hydra.utils.instantiate(cfg.data)
-
-    log.info(f"Instantiating model <{cfg.model._target_}>")
-    model: LightningModule = hydra.utils.instantiate(cfg.model)
-
-    log.info("Instantiating callbacks...")
-    callbacks: list[Callback] = utils.instantiate_callbacks(cfg.get("callbacks"))
-
-    log.info("Instantiating loggers...")
-    logger: list[Logger] = utils.instantiate_loggers(cfg.get("logger"))
-
-    log.info(f"Instantiating trainer <{cfg.trainer._target_}>")
-    trainer: Trainer = hydra.utils.instantiate(
-        cfg.trainer,
-        callbacks=callbacks,
-        logger=logger,
-    )
-
-    object_dict = {
-        "cfg": cfg,
-        "datamodule": datamodule,
-        "model": model,
-        "callbacks": callbacks,
-        "logger": logger,
-        "trainer": trainer,
-    }
-
-    if logger:
-        log.info("Logging hyperparameters!")
-        utils.log_hyperparameters(object_dict)
-
-    if cfg.get("train"):
-        log.info("Starting training!")
-
-        ckpt_path = cfg.get("ckpt_path")
-        auto_resume = False
-
-        resume_ckpt_path = utils.get_latest_checkpoint(cfg.paths.ckpt_dir)
-        if resume_ckpt_path is not None:
-            ckpt_path = resume_ckpt_path
-            auto_resume = True
-
-        if ckpt_path is not None:
-            log.info(f"Resuming from checkpoint: {ckpt_path}")
-
-        # resume weights only is disabled for auto-resume
-        if cfg.get("resume_weights_only") and auto_resume is False:
-            log.info("Resuming weights only!")
-            ckpt = torch.load(ckpt_path, map_location=model.device)
-            if "state_dict" in ckpt:
-                ckpt = ckpt["state_dict"]
-            err = model.load_state_dict(ckpt, strict=False)
-            log.info(f"Error loading state dict: {err}")
-            ckpt_path = None
-
-        trainer.fit(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
-
-    train_metrics = trainer.callback_metrics
-
-    if cfg.get("test"):
-        log.info("Starting testing!")
-        ckpt_path = trainer.checkpoint_callback.best_model_path
-        if ckpt_path == "":
-            log.warning("Best ckpt not found! Using current weights for testing...")
-            ckpt_path = cfg.get("ckpt_path")
-
-        trainer.test(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
-        log.info(f"Best ckpt path: {ckpt_path}")
-
-    test_metrics = trainer.callback_metrics
-
-    # merge train and test metrics
-    metric_dict = {**train_metrics, **test_metrics}
-
-    return metric_dict, object_dict
-
-
-@hydra.main(
-    version_base="1.3", config_path="./configs", config_name="llama_pretrain.yaml"
-)
-def main(cfg: DictConfig) -> Optional[float]:
-    # train the model
-    train(cfg)
-
-
-if __name__ == "__main__":
-    main()
-
-
 path: /fish_speech/utils/__init__.py
 ----------------------------------------
-from .braceexpand import braceexpand
 from .context import autocast_exclude_mps
 from .file import get_latest_checkpoint
-from .instantiators import instantiate_callbacks, instantiate_loggers
 from .logger import RankedLogger
-from .logging_utils import log_hyperparameters
-from .rich_utils import enforce_tags, print_config_tree
 from .utils import extras, get_metric_value, set_seed, task_wrapper
 
 __all__ = [
-    "enforce_tags",
     "extras",
     "get_metric_value",
     "RankedLogger",
-    "instantiate_callbacks",
-    "instantiate_loggers",
-    "log_hyperparameters",
-    "print_config_tree",
     "task_wrapper",
-    "braceexpand",
     "get_latest_checkpoint",
     "autocast_exclude_mps",
     "set_seed",
 ]
 
 
-path: /fish_speech/utils/braceexpand.py
-----------------------------------------
-"""
-Bash-style brace expansion
-Copied from: https://github.com/trendels/braceexpand/blob/main/src/braceexpand/__init__.py
-License: MIT
-"""
-
-import re
-import string
-from itertools import chain, product
-from typing import Iterable, Iterator, Optional
-
-__all__ = ["braceexpand", "alphabet", "UnbalancedBracesError"]
-
-
-class UnbalancedBracesError(ValueError):
-    pass
-
-
-alphabet = string.ascii_uppercase + string.ascii_lowercase
-
-int_range_re = re.compile(r"^(-?\d+)\.\.(-?\d+)(?:\.\.-?(\d+))?$")
-char_range_re = re.compile(r"^([A-Za-z])\.\.([A-Za-z])(?:\.\.-?(\d+))?$")
-escape_re = re.compile(r"\\(.)")
-
-
-def braceexpand(pattern: str, escape: bool = True) -> Iterator[str]:
-    """braceexpand(pattern) -> iterator over generated strings
-
-    Returns an iterator over the strings resulting from brace expansion
-    of pattern. This function implements Brace Expansion as described in
-    bash(1), with the following limitations:
-
-    * A pattern containing unbalanced braces will raise an
-      UnbalancedBracesError exception. In bash, unbalanced braces will either
-      be partly expanded or ignored.
-
-    * A mixed-case character range like '{Z..a}' or '{a..Z}' will not
-      include the characters '[]^_`' between 'Z' and 'a'.
-
-    When escape is True (the default), characters in pattern can be
-    prefixed with a backslash to cause them not to be interpreted as
-    special characters for brace expansion (such as '{', '}', ',').
-    To pass through a a literal backslash, double it ('\\\\').
-
-    When escape is False, backslashes in pattern have no special
-    meaning and will be preserved in the output.
-
-    Examples:
-
-    >>> from braceexpand import braceexpand
-
-    # Integer range
-    >>> list(braceexpand('item{1..3}'))
-    ['item1', 'item2', 'item3']
-
-    # Character range
-    >>> list(braceexpand('{a..c}'))
-    ['a', 'b', 'c']
-
-    # Sequence
-    >>> list(braceexpand('index.html{,.backup}'))
-    ['index.html', 'index.html.backup']
-
-    # Nested patterns
-    >>> list(braceexpand('python{2.{5..7},3.{2,3}}'))
-    ['python2.5', 'python2.6', 'python2.7', 'python3.2', 'python3.3']
-
-    # Prefixing an integer with zero causes all numbers to be padded to
-    # the same width.
-    >>> list(braceexpand('{07..10}'))
-    ['07', '08', '09', '10']
-
-    # An optional increment can be specified for ranges.
-    >>> list(braceexpand('{a..g..2}'))
-    ['a', 'c', 'e', 'g']
-
-    # Ranges can go in both directions.
-    >>> list(braceexpand('{4..1}'))
-    ['4', '3', '2', '1']
-
-    # Numbers can be negative
-    >>> list(braceexpand('{2..-1}'))
-    ['2', '1', '0', '-1']
-
-    # Unbalanced braces raise an exception.
-    >>> list(braceexpand('{1{2,3}'))
-    Traceback (most recent call last):
-        ...
-    UnbalancedBracesError: Unbalanced braces: '{1{2,3}'
-
-    # By default, the backslash is the escape character.
-    >>> list(braceexpand(r'{1\\{2,3}'))
-    ['1{2', '3']
-
-    # Setting 'escape' to False disables backslash escaping.
-    >>> list(braceexpand(r'\\{1,2}', escape=False))
-    ['\\\\1', '\\\\2']
-
-    """
-    return (
-        escape_re.sub(r"\1", s) if escape else s for s in parse_pattern(pattern, escape)
-    )
-
-
-def parse_pattern(pattern: str, escape: bool) -> Iterator[str]:
-    start = 0
-    pos = 0
-    bracketdepth = 0
-    items: list[Iterable[str]] = []
-
-    # print 'pattern:', pattern
-    while pos < len(pattern):
-        if escape and pattern[pos] == "\\":
-            pos += 2
-            continue
-        elif pattern[pos] == "{":
-            if bracketdepth == 0 and pos > start:
-                # print 'literal:', pattern[start:pos]
-                items.append([pattern[start:pos]])
-                start = pos
-            bracketdepth += 1
-        elif pattern[pos] == "}":
-            bracketdepth -= 1
-            if bracketdepth == 0:
-                # print 'expression:', pattern[start+1:pos]
-                expr = pattern[start + 1 : pos]
-                item = parse_expression(expr, escape)
-                if item is None:  # not a range or sequence
-                    items.extend([["{"], parse_pattern(expr, escape), ["}"]])
-                else:
-                    items.append(item)
-                start = pos + 1  # skip the closing brace
-        pos += 1
-
-    if bracketdepth != 0:  # unbalanced braces
-        raise UnbalancedBracesError("Unbalanced braces: '%s'" % pattern)
-
-    if start < pos:
-        items.append([pattern[start:]])
-
-    return ("".join(item) for item in product(*items))
-
-
-def parse_expression(expr: str, escape: bool) -> Optional[Iterable[str]]:
-    int_range_match = int_range_re.match(expr)
-    if int_range_match:
-        return make_int_range(*int_range_match.groups())
-
-    char_range_match = char_range_re.match(expr)
-    if char_range_match:
-        return make_char_range(*char_range_match.groups())
-
-    return parse_sequence(expr, escape)
-
-
-def parse_sequence(seq: str, escape: bool) -> Optional[Iterator[str]]:
-    # sequence -> chain(*sequence_items)
-    start = 0
-    pos = 0
-    bracketdepth = 0
-    items: list[Iterable[str]] = []
-
-    # print 'sequence:', seq
-    while pos < len(seq):
-        if escape and seq[pos] == "\\":
-            pos += 2
-            continue
-        elif seq[pos] == "{":
-            bracketdepth += 1
-        elif seq[pos] == "}":
-            bracketdepth -= 1
-        elif seq[pos] == "," and bracketdepth == 0:
-            items.append(parse_pattern(seq[start:pos], escape))
-            start = pos + 1  # skip the comma
-        pos += 1
-
-    if bracketdepth != 0:
-        raise UnbalancedBracesError
-    if not items:
-        return None
-
-    # part after the last comma (may be the empty string)
-    items.append(parse_pattern(seq[start:], escape))
-    return chain(*items)
-
-
-def make_int_range(left: str, right: str, incr: Optional[str] = None) -> Iterator[str]:
-    if any([s.startswith(("0", "-0")) for s in (left, right) if s not in ("0", "-0")]):
-        padding = max(len(left), len(right))
-    else:
-        padding = 0
-    step = (int(incr) or 1) if incr else 1
-    start = int(left)
-    end = int(right)
-    r = range(start, end + 1, step) if start < end else range(start, end - 1, -step)
-    fmt = "%0{}d".format(padding)
-    return (fmt % i for i in r)
-
-
-def make_char_range(left: str, right: str, incr: Optional[str] = None) -> str:
-    step = (int(incr) or 1) if incr else 1
-    start = alphabet.index(left)
-    end = alphabet.index(right)
-    if start < end:
-        return alphabet[start : end + 1 : step]
-    else:
-        end = end or -len(alphabet)
-        return alphabet[start : end - 1 : -step]
-
-
-if __name__ == "__main__":
-    import doctest
-    import sys
-
-    failed, _ = doctest.testmod(optionflags=doctest.IGNORE_EXCEPTION_DETAIL)
-    if failed:
-        sys.exit(1)
-
-
 path: /fish_speech/utils/context.py
 ----------------------------------------
+# fish_speech/utils/context.py
 from contextlib import nullcontext
 
 import torch
@@ -7674,6 +7156,7 @@ def autocast_exclude_mps(
 
 path: /fish_speech/utils/file.py
 ----------------------------------------
+# fish_speech/utils/file.py
 import os
 from pathlib import Path
 from typing import Union
@@ -7815,62 +7298,9 @@ def load_filelist(path: Path | str) -> list[tuple[Path, str, str, str]]:
     return results
 
 
-path: /fish_speech/utils/instantiators.py
-----------------------------------------
-from typing import List
-
-import hydra
-from omegaconf import DictConfig
-from pytorch_lightning import Callback
-from pytorch_lightning.loggers import Logger
-
-from .logger import RankedLogger
-
-log = RankedLogger(__name__, rank_zero_only=True)
-
-
-def instantiate_callbacks(callbacks_cfg: DictConfig) -> List[Callback]:
-    """Instantiates callbacks from config."""
-
-    callbacks: List[Callback] = []
-
-    if not callbacks_cfg:
-        log.warning("No callback configs found! Skipping..")
-        return callbacks
-
-    if not isinstance(callbacks_cfg, DictConfig):
-        raise TypeError("Callbacks config must be a DictConfig!")
-
-    for _, cb_conf in callbacks_cfg.items():
-        if isinstance(cb_conf, DictConfig) and "_target_" in cb_conf:
-            log.info(f"Instantiating callback <{cb_conf._target_}>")
-            callbacks.append(hydra.utils.instantiate(cb_conf))
-
-    return callbacks
-
-
-def instantiate_loggers(logger_cfg: DictConfig) -> List[Logger]:
-    """Instantiates loggers from config."""
-
-    logger: List[Logger] = []
-
-    if not logger_cfg:
-        log.warning("No logger configs found! Skipping...")
-        return logger
-
-    if not isinstance(logger_cfg, DictConfig):
-        raise TypeError("Logger config must be a DictConfig!")
-
-    for _, lg_conf in logger_cfg.items():
-        if isinstance(lg_conf, DictConfig) and "_target_" in lg_conf:
-            log.info(f"Instantiating logger <{lg_conf._target_}>")
-            logger.append(hydra.utils.instantiate(lg_conf))
-
-    return logger
-
-
 path: /fish_speech/utils/logger.py
 ----------------------------------------
+# fish_speech/utils/logger.py
 import logging
 from typing import Mapping, Optional
 
@@ -7928,164 +7358,9 @@ class RankedLogger(logging.LoggerAdapter):
                     self.logger.log(level, msg, *args, **kwargs)
 
 
-path: /fish_speech/utils/logging_utils.py
-----------------------------------------
-from lightning.pytorch.utilities import rank_zero_only
-
-from fish_speech.utils import logger as log
-
-
-@rank_zero_only
-def log_hyperparameters(object_dict: dict) -> None:
-    """Controls which config parts are saved by lightning loggers.
-
-    Additionally saves:
-    - Number of model parameters
-    """
-
-    hparams = {}
-
-    cfg = object_dict["cfg"]
-    model = object_dict["model"]
-    trainer = object_dict["trainer"]
-
-    if not trainer.logger:
-        log.warning("Logger not found! Skipping hyperparameter logging...")
-        return
-
-    hparams["model"] = cfg["model"]
-
-    # save number of model parameters
-    hparams["model/params/total"] = sum(p.numel() for p in model.parameters())
-    hparams["model/params/trainable"] = sum(
-        p.numel() for p in model.parameters() if p.requires_grad
-    )
-    hparams["model/params/non_trainable"] = sum(
-        p.numel() for p in model.parameters() if not p.requires_grad
-    )
-
-    hparams["data"] = cfg["data"]
-    hparams["trainer"] = cfg["trainer"]
-
-    hparams["callbacks"] = cfg.get("callbacks")
-    hparams["extras"] = cfg.get("extras")
-
-    hparams["task_name"] = cfg.get("task_name")
-    hparams["tags"] = cfg.get("tags")
-    hparams["ckpt_path"] = cfg.get("ckpt_path")
-    hparams["seed"] = cfg.get("seed")
-
-    # send hparams to all loggers
-    for logger in trainer.loggers:
-        logger.log_hyperparams(hparams)
-
-
-path: /fish_speech/utils/rich_utils.py
-----------------------------------------
-from pathlib import Path
-from typing import Sequence
-
-import rich
-import rich.syntax
-import rich.tree
-from hydra.core.hydra_config import HydraConfig
-from lightning.pytorch.utilities import rank_zero_only
-from omegaconf import DictConfig, OmegaConf, open_dict
-from rich.prompt import Prompt
-
-from fish_speech.utils import logger as log
-
-
-@rank_zero_only
-def print_config_tree(
-    cfg: DictConfig,
-    print_order: Sequence[str] = (
-        "data",
-        "model",
-        "callbacks",
-        "logger",
-        "trainer",
-        "paths",
-        "extras",
-    ),
-    resolve: bool = False,
-    save_to_file: bool = False,
-) -> None:
-    """Prints content of DictConfig using Rich library and its tree structure.
-
-    Args:
-        cfg (DictConfig): Configuration composed by Hydra.
-        print_order (Sequence[str], optional): Determines in what order config components are printed.
-        resolve (bool, optional): Whether to resolve reference fields of DictConfig.
-        save_to_file (bool, optional): Whether to export config to the hydra output folder.
-    """  # noqa: E501
-
-    style = "dim"
-    tree = rich.tree.Tree("CONFIG", style=style, guide_style=style)
-
-    queue = []
-
-    # add fields from `print_order` to queue
-    for field in print_order:
-        (
-            queue.append(field)
-            if field in cfg
-            else log.warning(
-                f"Field '{field}' not found in config. "
-                + f"Skipping '{field}' config printing..."
-            )
-        )
-
-    # add all the other fields to queue (not specified in `print_order`)
-    for field in cfg:
-        if field not in queue:
-            queue.append(field)
-
-    # generate config tree from queue
-    for field in queue:
-        branch = tree.add(field, style=style, guide_style=style)
-
-        config_group = cfg[field]
-        if isinstance(config_group, DictConfig):
-            branch_content = OmegaConf.to_yaml(config_group, resolve=resolve)
-        else:
-            branch_content = str(config_group)
-
-        branch.add(rich.syntax.Syntax(branch_content, "yaml"))
-
-    # print config tree
-    rich.print(tree)
-
-    # save config tree to file
-    if save_to_file:
-        with open(Path(cfg.paths.output_dir, "config_tree.log"), "w") as file:
-            rich.print(tree, file=file)
-
-
-@rank_zero_only
-def enforce_tags(cfg: DictConfig, save_to_file: bool = False) -> None:
-    """Prompts user to input tags from command line if no tags are provided in config."""  # noqa: E501
-
-    if not cfg.get("tags"):
-        if "id" in HydraConfig().cfg.hydra.job:
-            raise ValueError("Specify tags before launching a multirun!")
-
-        log.warning("No tags provided in config. Prompting user to input tags...")
-        tags = Prompt.ask("Enter a list of comma separated tags", default="dev")
-        tags = [t.strip() for t in tags.split(",") if t != ""]
-
-        with open_dict(cfg):
-            cfg.tags = tags
-
-        log.info(f"Tags: {cfg.tags}")
-
-    if save_to_file:
-        with open(Path(cfg.paths.output_dir, "tags.log"), "w") as file:
-            rich.print(cfg.tags, file=file)
-
-
 path: /fish_speech/utils/schema.py
 ----------------------------------------
+# fish_speech/utils/schema.py
 import base64
 import os
 import queue
@@ -8185,7 +7460,10 @@ class ServeTTSRequest(BaseModel):
     streaming: bool = False
     # When True, stream token chunks (low TTFA) instead of splitting text into batches
     stream_tokens: bool = False
-    stream_chunk_size: Annotated[int, conint(ge=1, le=200, strict=True)] = 20
+    # steady-state chunk size after the first emission
+    stream_chunk_size: Annotated[int, conint(ge=1, le=200, strict=True)] = 8
+    # first chunk is intentionally a bit larger so the browser/player has safer startup buffer
+    initial_stream_chunk_size: Annotated[int, conint(ge=1, le=200, strict=True)] = 10
     max_new_tokens: int = 512
     top_p: Annotated[float, Field(ge=0.1, le=1.0, strict=True)] = 0.8
     repetition_penalty: Annotated[float, Field(ge=0.9, le=2.0, strict=True)] = 1.1
@@ -8234,136 +7512,9 @@ class UpdateReferenceResponse(BaseModel):
     new_reference_id: str
 
 
-path: /fish_speech/utils/spectrogram.py
-----------------------------------------
-import torch
-import torchaudio.functional as F
-from torch import Tensor, nn
-from torchaudio.transforms import MelScale
-
-
-class LinearSpectrogram(nn.Module):
-    def __init__(
-        self,
-        n_fft=2048,
-        win_length=2048,
-        hop_length=512,
-        center=False,
-        mode="pow2_sqrt",
-    ):
-        super().__init__()
-
-        self.n_fft = n_fft
-        self.win_length = win_length
-        self.hop_length = hop_length
-        self.center = center
-        self.mode = mode
-        self.return_complex = True
-
-        self.register_buffer("window", torch.hann_window(win_length), persistent=False)
-
-    def forward(self, y: Tensor) -> Tensor:
-        if y.ndim == 3:
-            y = y.squeeze(1)
-
-        y = torch.nn.functional.pad(
-            y.unsqueeze(1),
-            (
-                (self.win_length - self.hop_length) // 2,
-                (self.win_length - self.hop_length + 1) // 2,
-            ),
-            mode="reflect",
-        ).squeeze(1)
-
-        spec = torch.stft(
-            y,
-            self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.win_length,
-            window=self.window,
-            center=self.center,
-            pad_mode="reflect",
-            normalized=False,
-            onesided=True,
-            return_complex=self.return_complex,
-        )
-
-        if self.return_complex:
-            spec = torch.view_as_real(spec)
-
-        if self.mode == "pow2_sqrt":
-            spec = torch.sqrt(spec.pow(2).sum(-1) + 1e-6)
-
-        return spec
-
-
-class LogMelSpectrogram(nn.Module):
-    def __init__(
-        self,
-        sample_rate=44100,
-        n_fft=2048,
-        win_length=2048,
-        hop_length=512,
-        n_mels=128,
-        center=False,
-        f_min=0.0,
-        f_max=None,
-    ):
-        super().__init__()
-
-        self.sample_rate = sample_rate
-        self.n_fft = n_fft
-        self.win_length = win_length
-        self.hop_length = hop_length
-        self.center = center
-        self.n_mels = n_mels
-        self.f_min = f_min
-        self.f_max = f_max or float(sample_rate // 2)
-
-        self.spectrogram = LinearSpectrogram(n_fft, win_length, hop_length, center)
-
-        fb = F.melscale_fbanks(
-            n_freqs=self.n_fft // 2 + 1,
-            f_min=self.f_min,
-            f_max=self.f_max,
-            n_mels=self.n_mels,
-            sample_rate=self.sample_rate,
-            norm="slaney",
-            mel_scale="slaney",
-        )
-        self.register_buffer(
-            "fb",
-            fb,
-            persistent=False,
-        )
-
-    def compress(self, x: Tensor) -> Tensor:
-        return torch.log(torch.clamp(x, min=1e-5))
-
-    def decompress(self, x: Tensor) -> Tensor:
-        return torch.exp(x)
-
-    def apply_mel_scale(self, x: Tensor) -> Tensor:
-        return torch.matmul(x.transpose(-1, -2), self.fb).transpose(-1, -2)
-
-    def forward(
-        self, x: Tensor, return_linear: bool = False, sample_rate: int = None
-    ) -> Tensor:
-        if sample_rate is not None and sample_rate != self.sample_rate:
-            x = F.resample(x, orig_freq=sample_rate, new_freq=self.sample_rate)
-
-        linear = self.spectrogram(x)
-        x = self.apply_mel_scale(linear)
-        x = self.compress(x)
-
-        if return_linear:
-            return x, self.compress(linear)
-
-        return x
-
-
 path: /fish_speech/utils/utils.py
 ----------------------------------------
+# fish_speech/utils/utils.py
 import random
 import warnings
 from importlib.util import find_spec
@@ -8374,7 +7525,6 @@ import torch
 from omegaconf import DictConfig
 
 from .logger import RankedLogger
-from .rich_utils import enforce_tags, print_config_tree
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
@@ -8501,223 +7651,17 @@ def set_seed(seed: int):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
+def enforce_tags(cfg, save_to_file=False):
+    pass
 
-path: /inference.ipynb
-----------------------------------------
-{
- "cells": [
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "# Fish Speech"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "### For Windows User / win用户"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {
-    "vscode": {
-     "languageId": "bat"
-    }
-   },
-   "outputs": [],
-   "source": [
-    "!chcp 65001"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "### For Linux User / Linux 用户"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "import locale\n",
-    "locale.setlocale(locale.LC_ALL, 'en_US.UTF-8')"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "### Prepare Model"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "# For Chinese users, you probably want to use mirror to accelerate downloading\n",
-    "# !set HF_ENDPOINT=https://hf-mirror.com\n",
-    "# !export HF_ENDPOINT=https://hf-mirror.com \n",
-    "\n",
-    "!hf download fishaudio/openaudio-s1-mini --local-dir checkpoints/openaudio-s1-mini/"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "## WebUI Inference\n",
-    "\n",
-    "> You can use --compile to fuse CUDA kernels for faster inference (10x)."
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {
-    "vscode": {
-     "languageId": "shellscript"
-    }
-   },
-   "outputs": [],
-   "source": [
-    "!python tools/run_webui.py \\\n",
-    "    --llama-checkpoint-path checkpoints/openaudio-s1-mini \\\n",
-    "    --decoder-checkpoint-path checkpoints/openaudio-s1-mini/codec.pth \\\n",
-    "    # --compile"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "## Break-down CLI Inference"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "### 1. Encode reference audio: / 从语音生成 prompt: \n",
-    "\n",
-    "You should get a `fake.npy` file.\n",
-    "\n",
-    "你应该能得到一个 `fake.npy` 文件."
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {
-    "vscode": {
-     "languageId": "shellscript"
-    }
-   },
-   "outputs": [],
-   "source": [
-    "## Enter the path to the audio file here\n",
-    "src_audio = r\"D:\\PythonProject\\vo_hutao_draw_appear.wav\"\n",
-    "\n",
-    "!python fish_speech/models/dac/inference.py \\\n",
-    "    -i {src_audio} \\\n",
-    "    --checkpoint-path \"checkpoints/openaudio-s1-mini/codec.pth\"\n",
-    "\n",
-    "from IPython.display import Audio, display\n",
-    "audio = Audio(filename=\"fake.wav\")\n",
-    "display(audio)"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "### 2. Generate semantic tokens from text: / 从文本生成语义 token:\n",
-    "\n",
-    "> This command will create a codes_N file in the working directory, where N is an integer starting from 0.\n",
-    "\n",
-    "> You may want to use `--compile` to fuse CUDA kernels for faster inference (~30 tokens/second -> ~300 tokens/second).\n",
-    "\n",
-    "> 该命令会在工作目录下创建 codes_N 文件, 其中 N 是从 0 开始的整数.\n",
-    "\n",
-    "> 您可以使用 `--compile` 来融合 cuda 内核以实现更快的推理 (~30 tokens/秒 -> ~300 tokens/秒)"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {
-    "vscode": {
-     "languageId": "shellscript"
-    }
-   },
-   "outputs": [],
-   "source": [
-    "!python fish_speech/models/text2semantic/inference.py \\\n",
-    "    --text \"hello world\" \\\n",
-    "    --prompt-text \"The text corresponding to reference audio\" \\\n",
-    "    --prompt-tokens \"fake.npy\" \\\n",
-    "    --checkpoint-path \"checkpoints/openaudio-s1-mini\" \\\n",
-    "    --num-samples 2\n",
-    "    # --compile"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "### 3. Generate speech from semantic tokens: / 从语义 token 生成人声:"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {
-    "vscode": {
-     "languageId": "shellscript"
-    }
-   },
-   "outputs": [],
-   "source": [
-    "!python fish_speech/models/dac/inference.py \\\n",
-    "    -i \"codes_0.npy\" \\\n",
-    "    --checkpoint-path \"checkpoints/openaudio-s1-mini/codec.pth\"\n",
-    "\n",
-    "from IPython.display import Audio, display\n",
-    "audio = Audio(filename=\"fake.wav\")\n",
-    "display(audio)"
-   ]
-  }
- ],
- "metadata": {
-  "kernelspec": {
-   "display_name": "Python 3",
-   "language": "python",
-   "name": "python3"
-  },
-  "language_info": {
-   "codemirror_mode": {
-    "name": "ipython",
-    "version": 3
-   },
-   "file_extension": ".py",
-   "mimetype": "text/x-python",
-   "name": "python",
-   "nbconvert_exporter": "python",
-   "pygments_lexer": "ipython3",
-   "version": "3.10.14"
-  }
- },
- "nbformat": 4,
- "nbformat_minor": 2
-}
+def print_config_tree(cfg, resolve=False, save_to_file=False):
+    pass
+
+def enforce_tags(cfg, save_to_file=False):
+    pass
+
+def print_config_tree(cfg, resolve=False, save_to_file=False):
+    pass
 
 
 path: /LICENSE
@@ -8818,296 +7762,42 @@ This Agreement will be governed by and construed in accordance with the laws of 
 **"Trade Control Laws"** means any applicable U.S. and non-U.S. export control and trade sanctions laws and regulations.
 
 
-path: /Makefile
-----------------------------------------
-# Fish Speech — 32GB VRAM Docker server and E2E tests
-# Use from repo root. See docs/docker-32gb-rtx5090.md
-
-PORT ?= 8080
-CONTAINER ?= fish-speech
-BASE_URL ?= http://127.0.0.1:$(PORT)
-
-.PHONY: run-server stop-server e2e e2e-memory preencode preencode-upload upload-references test help
-
-help:
-	@echo "Fish Speech 32GB server and E2E"
-	@echo "  make run-server        - Start API server in Docker (COMPILE=0)"
-	@echo "  make run-server COMPILE=1 - Start with torch.compile (warmup 2-10 min)"
-	@echo "  make stop-server       - Stop container"
-	@echo "  make e2e               - E2E smoke (server must be up)"
-	@echo "  make e2e-memory        - E2E memory (2 TTS requests)"
-	@echo "  make preencode         - Pre-encode WAV+txt to references/"
-	@echo "  make preencode-upload  - Pre-encode and upload to server"
-	@echo "  make upload-references - Upload existing references/ only"
-	@echo "  make test              - Run pytest"
-	@echo "Override: PORT=8080 PREENCODE_CHECKPOINT=../../checkpoints/s2-pro/codec.pth"
-
-run-server:
-	WORKSPACE_DIR="$(WORKSPACE_DIR)" CHECKPOINTS_DIR="$(CHECKPOINTS_DIR)" PORT="$(PORT)" COMPILE="$(COMPILE)" ./scripts/run_server_32gb.sh
-
-stop-server:
-	docker rm -f $(CONTAINER) 2>/dev/null || true
-
-e2e:
-	PORT="$(PORT)" BASE_URL="$(BASE_URL)" ./scripts/e2e_smoke.sh
-
-e2e-memory:
-	PORT="$(PORT)" BASE_URL="$(BASE_URL)" ./scripts/e2e_memory.sh
-
-preencode:
-	PREENCODE_INPUT_DIR="$(PREENCODE_INPUT_DIR)" PREENCODE_OUTPUT_DIR="$(PREENCODE_OUTPUT_DIR)" \
-	PREENCODE_CHECKPOINT="$(PREENCODE_CHECKPOINT)" PREENCODE_REF_ID="$(PREENCODE_REF_ID)" \
-	./scripts/preencode.sh
-
-preencode-upload:
-	PREENCODE_INPUT_DIR="$(PREENCODE_INPUT_DIR)" PREENCODE_OUTPUT_DIR="$(PREENCODE_OUTPUT_DIR)" \
-	PREENCODE_CHECKPOINT="$(PREENCODE_CHECKPOINT)" PREENCODE_REF_ID="$(PREENCODE_REF_ID)" \
-	UPLOAD=1 SERVER_URL="$(BASE_URL)" ./scripts/preencode.sh
-
-upload-references:
-	PREENCODE_OUTPUT_DIR="$(PREENCODE_OUTPUT_DIR)" BASE_URL="$(BASE_URL)" ./scripts/upload_references.sh
-
-test:
-	uv run pytest tests/ -v --tb=short
-
-
-path: /mkdocs.yml
-----------------------------------------
-site_name: Fish Audio
-site_description: Targeting SOTA TTS solutions.
-site_url: https://speech.fish.audio
-
-# Repository
-repo_name: fishaudio/fish-speech
-repo_url: https://github.com/fishaudio/fish-speech
-edit_uri: blob/main/docs
-
-# Copyright
-copyright: Copyright &copy; 2023-2025 by Fish Audio
-
-theme:
-  name: material
-  favicon: assets/logo.svg
-  language: en
-  features:
-    - content.action.edit
-    - content.action.view
-    - navigation.tracking
-    - navigation.footer
-    # - navigation.tabs
-    - search
-    - search.suggest
-    - search.highlight
-    - search.share
-    - content.code.copy
-  logo: assets/logo.svg
-
-  palette:
-    # Palette toggle for automatic mode
-    - media: "(prefers-color-scheme)"
-      toggle:
-        icon: material/brightness-auto
-        name: Switch to light mode
-
-    # Palette toggle for light mode
-    - media: "(prefers-color-scheme: light)"
-      scheme: default
-      toggle:
-        icon: material/brightness-7
-        name: Switch to dark mode
-      primary: black
-      font:
-        code: Roboto Mono
-
-    # Palette toggle for dark mode
-    - media: "(prefers-color-scheme: dark)"
-      scheme: slate
-      toggle:
-        icon: material/brightness-4
-        name: Switch to light mode
-      primary: black
-      font:
-        code: Roboto Mono
-
-nav:
-  - Introduction: en/index.md
-  - Installation: en/install.md
-  - Finetune: en/finetune.md
-  - Inference: en/inference.md
-  - Server: en/server.md
-  - Samples: en/samples.md
-
-# Plugins
-plugins:
-  - search:
-      separator: '[\s\-,:!=\[\]()"`/]+|\.(?!\d)|&[lg]t;|(?!\b)(?=[A-Z][a-z])'
-      lang:
-        - en
-        - zh
-        - ja
-        - pt
-        - ko
-        - ar
-  - i18n:
-      docs_structure: folder
-      languages:
-        - locale: en
-          name: English
-          default: true
-          build: true
-        - locale: zh
-          name: 简体中文
-          build: true
-          nav:
-            - 介绍: zh/index.md
-            - 安装: zh/install.md
-            - 微调: zh/finetune.md
-            - 推理: zh/inference.md
-            - 示例: zh/samples.md
-        - locale: ja
-          name: 日本語
-          build: true
-          nav:
-            - はじめに: ja/index.md
-            - インストール: ja/install.md
-            - ファインチューニング: ja/finetune.md
-            - 推論: ja/inference.md
-            - サンプル: ja/samples.md
-        - locale: pt
-          name: Português (Brasil)
-          build: true
-          nav:
-            - Introdução: pt/index.md
-            - Instalação: pt/install.md
-            - Ajuste Fino: pt/finetune.md
-            - Inferência: pt/inference.md
-            - Amostras: pt/samples.md
-        - locale: ko
-          name: 한국어
-          build: true
-          nav:
-            - 소개: ko/index.md
-            - 설치: ko/install.md
-            - 파인튜닝: ko/finetune.md
-            - 추론: ko/inference.md
-            - 샘플: ko/samples.md
-        - locale: ar
-          name: العربية
-          build: true
-          nav:
-            - مقدمة: ar/index.md
-            - التثبيت: ar/install.md
-            - الضبط الدقيق: ar/finetune.md
-            - الاستنتاج: ar/inference.md
-            - العينات: ar/samples.md
-
-markdown_extensions:
-  - pymdownx.highlight:
-      anchor_linenums: true
-      line_spans: __span
-      pygments_lang_class: true
-  - pymdownx.inlinehilite
-  - pymdownx.snippets
-  - pymdownx.superfences
-  - admonition
-  - pymdownx.details
-  - pymdownx.superfences
-  - attr_list
-  - md_in_html
-  - pymdownx.superfences
-
-extra_css:
-  - stylesheets/extra.css
-
-extra:
-  social:
-    - icon: fontawesome/brands/discord
-      link: https://discord.gg/Es5qTB9BcN
-    - icon: fontawesome/brands/docker
-      link: https://hub.docker.com/r/fishaudio/fish-speech
-    - icon: fontawesome/brands/qq
-      link: http://qm.qq.com/cgi-bin/qm/qr?_wv=1027&k=jCKlUP7QgSm9kh95UlBoYv6s1I-Apl1M&authKey=xI5ttVAp3do68IpEYEalwXSYZFdfxZSkah%2BctF5FIMyN2NqAa003vFtLqJyAVRfF&noverify=0&group_code=593946093
-  homepage: https://speech.fish.audio
-
-
 path: /pyproject.toml
 ----------------------------------------
 [project]
 name = "fish-speech"
 version = "2.0.0"
-authors = [
-    {name = "Fish Audio", email = "oss@fish.audio"},
-]
-description = "Fish Speech"
-readme = "README.md"
+description = "Fish Speech (streaming-only)"
 requires-python = ">=3.10"
-keywords = ["TTS", "Speech"]
-license = {text = "Fish Audio Research License"}
-classifiers = [
-    "Programming Language :: Python :: 3",
-]
 dependencies = [
     "numpy",
     "torch==2.8.0",
     "torchaudio==2.8.0",
     "transformers<=4.57.3",
-    "datasets==2.18.0",
-    "lightning>=2.1.0",
     "hydra-core>=1.3.2",
-    "tensorboard>=2.14.1",
-    "natsort>=8.4.0",
+    "omegaconf>=2.3.0",
     "einops>=0.7.0",
-    "librosa>=0.10.1",
-    "rich>=13.5.3",
-    "gradio>5.0.0",
-    "wandb>=0.15.11",
-    "grpcio>=1.58.0",
-    "kui>=1.6.0",
-    "uvicorn>=0.30.0",
     "loguru>=0.6.0",
-    "loralib>=0.1.2",
-    "pyrootutils>=1.0.4",
-    "resampy>=0.4.3",
-    "einx[torch]==0.2.2",
-    "zstandard>=0.22.0",
-    "pydub",
-    "pyaudio",
-    "modelscope==1.17.1",
-    "opencc-python-reimplemented==0.1.7",
-    "silero-vad",
-    "ormsgpack",
-    "tiktoken>=0.8.0",
     "pydantic==2.9.2",
+    "ormsgpack",
+    "uvicorn>=0.30.0",
+    "kui>=1.6.0",
     "cachetools",
-    "descript-audio-codec",
-    "descript-audiotools",
-    "safetensors"
+    "safetensors",
+    "tiktoken>=0.8.0",
+    "click>=8.0.0",
+    "pyrootutils>=1.0.4",
+    "natsort>=8.4.0",
+    "soundfile>=0.12.0",
+    "fastapi",
+    "httpx",
 ]
 
 [project.optional-dependencies]
-stable = [
-    "torch==2.8.0",
-    "torchaudio",
-]
-cpu = [
-  "torch==2.8.0",
-  "torchaudio",
-]
-cu126 = [
-  "torch==2.8.0",
-  "torchaudio",
-]
-cu128 = [
-  "torch==2.8.0",
-  "torchaudio",
-]
-cu129 = [
-  "torch==2.8.0",
-  "torchaudio",
-]
-dev = [
-  "pytest>=7.0.0",
-]
+cpu = ["torch==2.8.0", "torchaudio"]
+cu126 = ["torch==2.8.0", "torchaudio"]
+cu128 = ["torch==2.8.0", "torchaudio"]
+cu129 = ["torch==2.8.0", "torchaudio"]
 
 [tool.uv]
 conflicts = [
@@ -9157,247 +7847,198 @@ explicit = true
 requires = ["setuptools", "setuptools-scm"]
 build-backend = "setuptools.build_meta"
 
-[dependency-groups]
-dev = [
-    "pytest>=9.0.2",
-]
-
 [tool.setuptools]
 packages = ["fish_speech", "tools"]
 
-[tool.setuptools_scm]
 
-
-path: /pyrightconfig.json
+path: /scripts/down_5090.sh
 ----------------------------------------
-{
-    "exclude": [
-        "data",
-        "filelists"
-    ]
+# scripts/down_5090.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+CONTAINER="${CONTAINER:-fish-speech}"
+RUN_DIR="$REPO_ROOT/run"
+PID_FILE="$RUN_DIR/proxy.pid"
+
+docker_cmd() {
+  if [[ "${DOCKER_USE_SUDO:-0}" == "1" ]]; then
+    sudo docker "$@"
+  else
+    docker "$@"
+  fi
 }
 
+echo "[1/2] Stopping proxy"
+if [[ -f "$PID_FILE" ]]; then
+  PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
+    kill "$PID" 2>/dev/null || true
+    sleep 1
+    if kill -0 "$PID" 2>/dev/null; then
+      kill -9 "$PID" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$PID_FILE"
+fi
+pkill -f 'uvicorn.*tools.proxy.fish_proxy_pcm:app' 2>/dev/null || true
 
-path: /scripts/e2e_memory.sh
+echo "[2/2] Stopping model container"
+docker_cmd rm -f "$CONTAINER" 2>/dev/null || true
+
+echo "All stopped"
+
+
+path: /scripts/logs_5090.sh
 ----------------------------------------
+# scripts/logs_5090.sh
 #!/usr/bin/env bash
-# E2E memory check: two TTS requests to verify VRAM is freed between requests (no OOM on 32GB).
-# Server must be running. Usage: PORT=8080 ./scripts/e2e_memory.sh   or: make e2e-memory
-set -e
+set -euo pipefail
+
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
-PORT="${PORT:-8080}"
-BASE_URL="${BASE_URL:-http://127.0.0.1:${PORT}}"
-HEALTH_TIMEOUT="${E2E_HEALTH_TIMEOUT:-120}"
-OUT_DIR="${E2E_OUT_DIR:-$REPO_ROOT/results/e2e}"
-mkdir -p "$OUT_DIR"
 
-echo "=== Fish Speech E2E memory (2 requests) ==="
-echo "  BASE_URL=$BASE_URL"
-echo ""
+CONTAINER="${CONTAINER:-fish-speech}"
+PROXY_LOG_FILE="${PROXY_LOG_FILE:-$REPO_ROOT/logs/proxy.log}"
 
-echo "Waiting for server (timeout ${HEALTH_TIMEOUT}s)..."
-WAIT=0
-until curl -sf --connect-timeout 2 "$BASE_URL/v1/health" >/dev/null 2>&1; do
-  sleep 2
-  WAIT=$((WAIT + 2))
-  if [[ $WAIT -ge $HEALTH_TIMEOUT ]]; then
-    echo "ERROR: server not ready"
-    exit 1
+mkdir -p "$REPO_ROOT/logs"
+touch "$PROXY_LOG_FILE"
+
+docker_cmd() {
+  if [[ "${DOCKER_USE_SUDO:-0}" == "1" ]]; then
+    sudo docker "$@"
+  else
+    docker "$@"
   fi
-done
-echo "Server ready."
-echo ""
+}
 
-MEM1="$OUT_DIR/memory_before.json"
-MEM2="$OUT_DIR/memory_after_req1.json"
-MEM3="$OUT_DIR/memory_after_req2.json"
+cleanup() {
+  [[ -n "${MODEL_PID:-}" ]] && kill "$MODEL_PID" 2>/dev/null || true
+  [[ -n "${PROXY_PID:-}" ]] && kill "$PROXY_PID" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
 
-echo "Memory before:"
-curl -sf "$BASE_URL/v1/debug/memory" | tee "$MEM1" | (command -v jq >/dev/null 2>&1 && jq -c '{allocated_gb, reserved_gb}' || cat)
-echo ""
+echo "=== Live logs ==="
+echo "model container: $CONTAINER"
+echo "proxy log: $PROXY_LOG_FILE"
+echo
 
-echo "Request 1 (streaming)..."
-curl -sf -X POST "$BASE_URL/v1/tts" \
-  -H "Content-Type: application/json" \
-  -d '{"text":"Hello, this is the first request.","streaming":true}' \
-  --output "$OUT_DIR/e2e_mem_req1.wav" --max-time 60
-echo "Memory after request 1:"
-curl -sf "$BASE_URL/v1/debug/memory" | tee "$MEM2" | (command -v jq >/dev/null 2>&1 && jq -c '{allocated_gb, reserved_gb, max_allocated_gb}' || cat)
-echo ""
+(
+  docker_cmd logs -f "$CONTAINER" 2>&1 | sed 's/^/[model] /'
+) &
+MODEL_PID=$!
+
+(
+  tail -n 50 -F "$PROXY_LOG_FILE" 2>/dev/null | sed 's/^/[proxy] /'
+) &
+PROXY_PID=$!
+
+wait
+
+
+path: /scripts/restart_5090.sh
+----------------------------------------
+# scripts/restart_5090.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+DOCKER_USE_SUDO="${DOCKER_USE_SUDO:-0}" \
+  bash "$REPO_ROOT/scripts/down_5090.sh"
 
 sleep 2
-echo "Request 2 (streaming, OOM check)..."
-if curl -sf -X POST "$BASE_URL/v1/tts" \
-  -H "Content-Type: application/json" \
-  -d '{"text":"Second request to confirm memory is freed.","streaming":true}' \
-  --output "$OUT_DIR/e2e_mem_req2.wav" --max-time 60; then
-  echo "Request 2: OK"
-else
-  echo "Request 2: FAIL (possible OOM)"
-  exit 1
-fi
-echo "Memory after request 2:"
-curl -sf "$BASE_URL/v1/debug/memory" | tee "$MEM3" | (command -v jq >/dev/null 2>&1 && jq -c '{allocated_gb, reserved_gb, max_allocated_gb}' || cat)
-echo ""
 
-echo "E2E memory passed (two requests succeeded). Outputs in $OUT_DIR"
-
-
-path: /scripts/e2e_smoke.sh
-----------------------------------------
-#!/usr/bin/env bash
-# E2E smoke: server must be running (e.g. ./scripts/run_server_32gb.sh).
-# Waits for health, runs TTS (streaming + oneshot), checks /v1/debug/memory.
-# Usage: PORT=8080 ./scripts/e2e_smoke.sh   or: make e2e
-set -e
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$REPO_ROOT"
-PORT="${PORT:-8080}"
-BASE_URL="${BASE_URL:-http://127.0.0.1:${PORT}}"
-CONTAINER="${CONTAINER:-fish-speech}"
-HEALTH_TIMEOUT="${E2E_HEALTH_TIMEOUT:-120}"
-OUT_DIR="${E2E_OUT_DIR:-$REPO_ROOT/results/e2e}"
-mkdir -p "$OUT_DIR"
-
-echo "=== Fish Speech E2E smoke ==="
-echo "  BASE_URL=$BASE_URL  CONTAINER=$CONTAINER  OUT_DIR=$OUT_DIR"
-echo ""
-
-echo "Waiting for server (timeout ${HEALTH_TIMEOUT}s)..."
-WAIT=0
-until curl -sf --connect-timeout 2 "$BASE_URL/v1/health" >/dev/null 2>&1; do
-  sleep 2
-  WAIT=$((WAIT + 2))
-  if [[ $WAIT -ge $HEALTH_TIMEOUT ]]; then
-    echo "ERROR: server not ready in ${HEALTH_TIMEOUT}s"
-    exit 1
-  fi
-done
-echo "Server ready after ${WAIT}s."
-echo ""
-
-# Optional: use first reference from server (e.g. after preencode + upload)
-REF_ID=""
-if command -v jq >/dev/null 2>&1; then
-  REF_ID=$(curl -sf --compressed "$BASE_URL/v1/references/list" 2>/dev/null | jq -r '.reference_ids[0] // empty' 2>/dev/null) || true
-fi
-if [[ -n "$REF_ID" ]]; then
-  echo "Using reference_id=$REF_ID for TTS"
-fi
-echo ""
-
-# Streaming TTS (with TTFA metrics when python3 + ttfa_smoke.py available)
-echo "--- TTS streaming ---"
-STREAM_OUT="$OUT_DIR/e2e_stream.wav"
-TTFA_OK=0
-if command -v python3 >/dev/null 2>&1 && [[ -f "$REPO_ROOT/scripts/ttfa_smoke.py" ]]; then
-  TTFA_ARGS="--url $BASE_URL --output $STREAM_OUT"
-  [[ -n "$REF_ID" ]] && TTFA_ARGS="$TTFA_ARGS --reference-id $REF_ID"
-  if python3 "$REPO_ROOT/scripts/ttfa_smoke.py" $TTFA_ARGS && [[ -s "$STREAM_OUT" ]]; then
-    TTFA_OK=1
-  else
-    echo "  (ttfa_smoke failed, falling back to curl)"
-  fi
-fi
-if [[ "$TTFA_OK" -ne 1 ]]; then
-  if [[ -n "$REF_ID" ]]; then
-    TTS_JSON="{\"text\":\"Hello, this is an e2e smoke test.\",\"streaming\":true,\"reference_id\":\"$REF_ID\"}"
-  else
-    TTS_JSON='{"text":"Hello, this is an e2e smoke test.","streaming":true}'
-  fi
-  curl -sf -X POST "$BASE_URL/v1/tts" \
-    -H "Content-Type: application/json" \
-    -d "$TTS_JSON" \
-    --output "$STREAM_OUT" --max-time 60
-fi
-if [[ ! -s "$STREAM_OUT" ]]; then
-  echo "ERROR: streaming TTS produced empty or missing file: $STREAM_OUT"
-  exit 1
-fi
-echo "  OK: $STREAM_OUT ($(wc -c < "$STREAM_OUT") bytes)"
-echo ""
-
-# Oneshot TTS (with timing metrics when python3 + ttfa_smoke.py available)
-echo "--- TTS oneshot ---"
-ONESHOT_OUT="$OUT_DIR/e2e_oneshot.wav"
-ONESHOT_TTFA_OK=0
-if command -v python3 >/dev/null 2>&1 && [[ -f "$REPO_ROOT/scripts/ttfa_smoke.py" ]]; then
-  ONESHOT_ARGS="--url $BASE_URL --output $ONESHOT_OUT --oneshot"
-  [[ -n "$REF_ID" ]] && ONESHOT_ARGS="$ONESHOT_ARGS --reference-id $REF_ID"
-  if python3 "$REPO_ROOT/scripts/ttfa_smoke.py" $ONESHOT_ARGS && [[ -s "$ONESHOT_OUT" ]]; then
-    ONESHOT_TTFA_OK=1
-  else
-    echo "  (ttfa_smoke oneshot failed, falling back to curl)"
-  fi
-fi
-if [[ "$ONESHOT_TTFA_OK" -ne 1 ]]; then
-  if [[ -n "$REF_ID" ]]; then
-    ONESHOT_JSON="{\"text\":\"Short test.\",\"streaming\":false,\"reference_id\":\"$REF_ID\"}"
-  else
-    ONESHOT_JSON='{"text":"Short test.","streaming":false}'
-  fi
-  curl -sf -X POST "$BASE_URL/v1/tts" \
-    -H "Content-Type: application/json" \
-    -d "$ONESHOT_JSON" \
-    --output "$ONESHOT_OUT" --max-time 60
-fi
-if [[ ! -s "$ONESHOT_OUT" ]]; then
-  echo "ERROR: oneshot TTS produced empty or missing file: $ONESHOT_OUT"
-  exit 1
-fi
-echo "  OK: $ONESHOT_OUT ($(wc -c < "$ONESHOT_OUT") bytes)"
-echo ""
-
-# Memory
-echo "--- Memory ---"
-curl -sf --compressed "$BASE_URL/v1/debug/memory" | tee "$OUT_DIR/memory_after.json" | (command -v jq >/dev/null 2>&1 && jq -c '{allocated_gb, reserved_gb, max_allocated_gb}' 2>/dev/null || cat) || true
-echo ""
-
-echo "E2E smoke passed. Outputs in $OUT_DIR"
-
-
-path: /scripts/preencode.sh
-----------------------------------------
-#!/usr/bin/env bash
-# Pre-encode reference WAV+txt to references/. Optional: upload to server.
-# Env: PREENCODE_INPUT_DIR, PREENCODE_OUTPUT_DIR, PREENCODE_CHECKPOINT, PREENCODE_REF_ID, UPLOAD, SERVER_URL
-# Usage: ./scripts/preencode.sh   or   UPLOAD=1 ./scripts/preencode.sh
-set -e
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$REPO_ROOT"
-
-INPUT_DIR="${PREENCODE_INPUT_DIR:-data/voice_references}"
-OUTPUT_DIR="${PREENCODE_OUTPUT_DIR:-references}"
-CHECKPOINT="${PREENCODE_CHECKPOINT:-checkpoints/s2-pro/codec.pth}"
-REF_ID="${PREENCODE_REF_ID:-}"
-UPLOAD="${UPLOAD:-0}"
-SERVER_URL="${SERVER_URL:-http://127.0.0.1:8080}"
-
-if [[ ! -d "$INPUT_DIR" ]]; then
-  echo "ERROR: PREENCODE_INPUT_DIR=$INPUT_DIR not found. Create folder with <stem>.wav + <stem>.txt"
-  exit 1
-fi
-if [[ ! -f "$CHECKPOINT" ]]; then
-  echo "ERROR: PREENCODE_CHECKPOINT=$CHECKPOINT not found. E.g. PREENCODE_CHECKPOINT=../../checkpoints/s2-pro/codec.pth"
-  exit 1
-fi
-
-set -- --input-dir "$INPUT_DIR" --output-dir "$OUTPUT_DIR" --checkpoint-path "$CHECKPOINT"
-[[ -n "$REF_ID" ]] && set -- "$@" --ref-id "$REF_ID"
-[[ "$UPLOAD" =~ ^(1|true|yes|YES)$ ]] && set -- "$@" --upload --server-url "$SERVER_URL"
-
-exec uv run python tools/preencode_references.py "$@"
+DOCKER_USE_SUDO="${DOCKER_USE_SUDO:-0}" \
+  bash "$REPO_ROOT/scripts/up_5090.sh"
 
 
 path: /scripts/run_proxy.sh
 ----------------------------------------
- 
+# scripts/run_proxy.sh
+#!/usr/bin/env bash
+set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+PROXY_PORT="${PROXY_PORT:-9000}"
+PROXY_HOST="${PROXY_HOST:-0.0.0.0}"
+PROXY_LOG_LEVEL="${PROXY_LOG_LEVEL:-info}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+LOG_DIR="$REPO_ROOT/logs"
+RUN_DIR="$REPO_ROOT/run"
+LOG_FILE="$LOG_DIR/proxy.log"
+PID_FILE="$RUN_DIR/proxy.pid"
+VENV_PATH="$REPO_ROOT/.venv-proxy"
+
+mkdir -p "$LOG_DIR" "$RUN_DIR"
+touch "$LOG_FILE"
+
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  echo "ERROR: python not found: $PYTHON_BIN" >&2
+  exit 1
+fi
+
+if [[ ! -d "$VENV_PATH" ]]; then
+  echo "Creating proxy virtualenv at $VENV_PATH"
+  "$PYTHON_BIN" -m venv "$VENV_PATH"
+fi
+
+set +u
+source "$VENV_PATH/bin/activate"
+set -u
+
+if ! python - <<'PY' >/dev/null 2>&1
+import fastapi, uvicorn, httpx
+print("ok")
+PY
+then
+  echo "Installing proxy dependencies into $VENV_PATH"
+  python -m pip install -U pip setuptools wheel
+  python -m pip install fastapi "uvicorn[standard]" httpx
+fi
+
+if [[ -f "$PID_FILE" ]]; then
+  OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [[ -n "${OLD_PID:-}" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
+    kill "$OLD_PID" 2>/dev/null || true
+    sleep 1
+  fi
+  rm -f "$PID_FILE"
+fi
+
+pkill -f 'uvicorn.*tools.proxy.fish_proxy_pcm:app' 2>/dev/null || true
+
+nohup python -m uvicorn tools.proxy.fish_proxy_pcm:app \
+  --host "$PROXY_HOST" \
+  --port "$PROXY_PORT" \
+  --log-level "$PROXY_LOG_LEVEL" \
+  >> "$LOG_FILE" 2>&1 &
+
+echo $! > "$PID_FILE"
+
+sleep 1
+
+if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+  echo "ERROR: proxy failed to start. Check $LOG_FILE" >&2
+  exit 1
+fi
+
+echo "Proxy started"
+echo "  pid: $(cat "$PID_FILE")"
+echo "  log: $LOG_FILE"
+echo "  url: http://127.0.0.1:${PROXY_PORT}/health"
 
 
 path: /scripts/run_server_32gb.sh
 ----------------------------------------
+# scripts/run_server_32gb.sh
 #!/usr/bin/env bash
 # Minimal repro: run API server in Docker for 32GB VRAM (e.g. RTX 5090).
 # From repo root: ./scripts/run_server_32gb.sh
@@ -9495,501 +8136,231 @@ echo "  Memory: curl -s http://127.0.0.1:$PORT/v1/debug/memory"
 echo "  Logs:   docker logs -f $CONTAINER"
 
 
-path: /scripts/ttfa_smoke.py
+path: /scripts/up_5090.sh
 ----------------------------------------
-#!/usr/bin/env python3
-"""One TTS request (streaming or oneshot): measure TTFA and save WAV. Prints ttfa_s, ttfa_audio_s, total_s."""
-
-import argparse
-import sys
-import time
-
-WAV_HEADER_SIZE = 44
-
-
-def main() -> None:
-    p = argparse.ArgumentParser(description="TTS request with TTFA/timing metrics")
-    p.add_argument("--url", required=True, help="Base URL (e.g. http://127.0.0.1:8080)")
-    p.add_argument("--output", required=True, help="Output WAV path")
-    p.add_argument("--reference-id", default=None, help="Optional reference_id")
-    p.add_argument(
-        "--text", default=None, help="Text to synthesize (default depends on --oneshot)"
-    )
-    p.add_argument(
-        "--oneshot",
-        action="store_true",
-        help="Non-streaming request (streaming: false)",
-    )
-    args = p.parse_args()
-    if args.text is None:
-        args.text = (
-            "Short test." if args.oneshot else "Hello, this is an e2e smoke test."
-        )
-
-    try:
-        import urllib.request
-    except ImportError:
-        print("ERROR: urllib.request required", file=sys.stderr)
-        sys.exit(1)
-
-    url = f"{args.url.rstrip('/')}/v1/tts"
-    body = {"text": args.text, "streaming": not args.oneshot}
-    if args.reference_id:
-        body["reference_id"] = args.reference_id
-    import json
-
-    data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    t0 = time.perf_counter()
-    t1: float | None = None  # first byte
-    t2: float | None = None  # first audio byte (after 44-byte header)
-    out_bytes: list[bytes] = []
-    bytes_read = 0
-
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        while True:
-            chunk = resp.read(8192)
-            if not chunk:
-                break
-            if t1 is None:
-                t1 = time.perf_counter()
-            out_bytes.append(chunk)
-            bytes_read += len(chunk)
-            if t2 is None and bytes_read > WAV_HEADER_SIZE:
-                t2 = time.perf_counter()
-    t3 = time.perf_counter()
-
-    with open(args.output, "wb") as f:
-        f.write(b"".join(out_bytes))
-
-    ttfa_s = (t1 - t0) if t1 is not None else 0.0
-    ttfa_audio_s = (t2 - t0) if t2 is not None else ttfa_s
-    total_s = t3 - t0
-    print(
-        f"  ttfa_s={ttfa_s:.3f}  ttfa_audio_s={ttfa_audio_s:.3f}  total_s={total_s:.3f}  bytes={bytes_read}"
-    )
-
-
-if __name__ == "__main__":
-    main()
-
-
-path: /scripts/upload_references.sh
-----------------------------------------
+# scripts/up_5090.sh
 #!/usr/bin/env bash
-# Upload existing references/ to server (no encoding). Server skips if hash matches.
-# Env: PREENCODE_OUTPUT_DIR, SERVER_URL (or BASE_URL)
-# Usage: ./scripts/upload_references.sh   or   make upload-references
-set -e
+set -euo pipefail
+
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-OUTPUT_DIR="${PREENCODE_OUTPUT_DIR:-references}"
-SERVER_URL="${SERVER_URL:-${BASE_URL:-http://127.0.0.1:8080}}"
+IMAGE="${IMAGE:-fish-speech-webui:cu129}"
+CONTAINER="${CONTAINER:-fish-speech}"
+PORT="${PORT:-8080}"
+PROXY_PORT="${PROXY_PORT:-9000}"
 
-exec uv run python tools/preencode_references.py \
-  --output-dir "$OUTPUT_DIR" \
-  --upload-only --server-url "$SERVER_URL"
+COMPILE="${COMPILE:-1}"
+BUILD_IMAGE="${BUILD_IMAGE:-0}"
+START_PROXY="${START_PROXY:-1}"
+EXTRA_WARMUP="${EXTRA_WARMUP:-1}"
+
+CUDA_VER="${CUDA_VER:-12.9.0}"
+UV_EXTRA="${UV_EXTRA:-cu129}"
+CHECKPOINTS_DIR="${CHECKPOINTS_DIR:-checkpoints/s2-pro}"
+
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+FISH_CACHE_MAX_SEQ_LEN="${FISH_CACHE_MAX_SEQ_LEN:-320}"
+FISH_MAX_NEW_TOKENS_CAP="${FISH_MAX_NEW_TOKENS_CAP:-64}"
+
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-1800}"
+LOG_DIR="$REPO_ROOT/logs"
+mkdir -p "$LOG_DIR"
+
+docker_cmd() {
+  if [[ "${DOCKER_USE_SUDO:-0}" == "1" ]]; then
+    sudo docker "$@"
+  else
+    docker "$@"
+  fi
+}
+
+echo "=== Fish Speech full startup (RTX 5090) ==="
+echo "  REPO_ROOT=$REPO_ROOT"
+echo "  IMAGE=$IMAGE"
+echo "  CONTAINER=$CONTAINER"
+echo "  PORT=$PORT"
+echo "  PROXY_PORT=$PROXY_PORT"
+echo "  COMPILE=$COMPILE"
+echo "  CHECKPOINTS_DIR=$CHECKPOINTS_DIR"
+echo
+
+if [[ ! -d "$CHECKPOINTS_DIR" ]] || [[ -z "$(ls -A "$CHECKPOINTS_DIR" 2>/dev/null)" ]]; then
+  echo "ERROR: checkpoints not found in $CHECKPOINTS_DIR" >&2
+  exit 1
+fi
+
+if [[ "$BUILD_IMAGE" == "1" ]] || ! docker_cmd image inspect "$IMAGE" >/dev/null 2>&1; then
+  echo "[1/5] Building Docker image..."
+  docker_cmd build \
+    --platform linux/amd64 \
+    -f docker/Dockerfile \
+    --build-arg BACKEND=cuda \
+    --build-arg CUDA_VER="$CUDA_VER" \
+    --build-arg UV_EXTRA="$UV_EXTRA" \
+    --target webui \
+    -t "$IMAGE" .
+else
+  echo "[1/5] Using existing image: $IMAGE"
+fi
+
+echo "[2/5] Stopping previous processes..."
+DOCKER_USE_SUDO="${DOCKER_USE_SUDO:-0}" bash "$REPO_ROOT/scripts/down_5090.sh"
+
+echo "[3/5] Starting model container..."
+CID="$(
+  docker_cmd run -d --rm \
+    --name "$CONTAINER" \
+    -p "$PORT:8080" \
+    --gpus all \
+    -e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF" \
+    -e FISH_CACHE_MAX_SEQ_LEN="$FISH_CACHE_MAX_SEQ_LEN" \
+    -e FISH_MAX_NEW_TOKENS_CAP="$FISH_MAX_NEW_TOKENS_CAP" \
+    -e PYTHONPATH=/workspace \
+    -v "$REPO_ROOT":/workspace \
+    -w /workspace \
+    --entrypoint /app/.venv/bin/python \
+    "$IMAGE" \
+    /workspace/tools/api_server.py \
+    --listen 0.0.0.0:8080 \
+    --device cuda \
+    --llama-checkpoint-path "/workspace/$CHECKPOINTS_DIR" \
+    --decoder-checkpoint-path "/workspace/$CHECKPOINTS_DIR/codec.pth" \
+    $([[ "$COMPILE" == "1" ]] && echo --compile || true)
+)"
+
+echo "Container started: $CID"
+echo
+
+echo "[4/5] Waiting for model health..."
+START_TS="$(date +%s)"
+
+while true; do
+  if curl -sf "http://127.0.0.1:${PORT}/v1/health" >/dev/null 2>&1; then
+    break
+  fi
+
+  if ! docker_cmd ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+    echo "ERROR: container exited during startup" >&2
+    echo
+    echo "Last model logs:"
+    docker_cmd logs --tail 200 "$CONTAINER" 2>&1 || true
+    exit 1
+  fi
+
+  NOW_TS="$(date +%s)"
+  ELAPSED="$((NOW_TS - START_TS))"
+
+  if (( ELAPSED % 30 == 0 )); then
+    echo "Still warming up... ${ELAPSED}s"
+  fi
+
+  if [[ "$ELAPSED" -ge "$HEALTH_TIMEOUT" ]]; then
+    echo "ERROR: model did not become healthy within ${HEALTH_TIMEOUT}s" >&2
+    echo
+    echo "Last model logs:"
+    docker_cmd logs --tail 200 "$CONTAINER" 2>&1 || true
+    exit 1
+  fi
+
+  sleep 5
+done
+
+echo "Model is healthy after $(( $(date +%s) - START_TS ))s"
+
+if [[ "$EXTRA_WARMUP" == "1" ]]; then
+  echo "Sending one extra warmup streaming request..."
+  BASE_URL="http://127.0.0.1:${PORT}" \
+    bash "$REPO_ROOT/scripts/warmup_5090.sh"
+fi
+
+echo "Current model memory:"
+curl -sf "http://127.0.0.1:${PORT}/v1/debug/memory" || true
+echo
+echo
+
+if [[ "$START_PROXY" == "1" ]]; then
+  echo "[5/5] Starting proxy..."
+  PROXY_PORT="$PROXY_PORT" bash "$REPO_ROOT/scripts/run_proxy.sh"
+
+  echo "Checking proxy health..."
+  sleep 1
+  curl -sf "http://127.0.0.1:${PROXY_PORT}/health" >/dev/null
+  echo "Proxy is healthy"
+fi
+
+echo
+echo "=== READY ==="
+echo "Model health:  http://127.0.0.1:${PORT}/v1/health"
+echo "Model memory:  http://127.0.0.1:${PORT}/v1/debug/memory"
+echo "Proxy health:  http://127.0.0.1:${PROXY_PORT}/health"
+echo "Proxy stream:  http://127.0.0.1:${PROXY_PORT}/pcm-stream?text=Привет"
+echo
+echo "Live logs:"
+echo "  DOCKER_USE_SUDO=${DOCKER_USE_SUDO:-0} bash scripts/logs_5090.sh"
+echo
+echo "Stop all:"
+echo "  DOCKER_USE_SUDO=${DOCKER_USE_SUDO:-0} bash scripts/down_5090.sh"
+echo
+echo "Restart all:"
+echo "  DOCKER_USE_SUDO=${DOCKER_USE_SUDO:-0} bash scripts/restart_5090.sh"
 
 
 path: /scripts/warmup_5090.sh
 ----------------------------------------
- 
-
-
-path: /tests/__init__.py
-----------------------------------------
-# Tests for fish-speech
-
-
-path: /tests/test_debug_memory_dump.py
-----------------------------------------
-"""
-Tests for /v1/debug/memory dump (CUDA memory snapshot).
-Run in env with torch + tools deps: pytest tests/test_debug_memory_dump.py -v
-"""
-
-import tempfile
-import unittest.mock as mock
-
-import pytest
-
-# Need full app deps (torch, ormsgpack, kui, …) to import views
-pytest.importorskip("torch")
-pytest.importorskip("ormsgpack")
-
-
-def test_dump_memory_snapshot_no_cuda():
-    """When CUDA is not available, _dump_memory_snapshot returns (None, error message)."""
-    from tools.server.views import _dump_memory_snapshot
-
-    with mock.patch("tools.server.views.torch") as mtorch:
-        mtorch.cuda.is_available.return_value = False
-        path, err = _dump_memory_snapshot(out_dir=tempfile.gettempdir())
-    assert path is None
-    assert err == "CUDA not available"
-
-
-def test_dump_memory_snapshot_no_dump_fn():
-    """When _dump_snapshot is missing, returns (None, error message)."""
-    import torch
-
-    from tools.server.views import _dump_memory_snapshot
-
-    with mock.patch("tools.server.views.torch") as mtorch:
-        mtorch.cuda.is_available.return_value = True
-        mtorch.cuda.memory._dump_snapshot = None
-        path, err = _dump_memory_snapshot(out_dir=tempfile.gettempdir())
-    assert path is None
-    assert "_dump_snapshot" in (err or "")
-
-
-def test_dump_memory_snapshot_dump_fails():
-    """When _dump_snapshot raises, returns (None, error message)."""
-    import torch
-
-    from tools.server.views import _dump_memory_snapshot
-
-    with mock.patch("tools.server.views.torch") as mtorch:
-        mtorch.cuda.is_available.return_value = True
-        mtorch.cuda.memory._dump_snapshot = mock.Mock(
-            side_effect=RuntimeError("_cuda_memorySnapshot not found")
-        )
-        path, err = _dump_memory_snapshot(out_dir=tempfile.gettempdir())
-    assert path is None
-    assert err is not None
-    assert "Dump failed" in err or "RuntimeError" in err
-
-
-path: /tests/test_inference_engine.py
-----------------------------------------
-"""
-Tests for inference_engine (get_audio_segment and related).
-Run: pytest tests/test_inference_engine.py -v
-"""
-
-import unittest.mock as mock
-
-import numpy as np
-import pytest
-import torch
-
-from fish_speech.inference_engine import TTSInferenceEngine
-from fish_speech.models.text2semantic.inference import GenerateResponse
-
-
-class TestGetAudioSegment:
-    """get_audio_segment must use .detach() before .numpy() when inference_mode is not used."""
-
-    def test_returns_numpy_when_decode_vq_returns_tensor_requiring_grad(self):
-        """
-        When decode_vq_tokens returns a tensor with requires_grad=True (e.g. without inference_mode),
-        get_audio_segment must still return a numpy array without raising.
-        Regression: previously .numpy() was called without .detach() and raised.
-        """
-        decoder_model = mock.Mock()
-        decoder_model.device = torch.device("cpu")
-
-        engine = TTSInferenceEngine(
-            llama_queue=mock.Mock(),
-            decoder_model=decoder_model,
-            precision=torch.float32,
-            compile=False,
-        )
-        # Simulate DAC output that might require grad when inference_mode is off
-        fake_audio = torch.ones(100, requires_grad=True)
-        engine.decode_vq_tokens = mock.Mock(return_value=fake_audio)
-
-        result = GenerateResponse(
-            action="sample",
-            codes=torch.zeros(10, 5, dtype=torch.long),
-        )
-
-        out = engine.get_audio_segment(result)
-
-        assert isinstance(out, np.ndarray), "get_audio_segment must return numpy array"
-        assert out.shape == (100,)
-        assert out.dtype == np.float32
-        engine.decode_vq_tokens.assert_called_once()
-
-
-path: /tests/test_text2semantic_streaming.py
-----------------------------------------
-"""
-Unit tests for text2semantic inference streaming helpers.
-No model/checkpoint required.
-
-Run from repo root with project venv:
-  uv sync --extra cpu --extra dev && .venv/bin/python -m pytest tests/test_text2semantic_streaming.py -v
-Or: uv run --extra dev pytest tests/test_text2semantic_streaming.py -v  (if uv uses project venv)
-"""
-
-import unittest.mock as mock
-
-import pytest
-import torch
-
-from fish_speech.models.text2semantic.inference import (
-    _to_normal_tensor,
-    decode_n_tokens,
-    split_text_by_bytes,
-    split_text_by_speaker,
-)
-
-
-class TestSplitTextByBytes:
-    """Tests for split_text_by_bytes (used when no speaker turns, chunk_length controls batching)."""
-
-    def test_empty_or_whitespace_returns_empty(self):
-        assert split_text_by_bytes("", 100) == []
-        assert split_text_by_bytes("   \n", 100) == []
-
-    def test_short_text_single_chunk(self):
-        assert split_text_by_bytes("Hello", 100) == ["Hello"]
-        assert split_text_by_bytes("Hello world.", 50) == ["Hello world."]
-
-    def test_respects_max_bytes(self):
-        text = "a" * 200
-        chunks = split_text_by_bytes(text, 50)
-        assert len(chunks) == 4
-        assert sum(len(c.encode("utf-8")) for c in chunks) == 200
-        assert all(len(c.encode("utf-8")) <= 50 for c in chunks)
-
-    def test_utf8_boundary_no_split_mid_codepoint(self):
-        # Cyrillic "Привет" is 12 bytes in UTF-8; split at 6 could split inside a character
-        text = "Привет"
-        chunks = split_text_by_bytes(text, 6)
-        # Should not raise; chunks should be valid (no replacement chars from bad split)
-        assert "�" not in "".join(chunks)
-        assert "".join(chunks) == text
-
-    def test_ascii_splits_at_boundary(self):
-        text = "one two three four"
-        chunks = split_text_by_bytes(text, 8)
-        assert all(len(c.encode("utf-8")) <= 8 for c in chunks)
-        assert "".join(chunks) == text
-
-
-class TestSplitTextBySpeaker:
-    """Smoke tests for split_text_by_speaker (used for turn-based batching)."""
-
-    def test_no_speaker_tags_returns_empty_list(self):
-        # No tags -> empty list (caller uses split_text_by_bytes)
-        result = split_text_by_speaker("Just some text.")
-        assert result == []
-
-    def test_with_speaker_tag(self):
-        text = "<|speaker:0|>Hello world."
-        result = split_text_by_speaker(text)
-        assert len(result) >= 1
-        assert any("Hello" in r for r in result)
-
-
-def _is_inference(t: torch.Tensor) -> bool:
-    """True if tensor is an inference tensor (PyTorch 2.5+)."""
-    fn = getattr(t, "is_inference", None)
-    return fn() if callable(fn) else False
-
-
-class TestToNormalTensor:
-    """Tests for _to_normal_tensor (streaming + torch.compile workaround)."""
-
-    def test_returns_copy_on_same_device(self):
-        t = torch.tensor([1.0, 2.0])
-        out = _to_normal_tensor(t)
-        assert out.device == t.device
-        assert out.shape == t.shape
-        assert torch.equal(out, t)
-        assert out is not t
-
-    def test_cuda_if_available(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-        t = torch.tensor([1.0, 2.0], device="cuda")
-        out = _to_normal_tensor(t)
-        assert out.device.type == "cuda"
-        assert torch.equal(out.cpu(), t.cpu())
-
-    def test_clears_inference_flag_when_called_from_inference_mode(self):
-        """
-        When called from inside inference_mode(), result must not be an inference tensor.
-        This is required so AOT-compiled decode_one_token does not get inference tensors
-        as inputs (runtime does original_inpt.copy_(updated_inpt) and fails on inference tensors).
-        """
-        with torch.inference_mode():
-            t = torch.tensor([1.0, 2.0])
-            out = _to_normal_tensor(t)
-        assert out is not None
-        assert torch.equal(out, t)
-        if hasattr(out, "is_inference") and callable(out.is_inference):
-            assert (
-                not out.is_inference()
-            ), "_to_normal_tensor must return a normal tensor when used under inference_mode"
-
-
-class TestDecodeNTokens:
-    """Tests for decode_n_tokens loop: chunking, EOS, and streaming vs non-streaming."""
-
-    @pytest.fixture
-    def mock_model(self):
-        """Minimal mock model for decode_n_tokens (config + tokenizer)."""
-        model = mock.Mock()
-        model.config.num_codebooks = 10
-        model.tokenizer.get_token_id = mock.Mock(return_value=99999)  # EOS id
-        return model
-
-    def _make_inputs(self, device="cpu", seq_len=1):
-        codebook_dim = 11  # 1 + num_codebooks
-        cur_token = torch.randint(
-            0, 100, (1, codebook_dim, seq_len), device=device, dtype=torch.long
-        )
-        input_pos = torch.tensor([0], device=device, dtype=torch.long)
-        temperature = torch.tensor(0.7, device=device)
-        top_p = torch.tensor(0.8, device=device)
-        semantic_logit_bias = torch.zeros(1, 1, 100, device=device)
-        return cur_token, input_pos, temperature, top_p, semantic_logit_bias
-
-    @mock.patch("fish_speech.models.text2semantic.inference.tqdm", lambda x: x)
-    def test_streaming_yields_chunks_of_requested_size(self, mock_model):
-        """With stream_chunk_size=5 and mock returning 12 tokens then EOS, we get chunks [5, 5, 2]."""
-        cur_token, input_pos, temperature, top_p, semantic_logit_bias = (
-            self._make_inputs()
-        )
-        EOS_ID = 99999
-        num_codebooks = 10
-        chunk_size = 5
-        tokens_to_generate = 12  # then EOS
-
-        call_count = 0
-
-        def fake_decode_one_token(*, model, x, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            # Return (1, 11, 1) token; last one has EOS at [0,0,0] to stop loop
-            out = torch.randint(1, 100, (1, num_codebooks + 1, 1), dtype=torch.long)
-            if call_count >= tokens_to_generate:
-                out[0, 0, 0] = EOS_ID
-            return out
-
-        with mock.patch("fish_speech.models.text2semantic.inference.logger"):
-            chunks = list(
-                decode_n_tokens(
-                    mock_model,
-                    cur_token,
-                    input_pos,
-                    num_new_tokens=100,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=30,
-                    semantic_logit_bias=semantic_logit_bias,
-                    audio_masks=None,
-                    audio_parts=None,
-                    decode_one_token=fake_decode_one_token,
-                    stream_chunk_size=chunk_size,
-                )
-            )
-
-        # decode_n_tokens cat's on dim=1: each token (1, 11, 1) -> chunk (1, 11*K, 1)
-        assert len(chunks) == 3, "Expected 3 chunks: 5 + 5 + 2"
-        codebook_dim = 11
-        assert chunks[0].shape == (1, codebook_dim * chunk_size, 1)
-        assert chunks[1].shape == (1, codebook_dim * chunk_size, 1)
-        assert chunks[2].shape == (1, codebook_dim * 2, 1)
-        assert call_count == tokens_to_generate
-
-    @mock.patch("fish_speech.models.text2semantic.inference.tqdm", lambda x: x)
-    def test_non_streaming_yields_single_chunk(self, mock_model):
-        """With stream_chunk_size=None we get one chunk with all generated tokens."""
-        cur_token, input_pos, temperature, top_p, semantic_logit_bias = (
-            self._make_inputs()
-        )
-        EOS_ID = 99999
-        num_codebooks = 10
-        total_tokens = 7
-
-        call_count = 0
-
-        def fake_decode_one_token(*, model, x, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            out = torch.randint(1, 100, (1, num_codebooks + 1, 1), dtype=torch.long)
-            if call_count >= total_tokens:
-                out[0, 0, 0] = EOS_ID
-            return out
-
-        with mock.patch("fish_speech.models.text2semantic.inference.logger"):
-            chunks = list(
-                decode_n_tokens(
-                    mock_model,
-                    cur_token,
-                    input_pos,
-                    num_new_tokens=100,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=30,
-                    semantic_logit_bias=semantic_logit_bias,
-                    audio_masks=None,
-                    audio_parts=None,
-                    decode_one_token=fake_decode_one_token,
-                    stream_chunk_size=None,
-                )
-            )
-
-        # Non-streaming: one chunk (1, 11*K, 1)
-        assert len(chunks) == 1
-        assert chunks[0].shape == (1, 11 * total_tokens, 1)
-        assert call_count == total_tokens
-
-    @mock.patch("fish_speech.models.text2semantic.inference.tqdm", lambda x: x)
-    def test_streaming_eos_before_full_chunk(self, mock_model):
-        """EOS after 2 tokens with stream_chunk_size=5 yields one remainder chunk of 2."""
-        cur_token, input_pos, temperature, top_p, semantic_logit_bias = (
-            self._make_inputs()
-        )
-        EOS_ID = 99999
-        num_codebooks = 10
-
-        call_count = 0
-
-        def fake_decode_one_token(*, model, x, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            out = torch.randint(1, 100, (1, num_codebooks + 1, 1), dtype=torch.long)
-            if call_count >= 2:
-                out[0, 0, 0] = EOS_ID
-            return out
-
-        with mock.patch("fish_speech.models.text2semantic.inference.logger"):
-            chunks = list(
-                decode_n_tokens(
-                    mock_model,
-                    cur_token,
-                    input_pos,
-                    num_new_tokens=100,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=30,
-                    semantic_logit_bias=semantic_logit_bias,
-                    audio_masks=None,
-                    audio_parts=None,
-                    decode_one_token=fake_decode_one_token,
-                    stream_chunk_size=5,
-                )
-            )
-
-        assert len(chunks) == 1
-        assert chunks[0].shape == (1, 11 * 2, 1)
-        assert call_count == 2
+# scripts/warmup_5090.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+PORT="${PORT:-8080}"
+BASE_URL="${BASE_URL:-http://127.0.0.1:${PORT}}"
+WARMUP_TIMEOUT="${WARMUP_TIMEOUT:-1800}"
+WARMUP_TEXT="${WARMUP_TEXT:-Привет. Это дополнительный прогрев стримингового режима для Fish Speech.}"
+OUT_FILE="${OUT_FILE:-$REPO_ROOT/logs/warmup_stream.wav}"
+
+mkdir -p "$REPO_ROOT/logs"
+
+echo "Waiting for model health: $BASE_URL/v1/health"
+
+START_TS="$(date +%s)"
+while true; do
+  if curl -sf "$BASE_URL/v1/health" >/dev/null 2>&1; then
+    break
+  fi
+
+  NOW_TS="$(date +%s)"
+  ELAPSED="$((NOW_TS - START_TS))"
+  echo "Still warming up... ${ELAPSED}s"
+
+  if [[ "$ELAPSED" -ge "$WARMUP_TIMEOUT" ]]; then
+    echo "ERROR: model did not become healthy within ${WARMUP_TIMEOUT}s" >&2
+    exit 1
+  fi
+
+  sleep 10
+done
+
+echo "Model is healthy after $(( $(date +%s) - START_TS ))s"
+echo "Sending one extra warmup streaming request..."
+
+curl -sf -X POST "$BASE_URL/v1/tts" \
+  -H 'Content-Type: application/json' \
+  -d "{\"text\":\"${WARMUP_TEXT}\",\"streaming\":true}" \
+  --output "$OUT_FILE" \
+  --max-time 180 >/dev/null
+
+echo "Warmup completed"
+echo "Current memory:"
+curl -sf "$BASE_URL/v1/debug/memory" || true
+echo
 
 
 path: /tools/api_client.py
 ----------------------------------------
+# tools/api_client.py
 import argparse
 import base64
 import time
@@ -10223,6 +8594,7 @@ if __name__ == "__main__":
 
 path: /tools/api_server.py
 ----------------------------------------
+# tools/api_server.py
 import re
 import warnings
 from threading import Lock
@@ -10356,957 +8728,9 @@ if __name__ == "__main__":
     )
 
 
-path: /tools/llama/build_dataset.py
-----------------------------------------
-import itertools
-import os
-import re
-from collections import defaultdict
-from functools import partial
-from multiprocessing import Pool
-from pathlib import Path
-
-import click
-import numpy as np
-from loguru import logger
-from tqdm import tqdm
-
-from fish_speech.datasets.protos.text_data_pb2 import Semantics, Sentence, TextData
-from fish_speech.datasets.protos.text_data_stream import pack_pb_stream
-from fish_speech.utils.file import load_filelist
-
-# To avoid CPU overload
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OMP_NUM_THREADS"] = "1"
-
-
-def task_generator_folder(root: Path, text_extension: str):
-    files = list(tqdm(Path(root).rglob("*.npy"), desc=f"Loading {root}"))
-    files = sorted(files)
-
-    grouped_files = defaultdict(list)
-    for file in tqdm(files, desc=f"Grouping {root}"):
-        p = str(file.parent)
-        speaker = file.parent.name
-
-        try:
-            if isinstance(text_extension, str):
-                texts = [file.with_suffix(text_extension).read_text(encoding="utf-8")]
-            else:
-                texts = [
-                    file.with_suffix(ext).read_text(encoding="utf-8")
-                    for ext in text_extension
-                ]
-        except Exception as e:
-            logger.error(f"Failed to read text {file}: {e}")
-            continue
-
-        grouped_files[p].append((speaker, file, texts))
-
-    logger.info(
-        f"Found {len(grouped_files)} groups in {root}, {list(grouped_files.keys())[:5]}..."
-    )
-
-    for i in grouped_files.values():
-        subset = [(f, t) for _, f, t in i]
-        yield i[0][0], subset, "folder"
-
-
-def task_generator_filelist(filelist):
-    grouped_files = defaultdict(list)
-    for filename, speaker, _, text in load_filelist(filelist):
-        grouped_files[speaker].append((Path(filename), [text]))
-
-    logger.info(f"Found {len(grouped_files)} groups in {filelist}")
-    for speaker, values in grouped_files.items():
-        yield speaker, values, "filelist"
-
-
-def run_task(task):
-    name, subset, source = task
-
-    # Parse the files
-    sentences = []
-    for file, texts in subset:
-        np_file = file.with_suffix(".npy")
-        if np_file.exists() is False:
-            logger.warning(f"Can't find {np_file}")
-            continue
-
-        new_texts = []
-
-        for text in texts:
-            # Simple cleaning: replace { xxx } and < xxx > with space
-            text = re.sub(r"\{.*?\}", " ", text)
-            text = re.sub(r"<.*?>", " ", text)
-            text = re.sub(r"\s+", " ", text)
-            new_texts.append(text)
-
-        try:
-            semantics = np.load(np_file)
-        except Exception as e:
-            logger.error(f"Failed to parse {file}: {e}")
-            continue
-
-        if isinstance(semantics, np.ndarray):
-            semantics = semantics.tolist()
-
-        sentences.append(
-            Sentence(
-                texts=new_texts,
-                semantics=[Semantics(values=s) for s in semantics],
-            )
-        )
-
-    # Pack the sentences
-    return pack_pb_stream(
-        TextData(
-            source=source,
-            name=name,
-            sentences=sentences,
-        )
-    )
-
-
-@click.command()
-@click.option(
-    "--input",
-    type=click.Path(path_type=Path),
-    required=True,
-    help="A folder containing the dataset or a filelist",
-    multiple=True,
-)
-@click.option(
-    "--output", type=click.Path(path_type=Path), default="data/quantized-dataset-ft"
-)
-@click.option("--num-workers", type=int, default=16)
-@click.option("--text-extension", type=str, default=[".txt"], multiple=True)
-@click.option(
-    "--shard-size", type=int, default=10, help="The maximum size of each shard in mb"
-)
-def main(input, output, num_workers, text_extension, shard_size):
-    generator_fns = []
-
-    for f in input:
-        assert f.exists(), f"{f} not found"
-
-        if f.is_dir():
-            generator_fn = task_generator_folder(f, text_extension)
-        else:
-            generator_fn = task_generator_filelist(f)
-
-        generator_fns.append(generator_fn)
-
-    generator_fn = itertools.chain(*generator_fns)
-    output.mkdir(parents=True, exist_ok=True)
-
-    dataset_fp = None
-    tar_idx = 0
-    written_size = 0
-
-    with Pool(num_workers) as p:
-        for result in tqdm(p.imap_unordered(run_task, generator_fn)):
-            if dataset_fp is None:
-                dataset_fp = open(Path(output) / f"{tar_idx:08d}.protos", "wb")
-
-            dataset_fp.write(result)
-            written_size += len(result)
-
-            if written_size > shard_size * 1024 * 1024:
-                logger.info(f"Finished writing {tar_idx} shards to {output}")
-                dataset_fp.close()
-                dataset_fp = None
-                written_size = 0
-                tar_idx += 1
-
-    if dataset_fp is not None:
-        dataset_fp.close()
-
-    logger.info(f"Finished writing {tar_idx + 1} shards to {output}")
-
-
-if __name__ == "__main__":
-    main()
-
-
-path: /tools/llama/eval_in_context.py
-----------------------------------------
-import pyrootutils
-import torch
-import torch.nn.functional as F
-from matplotlib import pyplot as plt
-from transformers import AutoTokenizer
-
-# register eval resolver and root
-pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
-
-from torch.utils.data import DataLoader
-
-from fish_speech.datasets.semantic import AutoAugTextDataset, TextDataCollator
-from fish_speech.models.text2semantic.inference import load_model
-
-
-def smooth(
-    scalars: list[float], weight: float
-) -> list[float]:  # Weight between 0 and 1
-    last = scalars[0]  # First value in the plot (first timestep)
-    smoothed = list()
-    for point in scalars:
-        smoothed_val = last * weight + (1 - weight) * point  # Calculate smoothed value
-        smoothed.append(smoothed_val)  # Save it
-        last = smoothed_val  # Anchor the last smoothed value
-
-    return smoothed
-
-
-@torch.inference_mode()
-def analyze_one_model(loader, config, weight, max_length):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = load_model(
-        config,
-        weight,
-        device,
-        torch.bfloat16,
-        max_length,
-        compile=False,
-    )[0]
-
-    current_step = 0
-    model.eval()
-
-    semantic_loss_sum = torch.zeros(
-        max_length,
-        dtype=torch.float32,
-        device=device,
-    )
-    counter = torch.zeros(
-        max_length,
-        dtype=torch.long,
-        device=device,
-    )
-
-    for batch in loader:
-        batch = {k: v.to(device) for k, v in batch.items()}
-
-        labels = batch["labels"]
-        outputs = model(
-            inp=batch["inputs"],
-            key_padding_mask=batch["attention_masks"],
-        )
-
-        token_logits = outputs.token_logits
-        codebook_logits = outputs.codebook_logits
-
-        # Generate labels
-        base_loss = F.cross_entropy(
-            token_logits.reshape(-1, token_logits.size(-1)),
-            labels[:, 0].reshape(-1),
-            ignore_index=-100,
-            reduction="none",
-        )
-
-        codebook_labels = labels[:, 1 : 1 + model.config.num_codebooks].mT
-        semantic_loss = F.cross_entropy(
-            codebook_logits.reshape(-1, codebook_logits.size(-1)),
-            codebook_labels.reshape(-1),
-            ignore_index=-100,
-            reduction="none",
-        )
-
-        base_loss = base_loss.reshape(labels[:, 0].shape)
-        semantic_loss = semantic_loss.reshape(codebook_labels.shape)
-
-        semantic_loss_frame = semantic_loss.mean(-1)
-        pad_pos = codebook_labels.sum(-1) == -100 * model.config.num_codebooks
-
-        for loss_sample, pad in zip(semantic_loss_frame, pad_pos):
-            semantic_loss_sum[~pad] += loss_sample[~pad]
-            counter[~pad] += 1
-
-        current_step += 1
-        if current_step == 10:
-            break
-
-    semantic_loss = semantic_loss.cpu()
-    counter = counter.cpu()
-    xs, ys = [], []
-
-    for i, (loss, count) in enumerate(zip(semantic_loss_sum, counter)):
-        if count > 0:
-            xs.append(i)
-            ys.append((loss / count).item())  # for better loss visualization
-
-    smoothed_ys = smooth(ys, 0.95)
-
-    # Unload model
-    del model
-    torch.cuda.empty_cache()
-
-    return xs, ys, smoothed_ys
-
-
-def main():
-    tokenizer = AutoTokenizer.from_pretrained("fishaudio/fish-speech-1")
-    max_length = 4096
-
-    ds = AutoAugTextDataset(
-        ["data/protos/sft/云天河"],
-        tokenizer=tokenizer,
-        use_speaker=False,
-        interactive_prob=1.0,
-        max_length=max_length,
-    )
-
-    loader = DataLoader(
-        ds,
-        batch_size=8,
-        collate_fn=TextDataCollator(tokenizer, max_length=max_length),
-        num_workers=0,
-        shuffle=False,
-    )
-
-    plt.figure(figsize=(10, 5), dpi=200)
-
-    plt.xlabel("Frame")
-    plt.ylabel("Loss")
-    plt.yscale("log")
-    plt.title("Semantic Loss")
-    plt.grid(which="both", axis="both")
-    plt.xlim(0, max_length)
-
-    tests = [
-        (
-            "pertrain-medium",
-            "dual_ar_2_codebook_medium",
-            "checkpoints/text2semantic-pretrain-medium-2k-v1.pth",
-        ),
-        (
-            "sft-medium",
-            "dual_ar_2_codebook_medium",
-            "checkpoints/text2semantic-sft-medium-v1.1-4k.pth",
-        ),
-        (
-            "sft-large",
-            "dual_ar_2_codebook_large",
-            "checkpoints/text2semantic-sft-large-v1.1-4k.pth",
-        ),
-    ]
-
-    for name, config, weight in tests:
-        xs, _, smoothed_ys = analyze_one_model(loader, config, weight, max_length)
-        plt.plot(xs, smoothed_ys, label=name)
-
-    plt.legend()
-    plt.savefig("semantic_loss.png")
-
-
-if __name__ == "__main__":
-    main()
-
-
-path: /tools/llama/merge_lora.py
-----------------------------------------
-import shutil
-from copy import deepcopy
-from pathlib import Path
-
-import click
-import hydra
-import torch
-from hydra import compose, initialize
-from hydra.utils import instantiate
-from loguru import logger
-
-from fish_speech.models.text2semantic.llama import BaseTransformer
-from fish_speech.models.text2semantic.lora import get_merged_state_dict
-
-
-@click.command()
-@click.option("--lora-config", type=str, default="r_8_alpha_16")
-@click.option("--base-weight", type=str, default="checkpoints/fish-speech-1.4")
-@click.option("--lora-weight", type=str, required=True)
-@click.option("--output", type=str, required=True)
-def merge(lora_config, base_weight, lora_weight, output):
-    output = Path(output)
-    logger.info(
-        f"Merging {base_weight} and {lora_weight} into {output} with {lora_config}"
-    )
-
-    with initialize(version_base="1.3", config_path="../../fish_speech/configs/lora"):
-        cfg = compose(config_name=lora_config)
-
-    lora_config = instantiate(cfg)
-    logger.info(f"Loaded lora model with config {lora_config}")
-
-    llama_model = BaseTransformer.from_pretrained(
-        path=base_weight,
-        load_weights=True,
-        lora_config=lora_config,
-    )
-    logger.info(f"Loaded llama model")
-
-    llama_state_dict = llama_model.state_dict()
-    llama_state_dict = {k: v for k, v in llama_state_dict.items() if "lora" not in k}
-    llama_state_dict_copy = deepcopy(llama_state_dict)
-    lora_state_dict = torch.load(lora_weight, map_location="cpu", weights_only=False)
-
-    if "state_dict" in llama_state_dict:
-        llama_state_dict = llama_state_dict["state_dict"]
-
-    if "state_dict" in lora_state_dict:
-        lora_state_dict = lora_state_dict["state_dict"]
-
-    # remove prefix model.
-    if any(k.startswith("model.") for k in llama_state_dict.keys()):
-        llama_state_dict = {
-            k.replace("model.", ""): v
-            for k, v in llama_state_dict.items()
-            if k.startswith("model.")
-        }
-    if any(k.startswith("model.") for k in lora_state_dict.keys()):
-        lora_state_dict = {
-            k.replace("model.", ""): v
-            for k, v in lora_state_dict.items()
-            if k.startswith("model.")
-        }
-
-    logger.info(f"Found {len(llama_state_dict)} keys in llama model")
-    logger.info(f"Found {len(lora_state_dict)} keys in lora model")
-
-    merged_state_dict = llama_state_dict | lora_state_dict
-    llama_model.load_state_dict(merged_state_dict, strict=True)
-    logger.info(f"Merged model loaded")
-
-    # Trigger eval mode to merge lora
-    llama_model.eval()
-    llama_model.save_pretrained(output, drop_lora=True)
-    logger.info(f"Saved merged model to {output}, validating")
-
-    new_state_dict = torch.load(output / "model.pth", map_location="cpu")
-    original_keys = set(llama_state_dict_copy.keys())
-
-    tolerance = 1e-5
-    for key in original_keys:
-        diff_l1 = (new_state_dict[key] - llama_state_dict_copy[key]).abs().sum().item()
-        if diff_l1 > tolerance:
-            logger.info(f"Significant difference found in key: {key}")
-            break
-
-    if diff_l1 <= tolerance:
-        logger.warning(
-            "Merged model seems identical to the original model. Further validation might be needed."
-        )
-    else:
-        logger.info("Merged model is different from the original model, check passed")
-
-
-if __name__ == "__main__":
-    merge()
-
-
-path: /tools/llama/quantize.py
-----------------------------------------
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-import datetime
-import shutil
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-import time
-from pathlib import Path
-
-import click
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-from fish_speech.models.text2semantic.inference import load_model
-from fish_speech.models.text2semantic.llama import find_multiple
-
-##### Quantization Primitives ######
-
-
-def dynamically_quantize_per_channel(x, quant_min, quant_max, target_dtype):
-    # assumes symmetric quantization
-    # assumes axis == 0
-    # assumes dense memory format
-    # TODO(future): relax ^ as needed
-
-    # default setup for affine quantization of activations
-    eps = torch.finfo(torch.float32).eps
-
-    # get min and max
-    min_val, max_val = torch.aminmax(x, dim=1)
-
-    # calculate scales and zero_points based on min and max
-    # reference: https://fburl.com/code/srbiybme
-    min_val_neg = torch.min(min_val, torch.zeros_like(min_val))
-    max_val_pos = torch.max(max_val, torch.zeros_like(max_val))
-    device = min_val_neg.device
-
-    # reference: https://fburl.com/code/4wll53rk
-    max_val_pos = torch.max(-min_val_neg, max_val_pos)
-    scales = max_val_pos / (float(quant_max - quant_min) / 2)
-    # ensure scales is the same dtype as the original tensor
-    scales = torch.clamp(scales, min=eps).to(x.dtype)
-    zero_points = torch.zeros(min_val_neg.size(), dtype=torch.int64, device=device)
-
-    # quantize based on qmin/qmax/scales/zp
-    # reference: https://www.internalfb.com/code/fbsource/[8edc275012b1]/fbcode/caffe2/torch/ao/quantization/fx/_decomposed.py?lines=63
-    x_div = x / scales.unsqueeze(-1)
-    x_round = torch.round(x_div)
-    x_zp = x_round + zero_points.unsqueeze(-1)
-    quant = torch.clamp(x_zp, quant_min, quant_max).to(target_dtype)
-
-    return quant, scales, zero_points
-
-
-def get_group_qparams(w, n_bit=4, groupsize=128):
-    # needed for GPTQ with padding
-    if groupsize > w.shape[-1]:
-        groupsize = w.shape[-1]
-    assert groupsize > 1
-    assert w.shape[-1] % groupsize == 0
-    assert w.dim() == 2
-
-    to_quant = w.reshape(-1, groupsize)
-    assert torch.isnan(to_quant).sum() == 0
-
-    max_val = to_quant.amax(dim=1, keepdim=True)
-    min_val = to_quant.amin(dim=1, keepdim=True)
-    max_int = 2**n_bit - 1
-    scales = (max_val - min_val).clamp(min=1e-6) / max_int
-    zeros = min_val + scales * (2 ** (n_bit - 1))
-    return scales.to(torch.bfloat16).reshape(w.shape[0], -1), zeros.to(
-        torch.bfloat16
-    ).reshape(w.shape[0], -1)
-
-
-def pack_scales_and_zeros(scales, zeros):
-    assert scales.shape == zeros.shape
-    assert scales.dtype == torch.bfloat16
-    assert zeros.dtype == torch.bfloat16
-    return (
-        torch.cat(
-            [
-                scales.reshape(scales.size(0), scales.size(1), 1),
-                zeros.reshape(zeros.size(0), zeros.size(1), 1),
-            ],
-            2,
-        )
-        .transpose(0, 1)
-        .contiguous()
-    )
-
-
-def unpack_scales_and_zeros(scales_and_zeros):
-    assert len(scales_and_zeros.shape) == 3 and scales_and_zeros.shape[2] == 2
-    assert scales_and_zeros.dtype == torch.float
-    return torch.split(scales_and_zeros.transpose(0, 1), 1, 2)
-
-
-def group_quantize_tensor_from_qparams(w, scales, zeros, n_bit=4, groupsize=128):
-    assert groupsize > 1
-    # needed for GPTQ single column quantize
-    if groupsize > w.shape[-1] and scales.shape[-1] == 1:
-        groupsize = w.shape[-1]
-
-    assert w.shape[-1] % groupsize == 0
-    assert w.dim() == 2
-
-    to_quant = w.reshape(-1, groupsize)
-    assert torch.isnan(to_quant).sum() == 0
-
-    scales = scales.reshape(-1, 1)
-    zeros = zeros.reshape(-1, 1)
-    min_val = zeros - scales * (2 ** (n_bit - 1))
-    max_int = 2**n_bit - 1
-    min_int = 0
-    w_int32 = (
-        to_quant.sub(min_val)
-        .div(scales)
-        .round()
-        .clamp_(min_int, max_int)
-        .to(torch.int32)
-        .reshape_as(w)
-    )
-
-    return w_int32
-
-
-def group_quantize_tensor(w, n_bit=4, groupsize=128):
-    scales, zeros = get_group_qparams(w, n_bit, groupsize)
-    w_int32 = group_quantize_tensor_from_qparams(w, scales, zeros, n_bit, groupsize)
-    scales_and_zeros = pack_scales_and_zeros(scales, zeros)
-    return w_int32, scales_and_zeros
-
-
-def group_dequantize_tensor_from_qparams(
-    w_int32, scales, zeros, n_bit=4, groupsize=128
-):
-    assert groupsize > 1
-    # needed for GPTQ single column dequantize
-    if groupsize > w_int32.shape[-1] and scales.shape[-1] == 1:
-        groupsize = w_int32.shape[-1]
-    assert w_int32.shape[-1] % groupsize == 0
-    assert w_int32.dim() == 2
-
-    w_int32_grouped = w_int32.reshape(-1, groupsize)
-    scales = scales.reshape(-1, 1)
-    zeros = zeros.reshape(-1, 1)
-
-    w_dq = (
-        w_int32_grouped.sub(2 ** (n_bit - 1)).mul(scales).add(zeros).reshape_as(w_int32)
-    )
-    return w_dq
-
-
-def group_dequantize_tensor(w_int32, scales_and_zeros, n_bit=4, groupsize=128):
-    scales, zeros = unpack_scales_and_zeros(scales_and_zeros)
-    return group_dequantize_tensor_from_qparams(
-        w_int32, scales, zeros, n_bit, groupsize
-    )
-
-
-class QuantHandler:
-    def __init__(self, mod):
-        self.mod = mod
-
-    def create_quantized_state_dict(self) -> "StateDict":
-        pass
-
-    def convert_for_runtime(self) -> "nn.Module":
-        pass
-
-
-##### Weight-only int8 per-channel quantized code ######
-
-
-def replace_linear_weight_only_int8_per_channel(module):
-    for name, child in module.named_children():
-        if isinstance(child, nn.Linear):
-            setattr(
-                module,
-                name,
-                WeightOnlyInt8Linear(child.in_features, child.out_features),
-            )
-        else:
-            replace_linear_weight_only_int8_per_channel(child)
-
-
-class WeightOnlyInt8QuantHandler:
-    def __init__(self, mod):
-        self.mod = mod
-
-    @torch.no_grad()
-    def create_quantized_state_dict(self):
-        cur_state_dict = self.mod.state_dict()
-        for fqn, mod in self.mod.named_modules():
-            if isinstance(mod, torch.nn.Linear):
-                int8_weight, scales, _ = dynamically_quantize_per_channel(
-                    mod.weight.float(), -128, 127, torch.int8
-                )
-                cur_state_dict[f"{fqn}.weight"] = int8_weight
-                cur_state_dict[f"{fqn}.scales"] = scales.to(mod.weight.dtype)
-
-        return cur_state_dict
-
-    def convert_for_runtime(self):
-        replace_linear_weight_only_int8_per_channel(self.mod)
-        return self.mod
-
-
-class WeightOnlyInt8Linear(torch.nn.Module):
-    __constants__ = ["in_features", "out_features"]
-    in_features: int
-    out_features: int
-    weight: torch.Tensor
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        bias: bool = True,
-        device=None,
-        dtype=None,
-    ) -> None:
-        factory_kwargs = {"device": device, "dtype": dtype}
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.register_buffer(
-            "weight", torch.empty((out_features, in_features), dtype=torch.int8)
-        )
-        self.register_buffer("scales", torch.ones(out_features, dtype=torch.bfloat16))
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return F.linear(input, self.weight.to(dtype=input.dtype)) * self.scales
-
-
-##### weight only int4 per channel groupwise quantized code ######
-
-
-def prepare_int4_weight_and_scales_and_zeros(weight_bf16, groupsize, inner_k_tiles):
-    weight_int32, scales_and_zeros = group_quantize_tensor(
-        weight_bf16, n_bit=4, groupsize=groupsize
-    )
-    weight_int4pack = torch.ops.aten._convert_weight_to_int4pack(
-        weight_int32, inner_k_tiles
-    )
-    return weight_int4pack, scales_and_zeros
-
-
-def linear_forward_int4(x, weight_int4pack, scales_and_zeros, out_features, groupsize):
-    origin_x_size = x.size()
-    x = x.reshape(-1, origin_x_size[-1])
-    c = torch.ops.aten._weight_int4pack_mm(
-        x, weight_int4pack, groupsize, scales_and_zeros
-    )
-    new_shape = origin_x_size[:-1] + (out_features,)
-    c = c.reshape(new_shape)
-    return c
-
-
-def _check_linear_int4_k(k, groupsize=1, inner_k_tiles=1):
-    return k % groupsize == 0 and k % (inner_k_tiles * 16) == 0
-
-
-def replace_linear_int4(module, groupsize, inner_k_tiles, padding):
-    for name, child in module.named_children():
-        if isinstance(child, nn.Linear):
-            if _check_linear_int4_k(child.in_features, groupsize, inner_k_tiles):
-                setattr(
-                    module,
-                    name,
-                    WeightOnlyInt4Linear(
-                        child.in_features,
-                        child.out_features,
-                        bias=False,
-                        groupsize=groupsize,
-                        inner_k_tiles=inner_k_tiles,
-                        padding=False,
-                    ),
-                )
-            elif padding:
-                setattr(
-                    module,
-                    name,
-                    WeightOnlyInt4Linear(
-                        child.in_features,
-                        child.out_features,
-                        bias=False,
-                        groupsize=groupsize,
-                        inner_k_tiles=inner_k_tiles,
-                        padding=True,
-                    ),
-                )
-        else:
-            replace_linear_int4(child, groupsize, inner_k_tiles, padding)
-
-
-class WeightOnlyInt4QuantHandler:
-    def __init__(self, mod, groupsize=128, inner_k_tiles=8, padding=True):
-        self.mod = mod
-        self.groupsize = groupsize
-        self.inner_k_tiles = inner_k_tiles
-        self.padding = padding
-        assert groupsize in [32, 64, 128, 256]
-        assert inner_k_tiles in [2, 4, 8]
-
-    @torch.no_grad()
-    def create_quantized_state_dict(self):
-        cur_state_dict = self.mod.state_dict()
-        for fqn, mod in self.mod.named_modules():
-            if isinstance(mod, torch.nn.Linear):
-                assert not mod.bias
-                out_features = mod.out_features
-                in_features = mod.in_features
-                assert out_features % 8 == 0, "require out_features % 8 == 0"
-                print(f"linear: {fqn}, in={in_features}, out={out_features}")
-
-                weight = mod.weight.data
-                if not _check_linear_int4_k(
-                    in_features, self.groupsize, self.inner_k_tiles
-                ):
-                    if self.padding:
-                        import torch.nn.functional as F
-
-                        print(
-                            f"warning: {fqn} is padded to satisfy in_features % 1024 == 0"
-                        )
-                        padded_in_features = find_multiple(in_features, 1024)
-                        weight = F.pad(
-                            weight, pad=(0, padded_in_features - in_features)
-                        )
-                    else:
-                        print(
-                            f"warning: {fqn} is skipped, int4 requires that in_features is 32, 64, or is divisible by 1024, "
-                            + "and that groupsize and inner_k_tiles*16 evenly divide into it"
-                        )
-                        continue
-                (
-                    weight_int4pack,
-                    scales_and_zeros,
-                ) = prepare_int4_weight_and_scales_and_zeros(
-                    weight.to(torch.bfloat16).to("cuda"),
-                    self.groupsize,
-                    self.inner_k_tiles,
-                )
-                cur_state_dict[f"{fqn}.weight"] = weight_int4pack.to("cpu")
-                cur_state_dict[f"{fqn}.scales_and_zeros"] = scales_and_zeros.to("cpu")
-
-        return cur_state_dict
-
-    def convert_for_runtime(self):
-        replace_linear_int4(self.mod, self.groupsize, self.inner_k_tiles, self.padding)
-        return self.mod
-
-
-class WeightOnlyInt4Linear(torch.nn.Module):
-    __constants__ = ["in_features", "out_features"]
-    in_features: int
-    out_features: int
-    weight: torch.Tensor
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        bias=True,
-        device=None,
-        dtype=None,
-        groupsize: int = 128,
-        inner_k_tiles: int = 8,
-        padding: bool = True,
-    ) -> None:
-        super().__init__()
-        self.padding = padding
-        if padding:
-            self.origin_in_features = in_features
-            in_features = find_multiple(in_features, 1024)
-
-        self.in_features = in_features
-        self.out_features = out_features
-        assert not bias, "require bias=False"
-        self.groupsize = groupsize
-        self.inner_k_tiles = inner_k_tiles
-
-        assert out_features % 8 == 0, "require out_features % 8 == 0"
-        assert (
-            in_features % (inner_k_tiles * 16) == 0
-        ), "require in_features % (innerKTiles * 16) == 0"
-        self.register_buffer(
-            "weight",
-            torch.empty(
-                (
-                    out_features // 8,
-                    in_features // (inner_k_tiles * 16),
-                    32,
-                    inner_k_tiles // 2,
-                ),
-                dtype=torch.int32,
-            ),
-        )
-        self.register_buffer(
-            "scales_and_zeros",
-            torch.empty(
-                (in_features // groupsize, out_features, 2), dtype=torch.bfloat16
-            ),
-        )
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        input = input.to(torch.bfloat16)
-        if self.padding:
-            import torch.nn.functional as F
-
-            input = F.pad(input, pad=(0, self.in_features - self.origin_in_features))
-        return linear_forward_int4(
-            input, self.weight, self.scales_and_zeros, self.out_features, self.groupsize
-        )
-
-
-def generate_folder_name():
-    now = datetime.datetime.now()
-    folder_name = now.strftime("%Y%m%d_%H%M%S")
-    return folder_name
-
-
-@click.command()
-@click.option(
-    "--checkpoint-path",
-    type=click.Path(path_type=Path, exists=True),
-    default="checkpoints/fish-speech-1.4",
-)
-@click.option(
-    "--mode", type=str, default="int8", help="type of quantization to perform"
-)
-@click.option(
-    "--groupsize", type=int, default=128, help="Group size for int4 quantization."
-)
-@click.option("--timestamp", type=str, default="None", help="When to do quantization")
-def quantize(checkpoint_path: Path, mode: str, groupsize: int, timestamp: str) -> None:
-
-    device = "cpu"
-    precision = torch.bfloat16
-
-    print("Loading model ...")
-    t0 = time.time()
-
-    model, _ = load_model(
-        checkpoint_path=checkpoint_path,
-        device=device,
-        precision=precision,
-        compile=False,
-    )
-    vq_model = "codec.pth"
-    now = timestamp if timestamp != "None" else generate_folder_name()
-
-    if mode == "int8":
-        print(
-            "Quantizing model weights for int8 weight-only symmetric per-channel quantization"
-        )
-        quant_handler = WeightOnlyInt8QuantHandler(model)
-        quantized_state_dict = quant_handler.create_quantized_state_dict()
-
-        dir_name = checkpoint_path
-        dst_name = Path(f"checkpoints/fs-1.2-int8-{now}")
-        shutil.copytree(str(dir_name.resolve()), str(dst_name.resolve()))
-        if (dst_name / vq_model).exists():
-            (dst_name / vq_model).unlink()
-        quantize_path = dst_name / "model.pth"
-
-    elif mode == "int4":
-        print(
-            "Quantizing model weights for int4 weight-only affine per-channel groupwise quantization"
-        )
-        quant_handler = WeightOnlyInt4QuantHandler(model, groupsize)
-        quantized_state_dict = quant_handler.create_quantized_state_dict()
-
-        dir_name = checkpoint_path
-        dst_name = Path(f"checkpoints/fs-1.2-int4-g{groupsize}-{now}")
-        shutil.copytree(str(dir_name.resolve()), str(dst_name.resolve()))
-        if (dst_name / vq_model).exists():
-            (dst_name / vq_model).unlink()
-        quantize_path = dst_name / "model.pth"
-
-    else:
-        raise ValueError(
-            f"Invalid quantization mode {mode} needs to be one of [int8, int4, int4-gpptq]"
-        )
-
-    print(f"Writing quantized weights to {quantize_path}")
-    quantize_path.unlink(missing_ok=True)  # remove existing file if one already there
-    torch.save(quantized_state_dict, quantize_path)
-    print(f"Quantization complete took {time.time() - t0:.02f} seconds")
-
-
-if __name__ == "__main__":
-    quantize()
-
-
 path: /tools/memory_metrics.py
 ----------------------------------------
+# tools/memory_metrics.py
 #!/usr/bin/env python3
 """
 Poll /v1/debug/memory at a fixed interval; append one JSON line only when metrics change.
@@ -11394,6 +8818,7 @@ if __name__ == "__main__":
 
 path: /tools/preencode_references.py
 ----------------------------------------
+# tools/preencode_references.py
 #!/usr/bin/env python3
 """
 Pre-encode reference audio to .codes.pt so the server skips DAC encode at runtime.
@@ -11641,6 +9066,7 @@ if __name__ == "__main__":
 
 path: /tools/proxy/fish_proxy_pcm.py
 ----------------------------------------
+# tools/proxy/fish_proxy_pcm.py
 import asyncio
 import base64
 import json
@@ -11964,6 +9390,7 @@ async def pcm_stream(
 
 path: /tools/proxy/fish_proxy_server.py
 ----------------------------------------
+# tools/proxy/fish_proxy_server.py
 from __future__ import annotations
 
 import json
@@ -12214,119 +9641,9 @@ async def stream_segments(
     return StreamingResponse(iter_ndjson(), media_type="application/x-ndjson", headers=headers)
 
 
-path: /tools/run_webui.py
-----------------------------------------
-import os
-from argparse import ArgumentParser
-from pathlib import Path
-
-import pyrootutils
-import torch
-from loguru import logger
-
-pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
-
-from fish_speech.inference_engine import TTSInferenceEngine
-from fish_speech.models.dac.inference import load_model as load_decoder_model
-from fish_speech.models.text2semantic.inference import launch_thread_safe_queue
-from fish_speech.utils.schema import ServeTTSRequest
-from tools.webui import build_app
-from tools.webui.inference import get_inference_wrapper
-
-# Make einx happy
-os.environ["EINX_FILTER_TRACEBACK"] = "false"
-
-
-def parse_args():
-    parser = ArgumentParser()
-    parser.add_argument(
-        "--llama-checkpoint-path",
-        type=Path,
-        default="checkpoints/s2-pro",
-    )
-    parser.add_argument(
-        "--decoder-checkpoint-path",
-        type=Path,
-        default="checkpoints/s2-pro/codec.pth",
-    )
-    parser.add_argument("--decoder-config-name", type=str, default="modded_dac_vq")
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--half", action="store_true")
-    parser.add_argument("--compile", action="store_true")
-    parser.add_argument("--max-gradio-length", type=int, default=0)
-    parser.add_argument("--theme", type=str, default="light")
-
-    return parser.parse_args()
-
-
-if __name__ == "__main__":
-    args = parse_args()
-    args.precision = torch.half if args.half else torch.bfloat16
-
-    # Check if MPS or CUDA is available
-    if torch.backends.mps.is_available():
-        args.device = "mps"
-        logger.info("mps is available, running on mps.")
-    elif torch.xpu.is_available():
-        args.device = "xpu"
-        logger.info("XPU is available, running on XPU.")
-    elif not torch.cuda.is_available():
-        logger.info("CUDA is not available, running on CPU.")
-        args.device = "cpu"
-
-    logger.info("Loading Llama model...")
-    llama_queue = launch_thread_safe_queue(
-        checkpoint_path=args.llama_checkpoint_path,
-        device=args.device,
-        precision=args.precision,
-        compile=args.compile,
-    )
-
-    logger.info("Loading VQ-GAN model...")
-    decoder_model = load_decoder_model(
-        config_name=args.decoder_config_name,
-        checkpoint_path=args.decoder_checkpoint_path,
-        device=args.device,
-    )
-
-    logger.info("Decoder model loaded, warming up...")
-
-    # Create the inference engine
-    inference_engine = TTSInferenceEngine(
-        llama_queue=llama_queue,
-        decoder_model=decoder_model,
-        compile=args.compile,
-        precision=args.precision,
-    )
-
-    # Dry run to check if the model is loaded correctly and avoid the first-time latency
-    list(
-        inference_engine.inference(
-            ServeTTSRequest(
-                text="Hello world.",
-                references=[],
-                reference_id=None,
-                max_new_tokens=1024,
-                chunk_length=200,
-                top_p=0.7,
-                repetition_penalty=1.5,
-                temperature=0.7,
-                format="wav",
-            )
-        )
-    )
-
-    logger.info("Warming up done, launching the web UI...")
-
-    # Get the inference function with the immutable arguments
-    inference_fct = get_inference_wrapper(inference_engine)
-
-    app = build_app(inference_fct, args.theme)
-    app.launch()
-
-
 path: /tools/server/api_utils.py
 ----------------------------------------
+# tools/server/api_utils.py
 from argparse import ArgumentParser
 from http import HTTPStatus
 from typing import Annotated, Any
@@ -12480,6 +9797,7 @@ def format_response(response: BaseModel, status_code=200):
 
 path: /tools/server/exception_handler.py
 ----------------------------------------
+# tools/server/exception_handler.py
 import traceback
 from http import HTTPStatus
 
@@ -12511,6 +9829,7 @@ class ExceptionHandler:
 
 path: /tools/server/inference.py
 ----------------------------------------
+# tools/server/inference.py
 from http import HTTPStatus
 
 import numpy as np
@@ -12519,7 +9838,8 @@ from kui.asgi import HTTPException
 from fish_speech.inference_engine import TTSInferenceEngine
 from fish_speech.utils.schema import ServeTTSRequest
 
-AMPLITUDE = 32768  # Needs an explaination
+# float аудио в диапазоне [-1.0, 1.0] -> int16 PCM
+AMPLITUDE = 32768
 
 
 def inference_wrapper(req: ServeTTSRequest, engine: TTSInferenceEngine):
@@ -12528,6 +9848,7 @@ def inference_wrapper(req: ServeTTSRequest, engine: TTSInferenceEngine):
     Used in the API server.
     """
     count = 0
+
     for result in engine.inference(req):
         match result.code:
             case "header":
@@ -12550,6 +9871,12 @@ def inference_wrapper(req: ServeTTSRequest, engine: TTSInferenceEngine):
                     yield (result.audio[1] * AMPLITUDE).astype(np.int16).tobytes()
 
             case "final":
+                # В streaming-режиме final уже содержит весь звук целиком,
+                # а segment уже были отправлены ранее.
+                # Если отдать final ещё раз, пользователь услышит дубль.
+                if req.streaming:
+                    return None
+
                 count += 1
                 if isinstance(result.audio, tuple):
                     final = result.audio[1]
@@ -12557,7 +9884,7 @@ def inference_wrapper(req: ServeTTSRequest, engine: TTSInferenceEngine):
                         yield (final * AMPLITUDE).astype(np.int16).tobytes()
                     elif isinstance(final, (bytes, bytearray)):
                         yield bytes(final)
-                return None  # Stop the generator
+                return None
 
     if count == 0:
         raise HTTPException(
@@ -12568,6 +9895,7 @@ def inference_wrapper(req: ServeTTSRequest, engine: TTSInferenceEngine):
 
 path: /tools/server/model_manager.py
 ----------------------------------------
+# tools/server/model_manager.py
 import os
 
 import torch
@@ -12734,6 +10062,7 @@ class ModelManager:
 
 path: /tools/server/model_utils.py
 ----------------------------------------
+# tools/server/model_utils.py
 import io
 import re
 
@@ -12824,6 +10153,7 @@ def batch_vqgan_decode(model, features):
 
 path: /tools/server/views.py
 ----------------------------------------
+# tools/server/views.py
 import io
 import os
 import re
@@ -13497,600 +10827,9 @@ async def update_reference(
         return format_response(response, status_code=500)
 
 
-path: /tools/vqgan/create_train_split.py
-----------------------------------------
-import math
-from pathlib import Path
-from random import Random
-
-import click
-from loguru import logger
-from pydub import AudioSegment
-from tqdm import tqdm
-
-from fish_speech.utils.file import AUDIO_EXTENSIONS, list_files, load_filelist
-
-
-@click.command()
-@click.argument("root", type=click.Path(exists=True, path_type=Path))
-@click.option("--val-ratio", type=float, default=None)
-@click.option("--val-count", type=int, default=None)
-@click.option("--filelist", default=None, type=Path)
-@click.option("--min-duration", default=None, type=float)
-@click.option("--max-duration", default=None, type=float)
-def main(root, val_ratio, val_count, filelist, min_duration, max_duration):
-    if filelist:
-        files = [i[0] for i in load_filelist(filelist)]
-    else:
-        files = list_files(root, AUDIO_EXTENSIONS, recursive=True, sort=True)
-
-    if min_duration is None and max_duration is None:
-        filtered_files = list(map(str, [file.relative_to(root) for file in files]))
-    else:
-        filtered_files = []
-        for file in tqdm(files):
-            try:
-                audio = AudioSegment.from_file(str(file))
-                duration = len(audio) / 1000.0
-
-                if min_duration is not None and duration < min_duration:
-                    logger.info(
-                        f"Skipping {file} due to duration {duration:.2f} < {min_duration:.2f}"
-                    )
-                    continue
-
-                if max_duration is not None and duration > max_duration:
-                    logger.info(
-                        f"Skipping {file} due to duration {duration:.2f} > {max_duration:.2f}"
-                    )
-                    continue
-
-                filtered_files.append(str(file.relative_to(root)))
-            except Exception as e:
-                logger.info(f"Error processing {file}: {e}")
-
-    logger.info(
-        f"Found {len(files)} files, remaining {len(filtered_files)} files after filtering"
-    )
-
-    Random(42).shuffle(filtered_files)
-
-    if val_count is None and val_ratio is None:
-        logger.info("Validation ratio and count not specified, using min(20%, 100)")
-        val_size = min(100, math.ceil(len(filtered_files) * 0.2))
-    elif val_count is not None and val_ratio is not None:
-        logger.error("Cannot specify both val_count and val_ratio")
-        return
-    elif val_count is not None:
-        if val_count < 1 or val_count > len(filtered_files):
-            logger.error("val_count must be between 1 and number of files")
-            return
-        val_size = val_count
-    else:
-        val_size = math.ceil(len(filtered_files) * val_ratio)
-
-    logger.info(f"Using {val_size} files for validation")
-
-    with open(root / "vq_train_filelist.txt", "w", encoding="utf-8") as f:
-        f.write("\n".join(filtered_files[val_size:]))
-
-    with open(root / "vq_val_filelist.txt", "w", encoding="utf-8") as f:
-        f.write("\n".join(filtered_files[:val_size]))
-
-    logger.info("Done")
-
-
-if __name__ == "__main__":
-    main()
-
-
-path: /tools/vqgan/extract_vq.py
-----------------------------------------
-import os
-import subprocess as sp
-import sys
-import time
-from datetime import timedelta
-from functools import lru_cache
-from pathlib import Path
-from random import Random
-
-import click
-import numpy as np
-import torch
-import torchaudio
-from hydra import compose, initialize
-from hydra.utils import instantiate
-from loguru import logger
-from omegaconf import OmegaConf
-
-from fish_speech.utils.file import AUDIO_EXTENSIONS, list_files, load_filelist
-
-# register eval resolver
-OmegaConf.register_new_resolver("eval", eval)
-# This file is used to convert the audio files to text files using the Whisper model.
-# It's mainly used to generate the training data for the VQ model.
-
-backends = torchaudio.list_audio_backends()
-
-if "ffmpeg" in backends:
-    backend = "ffmpeg"
-else:
-    backend = "soundfile"
-
-RANK = int(os.environ.get("SLURM_PROCID", 0))
-WORLD_SIZE = int(os.environ.get("SLURM_NTASKS", 1))
-
-logger_format = (
-    "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
-    "<level>{level: <8}</level> | "
-    "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
-    "{extra[rank]} - <level>{message}</level>"
-)
-logger.configure(extra={"rank": f"RANK: {RANK} / {WORLD_SIZE}"})
-logger.remove()
-logger.add(sys.stderr, format=logger_format)
-
-
-@lru_cache(maxsize=1)
-def get_model(
-    config_name: str = "modded_dac_vq",
-    checkpoint_path: str = "checkpoints/openaudio-s1-mini/codec.pth",
-    device: str | torch.device = "cuda",
-):
-    with initialize(version_base="1.3", config_path="../../fish_speech/configs"):
-        cfg = compose(config_name=config_name)
-
-    model = instantiate(cfg)
-    state_dict = torch.load(
-        checkpoint_path,
-        map_location=device,
-    )
-    if "state_dict" in state_dict:
-        state_dict = state_dict["state_dict"]
-
-    if any("generator" in k for k in state_dict):
-        state_dict = {
-            k.replace("generator.", ""): v
-            for k, v in state_dict.items()
-            if "generator." in k
-        }
-
-    model.load_state_dict(state_dict, strict=False)
-    model.eval()
-    model.to(device)
-
-    logger.info(f"Loaded model")
-    return model
-
-
-@torch.inference_mode()
-def process_batch(files: list[Path], model) -> float:
-    wavs = []
-    audio_lengths = []
-    new_files = []
-    max_length = total_time = 0
-
-    for file in files:
-        try:
-            wav, sr = torchaudio.load(
-                str(file), backend=backend
-            )  # Need to install libsox-dev
-        except Exception as e:
-            logger.error(f"Error reading {file}: {e}")
-            continue
-
-        if wav.shape[0] > 1:
-            wav = wav.mean(dim=0, keepdim=True)
-
-        wav = torchaudio.functional.resample(wav.cuda(), sr, model.sample_rate)[0]
-        total_time += len(wav) / model.sample_rate
-        max_length = max(max_length, len(wav))
-
-        wavs.append(wav)
-        audio_lengths.append(len(wav))
-        new_files.append(file)
-
-    files = new_files
-
-    # Pad to max length
-    for i, wav in enumerate(wavs):
-        wavs[i] = torch.nn.functional.pad(wav, (0, max_length - len(wav)), "constant")
-
-    audios = torch.stack(wavs, dim=0)[:, None]
-    audio_lengths = torch.tensor(audio_lengths, device=model.device, dtype=torch.long)
-
-    # Calculate lengths
-    indices, feature_lengths = model.encode(audios, audio_lengths)
-
-    # Save to disk
-    outputs = indices.cpu().numpy()
-
-    for file, length, feature, audio_length in zip(
-        files, feature_lengths, outputs, audio_lengths
-    ):
-        feature = feature[:, :length]
-
-        # (T,)
-        with open(file.with_suffix(".npy"), "wb") as f:
-            np.save(f, feature)
-
-    return total_time
-
-
-@click.command()
-@click.argument("folder")
-@click.option("--num-workers", default=1)
-@click.option("--config-name", default="modded_dac_vq")
-@click.option(
-    "--checkpoint-path",
-    default="checkpoints/s2-pro/codec.pth",
-)
-@click.option("--batch-size", default=64)
-@click.option("--filelist", default=None, type=Path)
-def main(
-    folder: str,
-    num_workers: int,
-    config_name: str,
-    checkpoint_path: str,
-    batch_size: int,
-    filelist: Path,
-):
-    if num_workers > 1 and WORLD_SIZE != num_workers:
-        assert WORLD_SIZE == 1, "You should either use SLURM or this launcher, not both"
-
-        logger.info(f"Spawning {num_workers} workers")
-
-        if torch.cuda.is_available():
-            visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-            if visible_devices is None:
-                visible_devices = list(range(torch.cuda.device_count()))
-            else:
-                visible_devices = visible_devices.split(",")
-        else:
-            # Set to empty string to avoid using GPU
-            visible_devices = [""]
-
-        processes = []
-        for i in range(num_workers):
-            env = os.environ.copy()
-            env["CUDA_VISIBLE_DEVICES"] = str(visible_devices[i % len(visible_devices)])
-            env["SLURM_PROCID"] = str(i)
-            env["SLURM_NTASKS"] = str(num_workers)
-
-            processes.append(
-                sp.Popen(
-                    [sys.executable] + sys.argv.copy(),
-                    env=env,
-                )
-            )
-
-        for p in processes:
-            p.wait()
-
-        logger.info(f"All workers finished")
-        return
-
-    # This is a worker
-    logger.info(f"Starting worker")
-    if filelist:
-        files = [i[0] for i in load_filelist(filelist)]
-    else:
-        files = list_files(folder, AUDIO_EXTENSIONS, recursive=True, sort=False)
-
-    print(f"Found {len(files)} files")
-    files = [Path(f) for f in files if not Path(f).with_suffix(".npy").exists()]
-
-    total_files = len(files)
-    files = files[RANK::WORLD_SIZE]
-    logger.info(f"Processing {len(files)}/{total_files} files")
-
-    # Batch processing
-    total_time = 0
-    begin_time = time.time()
-    processed_files = 0
-    model = get_model(config_name, checkpoint_path)
-
-    for n_batch, idx in enumerate(range(0, len(files), batch_size)):
-        batch = files[idx : idx + batch_size]
-        batch_time = process_batch(batch, model)
-
-        total_time += batch_time
-        processed_files += len(batch)
-
-        if (n_batch + 1) % 10 == 0:
-            eta = (
-                (time.time() - begin_time)
-                / processed_files
-                * (len(files) - processed_files)
-            )
-            logger.info(
-                f"Processed {processed_files} files, {total_time / 3600:.2f} hours of audio, "
-                + f"ETA: {timedelta(seconds=round(eta))}s"
-            )
-
-    logger.info(
-        f"Finished processing {len(files)} files, {total_time / 3600:.2f} hours of audio"
-    )
-
-
-if __name__ == "__main__":
-    main()
-
-
-path: /tools/webui/__init__.py
-----------------------------------------
-from typing import Callable
-
-import gradio as gr
-
-from fish_speech.i18n import i18n
-from tools.webui.variables import HEADER_MD, TEXTBOX_PLACEHOLDER
-
-
-def build_app(inference_fct: Callable, theme: str = "light") -> gr.Blocks:
-    with gr.Blocks(theme=gr.themes.Base()) as app:
-        gr.Markdown(HEADER_MD)
-
-        # Use light theme by default
-        app.load(
-            None,
-            None,
-            js="() => {const params = new URLSearchParams(window.location.search);if (!params.has('__theme')) {params.set('__theme', '%s');window.location.search = params.toString();}}"
-            % theme,
-        )
-
-        # Inference
-        with gr.Row():
-            with gr.Column(scale=3):
-                text = gr.Textbox(
-                    label=i18n("Input Text"), placeholder=TEXTBOX_PLACEHOLDER, lines=10
-                )
-
-                with gr.Row():
-                    with gr.Column():
-                        with gr.Tab(label=i18n("Advanced Config")):
-                            with gr.Row():
-                                chunk_length = gr.Slider(
-                                    label=i18n("Iterative Prompt Length, 0 means off"),
-                                    minimum=100,
-                                    maximum=400,
-                                    value=300,
-                                    step=8,
-                                )
-
-                                max_new_tokens = gr.Slider(
-                                    label=i18n(
-                                        "Maximum tokens per batch, 0 means no limit"
-                                    ),
-                                    minimum=0,
-                                    maximum=2048,
-                                    value=0,
-                                    step=8,
-                                )
-
-                            with gr.Row():
-                                top_p = gr.Slider(
-                                    label="Top-P",
-                                    minimum=0.7,
-                                    maximum=0.95,
-                                    value=0.8,
-                                    step=0.01,
-                                )
-
-                                repetition_penalty = gr.Slider(
-                                    label=i18n("Repetition Penalty"),
-                                    minimum=1,
-                                    maximum=1.2,
-                                    value=1.1,
-                                    step=0.01,
-                                )
-
-                            with gr.Row():
-                                temperature = gr.Slider(
-                                    label="Temperature",
-                                    minimum=0.7,
-                                    maximum=1.0,
-                                    value=0.8,
-                                    step=0.01,
-                                )
-                                seed = gr.Number(
-                                    label="Seed",
-                                    info="0 means randomized inference, otherwise deterministic",
-                                    value=0,
-                                )
-
-                        with gr.Tab(label=i18n("Reference Audio")):
-                            with gr.Row():
-                                gr.Markdown(
-                                    i18n(
-                                        "5 to 10 seconds of reference audio, useful for specifying speaker."
-                                    )
-                                )
-                            with gr.Row():
-                                reference_id = gr.Textbox(
-                                    label=i18n("Reference ID"),
-                                    placeholder="Leave empty to use uploaded references",
-                                )
-
-                            with gr.Row():
-                                use_memory_cache = gr.Radio(
-                                    label=i18n("Use Memory Cache"),
-                                    choices=["on", "off"],
-                                    value="on",
-                                )
-
-                            with gr.Row():
-                                reference_audio = gr.Audio(
-                                    label=i18n("Reference Audio"),
-                                    type="filepath",
-                                )
-                            with gr.Row():
-                                reference_text = gr.Textbox(
-                                    label=i18n("Reference Text"),
-                                    lines=1,
-                                    placeholder="在一无所知中，梦里的一天结束了，一个新的「轮回」便会开始。",
-                                    value="",
-                                )
-
-            with gr.Column(scale=3):
-                with gr.Row():
-                    error = gr.HTML(
-                        label=i18n("Error Message"),
-                        visible=True,
-                    )
-                with gr.Row():
-                    audio = gr.Audio(
-                        label=i18n("Generated Audio"),
-                        type="numpy",
-                        interactive=False,
-                        visible=True,
-                    )
-
-                with gr.Row():
-                    with gr.Column(scale=3):
-                        generate = gr.Button(
-                            value="\U0001f3a7 " + i18n("Generate"),
-                            variant="primary",
-                        )
-
-        # Submit
-        generate.click(
-            inference_fct,
-            [
-                text,
-                reference_id,
-                reference_audio,
-                reference_text,
-                max_new_tokens,
-                chunk_length,
-                top_p,
-                repetition_penalty,
-                temperature,
-                seed,
-                use_memory_cache,
-            ],
-            [audio, error],
-            concurrency_limit=1,
-        )
-
-    return app
-
-
-path: /tools/webui/inference.py
-----------------------------------------
-import html
-from functools import partial
-from typing import Any, Callable
-
-from fish_speech.i18n import i18n
-from fish_speech.utils.schema import ServeReferenceAudio, ServeTTSRequest
-
-
-def inference_wrapper(
-    text,
-    reference_id,
-    reference_audio,
-    reference_text,
-    max_new_tokens,
-    chunk_length,
-    top_p,
-    repetition_penalty,
-    temperature,
-    seed,
-    use_memory_cache,
-    engine,
-):
-    """
-    Wrapper for the inference function.
-    Used in the Gradio interface.
-    """
-
-    if reference_audio:
-        references = get_reference_audio(reference_audio, reference_text)
-    else:
-        references = []
-
-    req = ServeTTSRequest(
-        text=text,
-        reference_id=reference_id if reference_id else None,
-        references=references,
-        max_new_tokens=max_new_tokens,
-        chunk_length=chunk_length,
-        top_p=top_p,
-        repetition_penalty=repetition_penalty,
-        temperature=temperature,
-        seed=int(seed) if seed else None,
-        use_memory_cache=use_memory_cache,
-    )
-
-    for result in engine.inference(req):
-        match result.code:
-            case "final":
-                return result.audio, None
-            case "error":
-                return None, build_html_error_message(i18n(result.error))
-            case _:
-                pass
-
-    return None, i18n("No audio generated")
-
-
-def get_reference_audio(reference_audio: str, reference_text: str) -> list:
-    """
-    Get the reference audio bytes.
-    """
-
-    with open(reference_audio, "rb") as audio_file:
-        audio_bytes = audio_file.read()
-
-    return [ServeReferenceAudio(audio=audio_bytes, text=reference_text)]
-
-
-def build_html_error_message(error: Any) -> str:
-
-    error = error if isinstance(error, Exception) else Exception("Unknown error")
-
-    return f"""
-    <div style="color: red; 
-    font-weight: bold;">
-        {html.escape(str(error))}
-    </div>
-    """
-
-
-def get_inference_wrapper(engine) -> Callable:
-    """
-    Get the inference function with the immutable arguments.
-    """
-
-    return partial(
-        inference_wrapper,
-        engine=engine,
-    )
-
-
-path: /tools/webui/variables.py
-----------------------------------------
-from fish_speech.i18n import i18n
-
-HEADER_MD = f"""# Fish Speech
-
-{i18n("A text-to-speech model based on VQ-GAN and Llama developed by [Fish Audio](https://fish.audio).")}  
-
-{i18n("You can find the source code [here](https://github.com/fishaudio/fish-speech) and models [here](https://huggingface.co/fishaudio/fish-speech-1.5).")}  
-
-{i18n("Related code and weights are released under FISH AUDIO RESEARCH LICENSE.")}  
-
-{i18n("We are not responsible for any misuse of the model, please consider your local laws and regulations before using it.")}  
-"""
-
-TEXTBOX_PLACEHOLDER = i18n("Put your text here.")
-
-
 === SUMMARY ===
-included: 91
-skipped(binary): 0
+included: 51
+skipped(binary): 2
 skipped(size): 0
 skipped(ext): 0
-totalBytes(approx): 457878
+totalBytes(approx): 364383

@@ -2,439 +2,613 @@
 <html lang="ru">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Fish Speech Client</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Proxy PCM Stream Client</title>
   <style>
+    :root {
+      --bg: #f5f7fb;
+      --card: #fff;
+      --line: #d8dfef;
+      --text: #182131;
+      --muted: #64748b;
+      --accent: #2563eb;
+      --accent-soft: #dbeafe;
+      --danger: #b91c1c;
+      --danger-soft: #fee2e2;
+    }
+
+    * { box-sizing: border-box; }
+
     body {
-      font-family: system-ui, sans-serif;
+      margin: 0;
+      background: linear-gradient(180deg, #fcfdff 0%, var(--bg) 100%);
+      color: var(--text);
+      font-family: "SF Pro Display", "Segoe UI", system-ui, sans-serif;
+    }
+
+    main {
       max-width: 760px;
-      margin: 40px auto;
-      padding: 0 16px;
+      margin: 0 auto;
+      padding: 32px 16px 48px;
     }
-    .row {
-      display: flex;
-      gap: 8px;
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 28px;
     }
-    input, button {
-      font-size: 18px;
-      padding: 10px 12px;
+
+    p {
+      color: var(--muted);
+      line-height: 1.5;
     }
-    input {
-      flex: 1;
+
+    .panel {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 18px;
+      margin-bottom: 16px;
     }
-    button {
-      width: 90px;
-    }
-    #status {
-      margin-top: 14px;
-      color: #333;
-      white-space: pre-wrap;
-    }
-    #log {
-      margin-top: 14px;
-      background: #111;
-      color: #ddd;
-      padding: 12px;
-      border-radius: 8px;
-      min-height: 220px;
-      white-space: pre-wrap;
-      overflow-wrap: anywhere;
-      font-family: ui-monospace, monospace;
+
+    label {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--muted);
       font-size: 13px;
+    }
+
+    input,
+    textarea,
+    button {
+      width: 100%;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--text);
+      font: inherit;
+      padding: 12px 14px;
+    }
+
+    textarea {
+      min-height: 160px;
+      resize: vertical;
+      line-height: 1.5;
+    }
+
+    .actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 14px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      width: auto;
+      min-width: 140px;
+      cursor: pointer;
+      font-weight: 650;
+      background: var(--accent-soft);
+      color: var(--accent);
+    }
+
+    button.stop {
+      background: var(--danger-soft);
+      color: var(--danger);
+    }
+
+    .status {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .status-card {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 14px;
+      background: #fbfcff;
+    }
+
+    .status-card .label {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 8px;
+    }
+
+    .status-card .value {
+      display: block;
+      font-size: 16px;
+      font-weight: 700;
+    }
+
+    .log {
+      margin: 0;
+      min-height: 220px;
+      max-height: 320px;
+      overflow: auto;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: #0f172a;
+      color: #e2e8f0;
+      padding: 14px;
+      font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    @media (max-width: 720px) {
+      .status {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
 <body>
-  <div class="row">
-    <input id="text" type="text" value="Сегодня утром я решил пройтись по улице." />
-    <button id="ok">OK</button>
-  </div>
+  <main>
+    <h1>Proxy PCM Stream Client</h1>
+    <p>Минимальный прямой тест proxy path: текст, одна кнопка запуска, один playback path через AudioWorklet.</p>
 
-  <div id="status">Готово</div>
-  <div id="log"></div>
+    <section class="panel">
+      <label for="proxyBaseUrl">Proxy base URL</label>
+      <input id="proxyBaseUrl" value="http://192.168.31.32:9000" />
+      <label for="sourceText" style="margin-top: 14px;">Text</label>
+      <textarea id="sourceText">Сегодня утром я решил пройтись по улице. Проверка нужна, чтобы убедиться, что потоковое воспроизведение остаётся непрерывным и разборчивым.</textarea>
+      <div class="actions">
+        <button id="playBtn">Play</button>
+        <button id="stopBtn" class="stop">Stop</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="status">
+        <div class="status-card">
+          <span class="label">State</span>
+          <span class="value" id="statusState">idle</span>
+        </div>
+        <div class="status-card">
+          <span class="label">TTFA</span>
+          <span class="value" id="statusTtfa">—</span>
+        </div>
+        <div class="status-card">
+          <span class="label">Queued audio</span>
+          <span class="value" id="statusQueue">0.000 s</span>
+        </div>
+        <div class="status-card">
+          <span class="label">Underruns</span>
+          <span class="value" id="statusUnderruns">0</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <pre id="logView" class="log"></pre>
+    </section>
+  </main>
 
   <script>
-    const BACKEND_BASE = 'http://192.168.31.32:9000';
+    const els = {
+      proxyBaseUrl: document.getElementById("proxyBaseUrl"),
+      sourceText: document.getElementById("sourceText"),
+      playBtn: document.getElementById("playBtn"),
+      stopBtn: document.getElementById("stopBtn"),
+      statusState: document.getElementById("statusState"),
+      statusTtfa: document.getElementById("statusTtfa"),
+      statusQueue: document.getElementById("statusQueue"),
+      statusUnderruns: document.getElementById("statusUnderruns"),
+      logView: document.getElementById("logView"),
+    };
 
-    const input = document.getElementById('text');
-    const button = document.getElementById('ok');
-    const statusEl = document.getElementById('status');
-    const logEl = document.getElementById('log');
+    const playbackState = {
+      queuedSamples: 0,
+      contextSampleRate: 0,
+      underruns: 0,
+      firstAudioAtMs: null,
+      clickAtMs: null,
+      pendingPcmRemainder: new Uint8Array(0),
+    };
 
-    let audioCtx = null;
-    let worklet = null;
-    let gainNode = null;
-    let abortController = null;
-    let currentRun = 0;
-    let clickTs = 0;
+    const state = {
+      audioCtx: null,
+      gainNode: null,
+      worklet: null,
+      workletBlobUrl: null,
+      abortController: null,
+      streamMeta: null,
+      currentRunId: 0,
+      logLines: [],
+    };
 
-    let streamMeta = null;
-    let lastSeq = 0;
-    let firstSoundLogged = false;
-
-    // Очередь PCM уже в float32
-    let pcmQueue = [];
-    let currentChunk = null;
-    let currentChunkOffset = 0;
-    let queuedSamples = 0;
-    let playbackActive = false;
-    let underruns = 0;
-    let lastUnderrunLog = 0;
-    let sampleRateMismatchLogged = false;
-
-    function log(msg) {
-      const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
-      logEl.textContent += line + '\n';
-      logEl.scrollTop = logEl.scrollHeight;
+    function log(message) {
+      const line = `[${new Date().toLocaleTimeString()}] ${message}`;
+      state.logLines.push(line);
+      if (state.logLines.length > 200) {
+        state.logLines = state.logLines.slice(-200);
+      }
+      els.logView.textContent = state.logLines.join("\n");
+      els.logView.scrollTop = els.logView.scrollHeight;
       console.log(line);
     }
 
-    function setStatus(msg) {
-      statusEl.textContent = msg;
+    function renderStatus() {
+      const queuedSec = playbackState.contextSampleRate
+        ? playbackState.queuedSamples / playbackState.contextSampleRate
+        : 0;
+      els.statusQueue.textContent = `${queuedSec.toFixed(3)} s`;
+      els.statusUnderruns.textContent = String(playbackState.underruns);
+      els.statusTtfa.textContent = playbackState.firstAudioAtMs && playbackState.clickAtMs
+        ? `${Math.round(playbackState.firstAudioAtMs - playbackState.clickAtMs)} ms`
+        : "—";
     }
 
-    function resetPlaybackQueue() {
-      if (worklet) worklet.port.postMessage({ type: "reset" });
-      pcmQueue = [];
-      currentChunk = null;
-      currentChunkOffset = 0;
-      queuedSamples = 0;
-      playbackActive = false;
-      underruns = 0;
-      lastUnderrunLog = 0;
-      sampleRateMismatchLogged = false;
-      streamMeta = null;
-      lastSeq = 0;
-      firstSoundLogged = false;
+    function renderDebugPanel() {
+      renderStatus();
     }
 
-    async function ensureAudio() {
-      if (!audioCtx) {
-        audioCtx = new (window.AudioContext || window.webkitAudioContext)({
-          latencyHint: 'interactive'
-        });
+    function concatUint8Arrays(parts) {
+      const chunks = parts.filter((part) => part && part.length);
+      const total = chunks.reduce((sum, part) => sum + part.length, 0);
+      const out = new Uint8Array(total);
+      let offset = 0;
+      for (const part of chunks) {
+        out.set(part, offset);
+        offset += part.length;
       }
-
-      if (!gainNode) {
-        gainNode = audioCtx.createGain();
-        gainNode.gain.value = 1.0;
-        gainNode.connect(audioCtx.destination);
-      }
-
-      if (!worklet) {
-        const blob = new Blob([`
-          class PCMWorklet extends AudioWorkletProcessor {
-            constructor() {
-              super();
-              this.queue = [];
-              this.currentChunk = null;
-              this.offset = 0;
-              this.active = false;
-              this.port.onmessage = (e) => {
-                if (e.data.type === "push") {
-                  this.queue.push(e.data.payload);
-                } else if (e.data.type === "reset") {
-                  this.queue = [];
-                  this.currentChunk = null;
-                  this.offset = 0;
-                  this.active = false;
-                }
-              };
-            }
-            process(inputs, outputs) {
-              const output = outputs[0];
-              const channel = output[0];
-              channel.fill(0);
-              let writePos = 0;
-              while (writePos < channel.length) {
-                if (!this.currentChunk) {
-                  if (this.queue.length === 0) break;
-                  this.currentChunk = this.queue.shift();
-                  this.offset = 0;
-                }
-                const n = Math.min(channel.length - writePos, this.currentChunk.length - this.offset);
-                channel.set(this.currentChunk.subarray(this.offset, this.offset + n), writePos);
-                this.offset += n;
-                writePos += n;
-                if (this.offset >= this.currentChunk.length) this.currentChunk = null;
-              }
-              if (writePos > 0 && !this.active) {
-                this.active = true;
-                this.port.postMessage({ type: "event", kind: "audio_play_started" });
-              }
-              if (writePos < channel.length && this.active) {
-                if (!this.lastUnderrunMsg || currentTime - this.lastUnderrunMsg > 0.35) {
-                  this.lastUnderrunMsg = currentTime;
-                  this.port.postMessage({ type: "event", kind: "underrun", samples: channel.length - writePos });
-                }
-              }
-              return true;
-            }
-          }
-          registerProcessor("pcm-worklet", PCMWorklet);
-        `], { type: "application/javascript" });
-        const url = URL.createObjectURL(blob);
-        await audioCtx.audioWorklet.addModule(url);
-        worklet = new AudioWorkletNode(audioCtx, "pcm-worklet");
-        worklet.port.onmessage = (e) => {
-          if (e.data.type === "event") {
-            if (e.data.kind === "underrun") {
-              underruns += 1;
-              const now = performance.now();
-              if (now - lastUnderrunLog > 350) {
-                lastUnderrunLog = now;
-                log(`underrun_detected missing_samples=${e.data.samples} underruns=${underruns}`);
-              }
-            } else {
-              log(e.data.kind);
-            }
-          }
-        };
-        worklet.connect(gainNode);
-      }
-
-      await audioCtx.resume();
-    }
-
-    function abortPrevious() {
-      if (abortController) {
-        try { abortController.abort(); } catch {}
-      }
-      abortController = null;
-      resetPlaybackQueue();
-      currentRun += 1;
-      return currentRun;
-    }
-
-    function base64ToUint8Array(base64) {
-      const binary = atob(base64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) {
-        bytes[i] = binary.charCodeAt(i);
-      }
-      return bytes;
-    }
-
-    function pcm16ToFloat32(bytes, channels) {
-      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-      const frames = Math.floor(bytes.byteLength / (2 * channels));
-      const out = new Float32Array(frames);
-
-      for (let i = 0; i < frames; i++) {
-        let acc = 0;
-        for (let ch = 0; ch < channels; ch++) {
-          const s = view.getInt16((i * channels + ch) * 2, true);
-          acc += s / 32768;
-        }
-        out[i] = Math.max(-1, Math.min(1, acc / channels));
-      }
-
       return out;
     }
 
-    function resampleHermite(input, fromRate, toRate) {
+    function setStateLabel(value) {
+      els.statusState.textContent = value;
+    }
+
+    function pcm16ToMonoFloat32(arrayBuffer, channels) {
+      const bytes = new Uint8Array(arrayBuffer);
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const frameCount = Math.floor(bytes.byteLength / Math.max(1, channels) / 2);
+      const out = new Float32Array(frameCount);
+      for (let frame = 0; frame < frameCount; frame += 1) {
+        let acc = 0;
+        for (let ch = 0; ch < channels; ch += 1) {
+          acc += view.getInt16((frame * channels + ch) * 2, true) / 32768;
+        }
+        out[frame] = Math.max(-1, Math.min(1, acc / Math.max(1, channels)));
+      }
+      return out;
+    }
+
+    function resampleCubic(input, fromRate, toRate) {
       if (!input.length || fromRate === toRate) return input;
       const ratio = fromRate / toRate;
       const outLength = Math.max(1, Math.round(input.length / ratio));
       const out = new Float32Array(outLength);
-      for (let i = 0; i < outLength; i++) {
-        const pos = i * ratio;
-        const i1 = Math.floor(pos);
-        const i0 = Math.max(0, i1 - 1);
-        const i2 = Math.min(input.length - 1, i1 + 1);
-        const i3 = Math.min(input.length - 1, i1 + 2);
-        const diff = pos - i1;
-        const diffSq = diff * diff;
-        const diffCu = diffSq * diff;
-        const a0 = input[i3] - input[i2] - input[i0] + input[i1];
-        const a1 = input[i0] - input[i1] - a0;
-        const a2 = input[i2] - input[i0];
-        const a3 = input[i1];
-        out[i] = a0 * diffCu + a1 * diffSq + a2 * diff + a3;
+      for (let i = 0; i < outLength; i += 1) {
+        const sourcePos = i * ratio;
+        const x1 = Math.floor(sourcePos);
+        const x0 = Math.max(0, x1 - 1);
+        const x2 = Math.min(input.length - 1, x1 + 1);
+        const x3 = Math.min(input.length - 1, x1 + 2);
+        const t = sourcePos - x1;
+        const t2 = t * t;
+        const t3 = t2 * t;
+        const a0 = input[x3] - input[x2] - input[x0] + input[x1];
+        const a1 = input[x0] - input[x1] - a0;
+        const a2 = input[x2] - input[x0];
+        const a3 = input[x1];
+        out[i] = Math.max(-1, Math.min(1, a0 * t3 + a1 * t2 + a2 * t + a3));
       }
       return out;
     }
 
-    function pushPcmChunk(float32Chunk, seq) {
-      if (seq != null) {
-        if (seq <= lastSeq) {
-          log(`drop duplicate/out-of-order seq=${seq} lastSeq=${lastSeq}`);
-          return;
-        }
-        lastSeq = seq;
-      }
-
-      if (worklet) worklet.port.postMessage({ type: "push", payload: float32Chunk });
-      pcmQueue.push(float32Chunk);
-      queuedSamples += float32Chunk.length;
-      const queuedSec = audioCtx ? queuedSamples / Math.max(1, audioCtx.sampleRate) : 0;
-      log(`audio_chunk_queued seq=${seq ?? '-'} samples=${float32Chunk.length} queue=${pcmQueue.length} queued_sec=${queuedSec.toFixed(3)}`);
-
-      if (!firstSoundLogged) {
-        firstSoundLogged = true;
-        const ms = Math.round(performance.now() - clickTs);
-        setStatus(`Первый звук пошёл через ${ms} мс`);
-        log(`FIRST_AUDIBLE_MS=${ms}`);
-      }
+    function recordQueueDepth(samples) {
+      playbackState.queuedSamples = samples;
+      renderDebugPanel();
     }
 
-    async function playStream(text) {
-      const runId = abortPrevious();
-      clickTs = performance.now();
+    async function ensureAudio() {
+      const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextCtor) {
+        throw new Error("Web Audio API is not available");
+      }
 
-      await ensureAudio();
-
-      setStatus('Запрос отправлен...');
-      log(`run=${runId} click`);
-
-      abortController = new AbortController();
-      const url = `${BACKEND_BASE}/pcm-stream?text=${encodeURIComponent(text)}&_ts=${Date.now()}`;
-
-      let resp;
-      try {
-        resp = await fetch(url, {
-          method: 'GET',
-          cache: 'no-store',
-          signal: abortController.signal,
+      if (!state.audioCtx) {
+        state.audioCtx = new AudioContextCtor({
+          latencyHint: "interactive",
+          sampleRate: 44100,
         });
-      } catch (e) {
-        setStatus('Ошибка подключения');
-        log(`run=${runId} fetch failed: ${e}`);
+        playbackState.contextSampleRate = state.audioCtx.sampleRate;
+        log(`audio_context sample_rate=${state.audioCtx.sampleRate}`);
+      }
+
+      if (!state.gainNode) {
+        state.gainNode = state.audioCtx.createGain();
+        state.gainNode.gain.value = 1.0;
+        state.gainNode.connect(state.audioCtx.destination);
+      }
+
+      if (!state.worklet) {
+        const workletCode = `
+          class PCMPlayerWorklet extends AudioWorkletProcessor {
+            constructor() {
+              super();
+              this.queue = [];
+              this.current = null;
+              this.offset = 0;
+              this.queuedSamples = 0;
+              this.expectMore = false;
+              this.prebufferSamples = Math.round(sampleRate * 0.18);
+              this.prebuffering = true;
+              this.started = false;
+              this.lastStatsAt = -1;
+              this.port.onmessage = (event) => {
+                const data = event.data || {};
+                if (data.type === "push" && data.payload) {
+                  this.queue.push(data.payload);
+                  this.queuedSamples += data.payload.length;
+                } else if (data.type === "expect_more") {
+                  this.expectMore = !!data.value;
+                } else if (data.type === "reset") {
+                  this.queue = [];
+                  this.current = null;
+                  this.offset = 0;
+                  this.queuedSamples = 0;
+                  this.expectMore = false;
+                  this.prebuffering = true;
+                  this.started = false;
+                }
+              };
+            }
+            postStats(force = false) {
+              if (!force && this.lastStatsAt >= 0 && currentTime - this.lastStatsAt < 0.1) return;
+              this.lastStatsAt = currentTime;
+              this.port.postMessage({ type: "stats", queuedSamples: this.queuedSamples });
+            }
+            process(inputs, outputs) {
+              const output = outputs[0][0];
+              output.fill(0);
+              if (this.prebuffering) {
+                const ready = this.queuedSamples >= this.prebufferSamples || (!this.expectMore && this.queuedSamples > 0);
+                if (!ready) {
+                  this.postStats();
+                  return true;
+                }
+                this.prebuffering = false;
+                if (!this.started) {
+                  this.started = true;
+                  this.port.postMessage({ type: "event", kind: "audio_play_started" });
+                }
+              }
+              let written = 0;
+              while (written < output.length) {
+                if (!this.current) {
+                  if (this.queue.length === 0) break;
+                  this.current = this.queue.shift();
+                  this.offset = 0;
+                }
+                const count = Math.min(output.length - written, this.current.length - this.offset);
+                output.set(this.current.subarray(this.offset, this.offset + count), written);
+                this.offset += count;
+                written += count;
+                this.queuedSamples -= count;
+                if (this.offset >= this.current.length) {
+                  this.current = null;
+                }
+              }
+              if (written < output.length && this.expectMore) {
+                this.prebuffering = true;
+                this.port.postMessage({ type: "event", kind: "underrun", missingSamples: output.length - written });
+              }
+              if (!this.expectMore && this.queuedSamples <= 0 && !this.current && this.started) {
+                this.started = false;
+                this.port.postMessage({ type: "event", kind: "audio_play_finished" });
+              }
+              this.postStats();
+              return true;
+            }
+          }
+          registerProcessor("pcm-player", PCMPlayerWorklet);
+        `;
+        const blob = new Blob([workletCode], { type: "application/javascript" });
+        state.workletBlobUrl = URL.createObjectURL(blob);
+        await state.audioCtx.audioWorklet.addModule(state.workletBlobUrl);
+        state.worklet = new AudioWorkletNode(state.audioCtx, "pcm-player");
+        state.worklet.port.onmessage = (event) => {
+          const data = event.data || {};
+          if (data.type === "stats") {
+            recordQueueDepth(Number(data.queuedSamples || 0));
+            return;
+          }
+          if (data.type === "event") {
+            if (data.kind === "underrun") {
+              playbackState.underruns += 1;
+              log(`underrun_detected missing_samples=${data.missingSamples || 0}`);
+            } else {
+              log(data.kind);
+            }
+            renderDebugPanel();
+          }
+        };
+        state.worklet.connect(state.gainNode);
+      }
+
+      if (state.audioCtx.state !== "running") {
+        await state.audioCtx.resume();
+      }
+      renderDebugPanel();
+    }
+
+    function schedulePcmChunk(arrayBuffer) {
+      if (!state.audioCtx || !state.worklet || !state.streamMeta) return;
+      const bytes = new Uint8Array(arrayBuffer);
+      const channels = Number(state.streamMeta.channels || 1);
+      const frameSize = Math.max(1, channels) * 2;
+      const alignedInput = concatUint8Arrays([
+        playbackState.pendingPcmRemainder,
+        bytes,
+      ]);
+      const alignedLength = alignedInput.length - (alignedInput.length % frameSize);
+      const alignedBytes = alignedInput.subarray(0, alignedLength);
+      playbackState.pendingPcmRemainder = alignedInput.slice(alignedLength);
+      if (!alignedBytes.length) {
+        log(`pcm_frame_buffered carry_bytes=${playbackState.pendingPcmRemainder.length}`);
+        return;
+      }
+      const mono = pcm16ToMonoFloat32(
+        alignedBytes.buffer.slice(
+          alignedBytes.byteOffset,
+          alignedBytes.byteOffset + alignedBytes.byteLength,
+        ),
+        channels,
+      );
+      const playable = resampleCubic(
+        mono,
+        Number(state.streamMeta.sample_rate || 44100),
+        state.audioCtx.sampleRate,
+      );
+      state.worklet.port.postMessage({ type: "push", payload: playable });
+      log(
+        `audio_chunk_queued seq=${state.streamMeta.lastSeq || "-"} samples=${playable.length} ` +
+        `sample_rate=${state.streamMeta.sample_rate} audio_ctx=${state.audioCtx.sampleRate} ` +
+        `carry_bytes=${playbackState.pendingPcmRemainder.length}`,
+      );
+    }
+
+    async function scheduleWavChunk(arrayBuffer) {
+      if (!state.audioCtx || !state.worklet) return;
+      const decoded = await state.audioCtx.decodeAudioData(arrayBuffer.slice(0));
+      const mono = new Float32Array(decoded.length);
+      for (let ch = 0; ch < decoded.numberOfChannels; ch += 1) {
+        const data = decoded.getChannelData(ch);
+        for (let i = 0; i < decoded.length; i += 1) {
+          mono[i] += data[i] / decoded.numberOfChannels;
+        }
+      }
+      state.worklet.port.postMessage({ type: "push", payload: mono });
+    }
+
+    function stopPlayback() {
+      if (state.abortController) {
+        state.abortController.abort();
+        state.abortController = null;
+      }
+      if (state.worklet) {
+        state.worklet.port.postMessage({ type: "reset" });
+        state.worklet.port.postMessage({ type: "expect_more", value: false });
+      }
+      playbackState.queuedSamples = 0;
+      playbackState.underruns = 0;
+      playbackState.firstAudioAtMs = null;
+      playbackState.pendingPcmRemainder = new Uint8Array(0);
+      state.streamMeta = null;
+      renderDebugPanel();
+      setStateLabel("stopped");
+      log("stopped");
+    }
+
+    async function play() {
+      await ensureAudio();
+      stopPlayback();
+
+      const text = els.sourceText.value.trim();
+      if (!text) {
+        log("empty_text");
         return;
       }
 
-      if (!resp.ok || !resp.body) {
-        setStatus(`HTTP ошибка: ${resp.status}`);
-        log(`run=${runId} bad response status=${resp.status}`);
+      const finalText = /[.!?…]$/.test(text) ? text : `${text}.`;
+      const url = `${els.proxyBaseUrl.value.trim()}/pcm-stream?text=${encodeURIComponent(finalText)}&_ts=${Date.now()}`;
+
+      state.abortController = new AbortController();
+      state.currentRunId += 1;
+      const runId = state.currentRunId;
+      playbackState.clickAtMs = performance.now();
+      playbackState.firstAudioAtMs = null;
+
+      setStateLabel("connecting");
+      log(`request_start run=${runId}`);
+
+      const response = await fetch(url, {
+        method: "GET",
+        cache: "no-store",
+        signal: state.abortController.signal,
+      });
+
+      if (!response.ok || !response.body) {
+        setStateLabel(`http_${response.status}`);
+        log(`bad_response status=${response.status}`);
         return;
       }
 
-      setStatus('Поток подключён');
-      log(`run=${runId} connected`);
+      setStateLabel("streaming");
+      log(`proxy_connected status=${response.status}`);
 
-      const reader = resp.body.getReader();
+      const reader = response.body.getReader();
       const decoder = new TextDecoder();
-      let textBuf = '';
+      let textBuffer = "";
 
       try {
         while (true) {
           const { value, done } = await reader.read();
           if (done) break;
-
-          if (runId !== currentRun) {
-            log(`run=${runId} stale response ignored`);
-            break;
-          }
-
-          textBuf += decoder.decode(value, { stream: true });
-
+          textBuffer += decoder.decode(value, { stream: true });
           while (true) {
-            const idx = textBuf.indexOf('\n');
-            if (idx === -1) break;
-
-            const line = textBuf.slice(0, idx).trim();
-            textBuf = textBuf.slice(idx + 1);
-
+            const newline = textBuffer.indexOf("\n");
+            if (newline === -1) break;
+            const line = textBuffer.slice(0, newline).trim();
+            textBuffer = textBuffer.slice(newline + 1);
             if (!line) continue;
 
-            let event;
-            try {
-              event = JSON.parse(line);
-            } catch {
-              log(`run=${runId} bad json`);
-              continue;
-            }
-
-            if (event.type === 'proxy_start') {
-              log(`run=${runId} proxy_start req=${event.req_id}`);
-              continue;
-            }
-
-            if (event.type === 'meta') {
-              streamMeta = event;
-              log(`run=${runId} meta sr=${event.sample_rate} ch=${event.channels}`);
-              if (
-                audioCtx
-                && Number(event.sample_rate) !== audioCtx.sampleRate
-                && !sampleRateMismatchLogged
-              ) {
-                sampleRateMismatchLogged = true;
-                log(`sample_rate_mismatch pcm=${event.sample_rate}Hz audio_ctx=${audioCtx.sampleRate}Hz; linear resampler enabled`);
+            const event = JSON.parse(line);
+            if (event.type === "meta") {
+              state.streamMeta = { ...event, lastSeq: null };
+              log(`meta sample_rate=${event.sample_rate} channels=${event.channels}`);
+            } else if (event.type === "pcm") {
+              if (!state.streamMeta) continue;
+              state.streamMeta.lastSeq = event.seq ?? null;
+              const bytes = Uint8Array.from(atob(event.data), ch => ch.charCodeAt(0));
+              if (!playbackState.firstAudioAtMs) {
+                playbackState.firstAudioAtMs = performance.now();
               }
-              continue;
-            }
-
-            if (event.type === 'pcm') {
-              if (!streamMeta) {
-                log(`run=${runId} pcm before meta`);
-                continue;
+              log(`audio_chunk_received seq=${event.seq ?? "-"} bytes=${bytes.byteLength}`);
+              schedulePcmChunk(bytes.buffer);
+              state.worklet.port.postMessage({ type: "expect_more", value: true });
+            } else if (event.type === "done") {
+              if (state.worklet) {
+                state.worklet.port.postMessage({ type: "expect_more", value: false });
               }
-
-              const bytes = base64ToUint8Array(event.data);
-              log(`audio_chunk_received seq=${event.seq ?? '-'} bytes=${bytes.byteLength}`);
-              const mono = pcm16ToFloat32(bytes, Number(streamMeta.channels || 1));
-              const floatChunk = resampleHermite(
-                mono,
-                Number(streamMeta.sample_rate || 44100),
-                audioCtx.sampleRate
-              );
-              pushPcmChunk(floatChunk, event.seq ?? null);
-
-              log(`run=${runId} pcm seq=${event.seq ?? '-'} bytes=${bytes.byteLength}`);
-              continue;
-            }
-
-            if (event.type === 'done') {
-              setStatus('Готово');
-              log(`run=${runId} done`);
-              continue;
-            }
-
-            if (event.type === 'error') {
-              setStatus(`Ошибка: ${event.message}`);
-              log(`run=${runId} error=${event.message}`);
-              continue;
+              setStateLabel("done");
+              log("stream_done");
+            } else if (event.type === "error") {
+              setStateLabel("error");
+              log(`proxy_error ${event.message}`);
             }
           }
+          renderDebugPanel();
         }
-
-        if (runId === currentRun) {
-          log(`run=${runId} stream finished`);
-        }
-      } catch (e) {
-        if (abortController?.signal.aborted) {
-          log(`run=${runId} aborted`);
-          setStatus('Остановлено');
+      } catch (error) {
+        if (state.abortController?.signal.aborted) {
+          log("request_aborted");
         } else {
-          log(`run=${runId} read error: ${e}`);
-          setStatus(`Ошибка чтения: ${e}`);
+          log(`read_error ${error.message || error}`);
         }
+      } finally {
+        state.abortController = null;
+        renderDebugPanel();
       }
     }
 
-    button.addEventListener('click', async () => {
-      let text = input.value.trim();
-      if (!text) return;
-
-      // Практически полезно: если нет финальной пунктуации, добавим точку.
-      // Это часто уменьшает "хвосты" и повторения у TTS.
-      if (!/[.!?…]$/.test(text)) {
-        text += '.';
-      }
-
-      button.disabled = true;
-      try {
-        await playStream(text);
-      } finally {
-        button.disabled = false;
-      }
+    els.playBtn.addEventListener("click", () => {
+      play().catch((error) => {
+        log(`play_error ${error.message || error}`);
+        setStateLabel("error");
+      });
     });
 
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        button.click();
-      }
-    });
+    els.stopBtn.addEventListener("click", stopPlayback);
+
+    renderDebugPanel();
+    log("ready");
   </script>
 </body>
 </html>

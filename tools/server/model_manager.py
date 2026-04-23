@@ -10,6 +10,33 @@ from fish_speech.utils.schema import ServeTTSRequest
 from tools.server.inference import inference_wrapper as inference
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip() in {"1", "true", "TRUE", "yes", "YES", "on", "ON"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_optional_int(name: str) -> int | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 class ModelManager:
     def __init__(
         self,
@@ -128,6 +155,41 @@ class ModelManager:
             torch.cuda.empty_cache()  # free cached VRAM so first request with reference fits in 32 GB
         logger.info("Warmup: first inference done.")
 
+        # Streaming hits a different hot path than the oneshot warmup above:
+        # prefill may be compiled already, but iterative token decode and bounded
+        # streaming pipeline can still compile lazily on the first user request.
+        if compile and _env_flag("FISH_WARMUP_STREAMING", True):
+            stream_chunk_size = max(1, _env_int("FISH_STREAM_CHUNK_SIZE", 8))
+            initial_stream_chunk_size = _env_optional_int(
+                "FISH_INITIAL_STREAM_CHUNK_SIZE"
+            )
+            logger.info(
+                "Warmup: streaming inference (compile iterative decode path) chunk_size={} initial_chunk_size={}",
+                stream_chunk_size,
+                initial_stream_chunk_size,
+            )
+            request_stream = ServeTTSRequest(
+                text=(
+                    "Hello world. This is a short streaming warmup request so the "
+                    "iterative decode path is compiled before the first real client."
+                ),
+                references=[],
+                reference_id=None,
+                max_new_tokens=64,
+                chunk_length=200,
+                top_p=0.7,
+                repetition_penalty=1.2,
+                temperature=0.7,
+                format="wav",
+                streaming=True,
+                stream_chunk_size=stream_chunk_size,
+                initial_stream_chunk_size=initial_stream_chunk_size,
+            )
+            list(inference(request_stream, tts_inference_engine))
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            logger.info("Warmup: streaming inference done.")
+
         # Optional: compile the long-prompt + streaming path so first real request is fast.
         # Set FISH_WARMUP_REFERENCE_ID to a valid reference id (e.g. en) to run one
         # streaming request with that reference at startup. Use ~50 word text so the
@@ -155,6 +217,8 @@ class ModelManager:
                 temperature=0.7,
                 format="wav",
                 streaming=True,
+                stream_chunk_size=stream_chunk_size,
+                initial_stream_chunk_size=initial_stream_chunk_size,
             )
             list(inference(request_long, tts_inference_engine))
             if torch.cuda.is_available():

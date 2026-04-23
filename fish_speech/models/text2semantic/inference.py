@@ -793,7 +793,8 @@ def init_model(checkpoint_path, device, precision, compile=False):
     logger.info("Restored model from checkpoint")
 
     if isinstance(model, DualARTransformer):
-        decode_one_token = decode_one_token_ar
+        eager_decode_one_token = decode_one_token_ar
+        decode_one_token = eager_decode_one_token
         logger.info("Using DualARTransformer")
     else:
         raise ValueError("Unsupported model type")
@@ -814,7 +815,7 @@ def init_model(checkpoint_path, device, precision, compile=False):
             dynamic=True,
         )
 
-    return model.eval(), decode_one_token
+    return model.eval(), decode_one_token, eager_decode_one_token
 
 
 @torch.inference_mode()
@@ -1308,7 +1309,7 @@ def launch_thread_safe_queue(
             "YES",
         }
 
-        model, decode_one_token = init_model(
+        model, decode_one_token, eager_decode_one_token = init_model(
             checkpoint_path, device, precision, compile=compile
         )
         cache_len = _cache_max_seq_len(model)
@@ -1342,6 +1343,11 @@ def launch_thread_safe_queue(
             t_req_start = time.perf_counter()
             t_last_put = t_req_start
             stream_tokens = kwargs.get("stream_tokens", False)
+            streaming_eager_decode = stream_tokens and _env_flag(
+                "FISH_STREAMING_EAGER_DECODE", False
+            )
+            if streaming_eager_decode:
+                kwargs["compile"] = False
             put_count = 0
             cleanup_mode = _normalize_cleanup_mode(
                 kwargs.pop("cleanup_mode", "request_end")
@@ -1412,7 +1418,13 @@ def launch_thread_safe_queue(
 
             try:
                 for chunk in generate_long(
-                    model=model, decode_one_token=decode_one_token, **kwargs
+                    model=model,
+                    decode_one_token=(
+                        eager_decode_one_token
+                        if streaming_eager_decode
+                        else decode_one_token
+                    ),
+                    **kwargs,
                 ):
                     if cancel_event is not None and cancel_event.is_set():
                         abort_requested = True
@@ -1630,7 +1642,7 @@ def main(
 
     logger.info("Loading model ...")
     t0 = time.time()
-    model, decode_one_token = init_model(
+    model, decode_one_token, _ = init_model(
         checkpoint_path, device, precision, compile=compile
     )
     with torch.device(device):

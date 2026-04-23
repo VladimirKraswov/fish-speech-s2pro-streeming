@@ -9,7 +9,6 @@ import torch
 from omegaconf import DictConfig
 
 from .logger import RankedLogger
-from .rich_utils import enforce_tags, print_config_tree
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
@@ -135,3 +134,15 @@ def set_seed(seed: int):
     if torch.backends.cudnn.is_available():
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+
+def enforce_tags(cfg, save_to_file=False):
+    pass
+
+def print_config_tree(cfg, resolve=False, save_to_file=False):
+    pass
+
+def enforce_tags(cfg, save_to_file=False):
+    pass
+
+def print_config_tree(cfg, resolve=False, save_to_file=False):
+    pass

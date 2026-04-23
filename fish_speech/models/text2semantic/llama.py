@@ -872,6 +872,9 @@ class Attention(nn.Module):
             return tensor
         return tensor.repeat_interleave(repeat_factor, dim=1)
 
+    def _make_sdpa_context(self, force_math: bool):
+        return sdpa_kernel(SDPBackend.MATH) if force_math else nullcontext()
+
     def _sdpa_with_optional_gqa(
         self,
         query: Tensor,
@@ -884,7 +887,6 @@ class Attention(nn.Module):
         force_math: bool = False,
     ) -> Tensor:
         enable_gqa = self.n_head != self.n_local_heads
-        context = sdpa_kernel(SDPBackend.MATH) if force_math else nullcontext()
 
         call_kwargs = {
             "dropout_p": dropout_p,
@@ -895,7 +897,7 @@ class Attention(nn.Module):
 
         if enable_gqa:
             try:
-                with context:
+                with self._make_sdpa_context(force_math):
                     return F.scaled_dot_product_attention(
                         query,
                         key,
@@ -907,7 +909,7 @@ class Attention(nn.Module):
                 key = self._repeat_kv_for_gqa(key)
                 value = self._repeat_kv_for_gqa(value)
 
-        with context:
+        with self._make_sdpa_context(force_math):
             return F.scaled_dot_product_attention(
                 query,
                 key,

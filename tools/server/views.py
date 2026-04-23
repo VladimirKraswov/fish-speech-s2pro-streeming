@@ -22,7 +22,6 @@ from kui.asgi import (
     request,
 )
 from loguru import logger
-from starlette.responses import Response
 from typing_extensions import Annotated
 
 from fish_speech.utils.schema import (
@@ -234,7 +233,9 @@ async def debug_memory():
                 or "Set FISH_RECORD_MEMORY_HISTORY=1 at startup for alloc history in snapshot."
             )
     if request.query_params.get("format", "").strip().lower() == "text":
-        return Response(_gpu_memory_text(info), media_type="text/plain; charset=utf-8")
+        return _gpu_memory_text(info).encode("utf-8"), 200, {
+            "Content-Type": "text/plain; charset=utf-8"
+        }
     return JSONResponse(info)
 
 
@@ -332,11 +333,11 @@ async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
                 for result in engine.inference(req):
                     if result.code == "error" and result.error:
                         raise RuntimeError(str(result.error))
-                return Response(status_code=204)
+                return b"", 204, {}
             except RuntimeError as e:
                 if _is_no_audio_generated_error(e):
                     logger.info("TTS cleanup completed without audio generation")
-                    return Response(status_code=204)
+                    return b"", 204, {}
                 raise HTTPException(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     content=f"Cleanup failed: {e}",
@@ -437,7 +438,7 @@ async def add_reference(
             message=f"Reference ID '{id}' already exists",
             reference_id=id,
         )
-        return format_response(response, status_code=409)  # Conflict
+        return format_response(response, status_code=409)
 
     except ValueError as e:
         logger.warning(f"Invalid input for reference '{id}': {e}")
@@ -533,12 +534,10 @@ async def list_references():
     Get a list of all available reference voice IDs.
     """
     try:
-        # Get the model manager to access the reference loader
         app_state = request.app.state
         model_manager: ModelManager = app_state.model_manager
         engine = model_manager.tts_inference_engine
 
-        # Get the list of reference IDs
         reference_ids = engine.list_reference_ids()
 
         response = ListReferencesResponse(
@@ -562,16 +561,13 @@ async def delete_reference(reference_id: str = Body(...)):
     Delete a reference voice by ID.
     """
     try:
-        # Validate input parameters
         if not reference_id or not reference_id.strip():
             raise ValueError("Reference ID cannot be empty")
 
-        # Get the model manager to access the reference loader
         app_state = request.app.state
         model_manager: ModelManager = app_state.model_manager
         engine = model_manager.tts_inference_engine
 
-        # Delete the reference using the engine's reference loader
         engine.delete_reference(reference_id)
 
         response = DeleteReferenceResponse(
@@ -588,7 +584,7 @@ async def delete_reference(reference_id: str = Body(...)):
             message=f"Reference ID '{reference_id}' not found",
             reference_id=reference_id,
         )
-        return format_response(response, status_code=404)  # Not Found
+        return format_response(response, status_code=404)
 
     except ValueError as e:
         logger.warning(f"Invalid input for reference '{reference_id}': {e}")
@@ -626,7 +622,6 @@ async def update_reference(
     Rename a reference voice directory from old_reference_id to new_reference_id.
     """
     try:
-        # Validate input parameters
         if not old_reference_id or not old_reference_id.strip():
             raise ValueError("Old reference ID cannot be empty")
         if not new_reference_id or not new_reference_id.strip():
@@ -634,14 +629,12 @@ async def update_reference(
         if old_reference_id == new_reference_id:
             raise ValueError("New reference ID must be different from old reference ID")
 
-        # Validate ID format per ReferenceLoader rules
         id_pattern = r"^[a-zA-Z0-9\-_ ]+$"
         if not re.match(id_pattern, new_reference_id) or len(new_reference_id) > 255:
             raise ValueError(
                 "New reference ID contains invalid characters or is too long"
             )
 
-        # Access engine to update caches after renaming
         app_state = request.app.state
         model_manager: ModelManager = app_state.model_manager
         engine = model_manager.tts_inference_engine
@@ -650,11 +643,9 @@ async def update_reference(
         old_dir = refs_base / old_reference_id
         new_dir = refs_base / new_reference_id
 
-        # Existence checks
         if not old_dir.exists() or not old_dir.is_dir():
             raise FileNotFoundError(f"Reference ID '{old_reference_id}' not found")
         if new_dir.exists():
-            # Conflict: destination already exists
             response = UpdateReferenceResponse(
                 success=False,
                 message=f"Reference ID '{new_reference_id}' already exists",
@@ -663,10 +654,8 @@ async def update_reference(
             )
             return format_response(response, status_code=409)
 
-        # Perform rename
         old_dir.rename(new_dir)
 
-        # Update in-memory cache key if present
         if old_reference_id in engine.ref_by_id:
             engine.ref_by_id[new_reference_id] = engine.ref_by_id.pop(old_reference_id)
 

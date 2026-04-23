@@ -78,7 +78,7 @@ class SessionPolicyConfig(SessionBaseModel):
 
     session_idle_timeout_sec: float = Field(default=15.0, ge=1.0, le=3600.0)
     cleanup_after_idle_sec: float = Field(default=2.0, ge=0.0, le=300.0)
-    force_flush_after_sec: float = Field(default=0.35, ge=0.0, le=10.0)
+    force_flush_after_sec: float = Field(default=1.0, ge=0.0, le=10.0)
     max_pending_emit_chunks: int = Field(default=32, ge=1, le=4096)
     close_tts_stream_on_new_text: bool = False
 

@@ -117,6 +117,7 @@ def _cuda_free_gb(device: torch.device | str | None = None) -> float | None:
 def _light_cuda_cleanup() -> None:
     if not torch.cuda.is_available():
         return
+    torch.cuda.synchronize()
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -539,10 +540,12 @@ def decode_n_tokens(
         else:
             current_stream_chunk_size = stream_chunk_size
 
+    llm_critical_free_gb = _env_float("FISH_LLM_CRITICAL_FREE_GB", 1.5)
+
     for i in tqdm(range(num_new_tokens)):
-        if (i + 1) % 16 == 0:
+        if (i + 1) % 4 == 0:
             free_gb = _cuda_free_gb(cur_token.device)
-            if free_gb is not None and free_gb < 1.5:
+            if free_gb is not None and free_gb < llm_critical_free_gb:
                 _light_cuda_cleanup()
 
         if i == 0 and do_stream_log:

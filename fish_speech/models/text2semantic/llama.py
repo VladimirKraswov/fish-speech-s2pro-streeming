@@ -914,7 +914,9 @@ class Attention(nn.Module):
             return attn_mask.unsqueeze(1).unsqueeze(1)
         if attn_mask.dim() == 2:
             return attn_mask.unsqueeze(0).unsqueeze(0).unsqueeze(0)
-        raise ValueError(f"Unsupported attn_mask rank for manual GQA: {attn_mask.dim()}")
+        raise ValueError(
+            f"Unsupported attn_mask rank for manual GQA: {attn_mask.dim()}"
+        )
 
     def _manual_gqa_attention(
         self,
@@ -924,16 +926,21 @@ class Attention(nn.Module):
         attn_mask: Optional[Tensor] = None,
         dropout_p: float = 0.0,
     ) -> Tensor:
+        # query: [B, Hq, Lq, D]
+        # key  : [B, Hkv, Lk, D]
+        # value: [B, Hkv, Lk, D]
         bsz, hq, q_len, head_dim = query.shape
         _, hkv, _, _ = key.shape
 
         assert hq % hkv == 0, f"n_head={hq} must be divisible by n_local_heads={hkv}"
         groups = hq // hkv
 
+        # [B, Hkv, G, Lq, D]
         q = query.view(bsz, hkv, groups, q_len, head_dim).float()
         k = key.float()
         v = value.float()
 
+        # [B, Hkv, G, Lq, Lk]
         attn_weight = torch.einsum("bhgld,bhsd->bhgls", q, k)
         attn_weight *= 1.0 / math.sqrt(head_dim)
 
@@ -951,10 +958,38 @@ class Attention(nn.Module):
         if dropout_p > 0.0:
             attn_weight = torch.dropout(attn_weight, dropout_p, train=self.training)
 
+        # [B, Hkv, G, Lq, D]
         y = torch.einsum("bhgls,bhsd->bhgld", attn_weight.to(v.dtype), v)
         y = y.reshape(bsz, hq, q_len, head_dim)
 
         return y.type_as(query)
+
+    def _single_token_low_mem_attention(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attn_mask: Optional[Tensor] = None,
+        dropout_p: float = 0.0,
+    ) -> Tensor:
+        # Для streaming decode (q_len=1) не используем SDPA вообще:
+        # он может просить лишний workspace и падать при низком free VRAM.
+        if self.n_head != self.n_local_heads:
+            return self._manual_gqa_attention(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+            )
+
+        return self.eq_scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+        )
 
     def _sdpa_with_optional_gqa(
         self,
@@ -968,6 +1003,18 @@ class Attention(nn.Module):
         force_math: bool = False,
     ) -> Tensor:
         enable_gqa = self.n_head != self.n_local_heads
+
+        # Ключевая правка:
+        # если это incremental decode (обычно Lq=1), идём в low-memory реализацию,
+        # а не в SDPA. Это именно ваш кейс из логов.
+        if query.size(-2) == 1 and not self.training:
+            return self._single_token_low_mem_attention(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+            )
 
         call_kwargs = {
             "dropout_p": dropout_p,
@@ -987,27 +1034,35 @@ class Attention(nn.Module):
                         **call_kwargs,
                     )
             except Exception as e:
-                if self._is_oom_error(e):
-                    raise
+                # На OOM тоже уходим в manual GQA, а не падаем сразу.
+                if self._is_oom_error(e) or self._is_sdpa_support_error(e):
+                    return self._manual_gqa_attention(
+                        query,
+                        key,
+                        value,
+                        attn_mask=attn_mask,
+                        dropout_p=dropout_p,
+                    )
+                raise
 
-                if not self._is_sdpa_support_error(e):
-                    raise
-
-                return self._manual_gqa_attention(
+        try:
+            with self._make_sdpa_context(force_math):
+                return F.scaled_dot_product_attention(
+                    query,
+                    key,
+                    value,
+                    **call_kwargs,
+                )
+        except Exception as e:
+            if self._is_oom_error(e) or self._is_sdpa_support_error(e):
+                return self.eq_scaled_dot_product_attention(
                     query,
                     key,
                     value,
                     attn_mask=attn_mask,
                     dropout_p=dropout_p,
                 )
-
-        with self._make_sdpa_context(force_math):
-            return F.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                **call_kwargs,
-            )
+            raise
 
     def _math_attention(
         self,
@@ -1017,6 +1072,16 @@ class Attention(nn.Module):
         attn_mask: Optional[Tensor] = None,
         dropout_p: float = 0.0,
     ) -> Tensor:
+        # Тот же low-memory shortcut для single-token decode
+        if query.size(-2) == 1 and not self.training:
+            return self._single_token_low_mem_attention(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+            )
+
         try:
             return self._sdpa_with_optional_gqa(
                 query,
@@ -1028,10 +1093,7 @@ class Attention(nn.Module):
                 force_math=True,
             )
         except Exception as e:
-            if self._is_oom_error(e):
-                raise
-
-            if self._is_sdpa_support_error(e):
+            if self._is_oom_error(e) or self._is_sdpa_support_error(e):
                 if self.n_head != self.n_local_heads:
                     return self._manual_gqa_attention(
                         query,
@@ -1048,7 +1110,6 @@ class Attention(nn.Module):
                     attn_mask=attn_mask,
                     dropout_p=dropout_p,
                 )
-
             raise
 
     def forward(
@@ -1132,7 +1193,9 @@ class Attention(nn.Module):
         attn_weight = query @ key.transpose(-2, -1) * scale_factor
         attn_weight += attn_bias
         attn_weight = torch.softmax(attn_weight, dim=-1)
-        attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+
+        if dropout_p > 0.0:
+            attn_weight = torch.dropout(attn_weight, dropout_p, train=self.training)
 
         return attn_weight @ value
 

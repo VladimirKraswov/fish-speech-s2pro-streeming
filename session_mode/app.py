@@ -9,6 +9,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 from loguru import logger
 
@@ -172,6 +173,8 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    app.mount("/demo", StaticFiles(directory="demo"), name="demo")
 
     @app.middleware("http")
     async def request_timing_middleware(request: Request, call_next):

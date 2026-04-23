@@ -62,7 +62,7 @@
     const logEl = document.getElementById('log');
 
     let audioCtx = null;
-    let processor = null;
+    let worklet = null;
     let gainNode = null;
     let abortController = null;
     let currentRun = 0;
@@ -94,6 +94,7 @@
     }
 
     function resetPlaybackQueue() {
+      if (worklet) worklet.port.postMessage({ type: "reset" });
       pcmQueue = [];
       currentChunk = null;
       currentChunkOffset = 0;
@@ -120,58 +121,76 @@
         gainNode.connect(audioCtx.destination);
       }
 
-      if (!processor) {
-        // 2048 сэмплов при 44.1kHz ~= 46 мс
-        processor = audioCtx.createScriptProcessor(2048, 0, 1);
-        processor.onaudioprocess = (event) => {
-          const out = event.outputBuffer.getChannelData(0);
-          out.fill(0);
-
-          let writePos = 0;
-
-          while (writePos < out.length) {
-            if (!currentChunk) {
-              if (pcmQueue.length === 0) {
-                break;
+      if (!worklet) {
+        const blob = new Blob([`
+          class PCMWorklet extends AudioWorkletProcessor {
+            constructor() {
+              super();
+              this.queue = [];
+              this.currentChunk = null;
+              this.offset = 0;
+              this.active = false;
+              this.port.onmessage = (e) => {
+                if (e.data.type === "push") {
+                  this.queue.push(e.data.payload);
+                } else if (e.data.type === "reset") {
+                  this.queue = [];
+                  this.currentChunk = null;
+                  this.offset = 0;
+                  this.active = false;
+                }
+              };
+            }
+            process(inputs, outputs) {
+              const output = outputs[0];
+              const channel = output[0];
+              channel.fill(0);
+              let writePos = 0;
+              while (writePos < channel.length) {
+                if (!this.currentChunk) {
+                  if (this.queue.length === 0) break;
+                  this.currentChunk = this.queue.shift();
+                  this.offset = 0;
+                }
+                const n = Math.min(channel.length - writePos, this.currentChunk.length - this.offset);
+                channel.set(this.currentChunk.subarray(this.offset, this.offset + n), writePos);
+                this.offset += n;
+                writePos += n;
+                if (this.offset >= this.currentChunk.length) this.currentChunk = null;
               }
-              currentChunk = pcmQueue.shift();
-              currentChunkOffset = 0;
-            }
-
-            const remainingChunk = currentChunk.length - currentChunkOffset;
-            const remainingOut = out.length - writePos;
-            const n = Math.min(remainingChunk, remainingOut);
-
-            out.set(
-              currentChunk.subarray(currentChunkOffset, currentChunkOffset + n),
-              writePos
-            );
-
-            currentChunkOffset += n;
-            queuedSamples = Math.max(0, queuedSamples - n);
-            writePos += n;
-
-            if (currentChunkOffset >= currentChunk.length) {
-              currentChunk = null;
-              currentChunkOffset = 0;
+              if (writePos > 0 && !this.active) {
+                this.active = true;
+                this.port.postMessage({ type: "event", kind: "audio_play_started" });
+              }
+              if (writePos < channel.length && this.active) {
+                if (!this.lastUnderrunMsg || currentTime - this.lastUnderrunMsg > 0.35) {
+                  this.lastUnderrunMsg = currentTime;
+                  this.port.postMessage({ type: "event", kind: "underrun", samples: channel.length - writePos });
+                }
+              }
+              return true;
             }
           }
-
-          if (writePos > 0 && !playbackActive) {
-            playbackActive = true;
-            log(`audio_play_started queue=${pcmQueue.length}`);
-          }
-
-          if (writePos < out.length && playbackActive) {
-            underruns += 1;
-            const now = performance.now();
-            if (now - lastUnderrunLog > 350) {
-              lastUnderrunLog = now;
-              log(`underrun_detected missing_samples=${out.length - writePos} underruns=${underruns}`);
+          registerProcessor("pcm-worklet", PCMWorklet);
+        `], { type: "application/javascript" });
+        const url = URL.createObjectURL(blob);
+        await audioCtx.audioWorklet.addModule(url);
+        worklet = new AudioWorkletNode(audioCtx, "pcm-worklet");
+        worklet.port.onmessage = (e) => {
+          if (e.data.type === "event") {
+            if (e.data.kind === "underrun") {
+              underruns += 1;
+              const now = performance.now();
+              if (now - lastUnderrunLog > 350) {
+                lastUnderrunLog = now;
+                log(`underrun_detected missing_samples=${e.data.samples} underruns=${underruns}`);
+              }
+            } else {
+              log(e.data.kind);
             }
           }
         };
-        processor.connect(gainNode);
+        worklet.connect(gainNode);
       }
 
       await audioCtx.resume();
@@ -213,21 +232,26 @@
       return out;
     }
 
-    function resampleLinear(input, fromRate, toRate) {
+    function resampleHermite(input, fromRate, toRate) {
       if (!input.length || fromRate === toRate) return input;
-
-      const ratio = toRate / fromRate;
-      const outLength = Math.max(1, Math.round(input.length * ratio));
+      const ratio = fromRate / toRate;
+      const outLength = Math.max(1, Math.round(input.length / ratio));
       const out = new Float32Array(outLength);
-
       for (let i = 0; i < outLength; i++) {
-        const srcPos = i / ratio;
-        const i0 = Math.floor(srcPos);
-        const i1 = Math.min(input.length - 1, i0 + 1);
-        const frac = srcPos - i0;
-        out[i] = input[i0] * (1 - frac) + input[i1] * frac;
+        const pos = i * ratio;
+        const i1 = Math.floor(pos);
+        const i0 = Math.max(0, i1 - 1);
+        const i2 = Math.min(input.length - 1, i1 + 1);
+        const i3 = Math.min(input.length - 1, i1 + 2);
+        const diff = pos - i1;
+        const diffSq = diff * diff;
+        const diffCu = diffSq * diff;
+        const a0 = input[i3] - input[i2] - input[i0] + input[i1];
+        const a1 = input[i0] - input[i1] - a0;
+        const a2 = input[i2] - input[i0];
+        const a3 = input[i1];
+        out[i] = a0 * diffCu + a1 * diffSq + a2 * diff + a3;
       }
-
       return out;
     }
 
@@ -240,6 +264,7 @@
         lastSeq = seq;
       }
 
+      if (worklet) worklet.port.postMessage({ type: "push", payload: float32Chunk });
       pcmQueue.push(float32Chunk);
       queuedSamples += float32Chunk.length;
       const queuedSec = audioCtx ? queuedSamples / Math.max(1, audioCtx.sampleRate) : 0;
@@ -348,7 +373,7 @@
               const bytes = base64ToUint8Array(event.data);
               log(`audio_chunk_received seq=${event.seq ?? '-'} bytes=${bytes.byteLength}`);
               const mono = pcm16ToFloat32(bytes, Number(streamMeta.channels || 1));
-              const floatChunk = resampleLinear(
+              const floatChunk = resampleHermite(
                 mono,
                 Number(streamMeta.sample_rate || 44100),
                 audioCtx.sampleRate

@@ -661,6 +661,11 @@
             <button id="cleanupBtn" class="warn">Cleanup</button>
           </div>
 
+          <div class="buttons-2" style="margin-top: 10px;">
+            <button id="downloadRawBtn" class="secondary" title="Download raw incoming PCM">Raw PCM</button>
+            <button id="downloadResampledBtn" class="secondary" title="Download post-resample mono PCM">Resampled</button>
+          </div>
+
           <div class="muted" style="margin-top:10px;">
             После подключения страница отправляет <code>start_session</code> и <code>patch_config</code>.
           </div>
@@ -833,6 +838,10 @@
                   <div id="debugActiveChunk" class="mini-log">—</div>
                 </div>
                 <div>
+                  <div class="muted">audio metrics & boundaries</div>
+                  <div id="debugAudioMetrics" class="mini-log">—</div>
+                </div>
+                <div>
                   <div class="muted">playback events</div>
                   <div id="debugPlaybackEvents" class="mini-log">—</div>
                 </div>
@@ -889,6 +898,7 @@
 	      debugBuffer: document.getElementById("debugBuffer"),
 	      debugQueuedChunks: document.getElementById("debugQueuedChunks"),
 	      debugActiveChunk: document.getElementById("debugActiveChunk"),
+	      debugAudioMetrics: document.getElementById("debugAudioMetrics"),
 	      debugPlaybackEvents: document.getElementById("debugPlaybackEvents"),
 
       connectBtn: document.getElementById("connectBtn"),
@@ -898,6 +908,8 @@
       stopBtn: document.getElementById("stopBtn"),
       flushBtn: document.getElementById("flushBtn"),
       clearLogBtn: document.getElementById("clearLogBtn"),
+      downloadRawBtn: document.getElementById("downloadRawBtn"),
+      downloadResampledBtn: document.getElementById("downloadResampledBtn"),
 
       statusDot: document.getElementById("statusDot"),
       statusText: document.getElementById("statusText"),
@@ -922,7 +934,7 @@
 
 	      audioCtx: null,
 	      gainNode: null,
-	      processor: null,
+	      worklet: null,
 	      playback: {
 	        nextStartTime: 0,
 	        pcmQueue: [],
@@ -936,7 +948,11 @@
 	        overlaps: 0,
 	        lastUnderrunLogAt: 0,
 	        sampleRateMismatchLogged: false,
-	        events: []
+	        events: [],
+	        rawHistory: [],
+	        resampledHistory: [],
+	        lastSample: 0,
+	        boundaries: []
 	      },
 
       simRunning: false,
@@ -1046,6 +1062,7 @@
 	      state.chunkLanes = new Map();
 	      state.pendingAudioEvent = null;
 	      state.playback.nextStartTime = state.audioCtx ? state.audioCtx.currentTime : 0;
+	      if (state.worklet) state.worklet.port.postMessage({ type: "reset" });
 	      state.playback.pcmQueue = [];
 	      state.playback.currentChunk = null;
 	      state.playback.currentOffset = 0;
@@ -1058,6 +1075,10 @@
 	      state.playback.lastUnderrunLogAt = 0;
 	      state.playback.sampleRateMismatchLogged = false;
 	      state.playback.events = [];
+	      state.playback.rawHistory = [];
+	      state.playback.resampledHistory = [];
+	      state.playback.lastSample = 0;
+	      state.playback.boundaries = [];
 	      els.ttfa.textContent = "—";
       renderPreview();
       renderBuffer();
@@ -1201,6 +1222,22 @@
 	      renderDebugPanel();
 	    }
 
+	    function getRMS(arr) {
+	      if (!arr.length) return 0;
+	      let sum = 0;
+	      for (let i = 0; i < arr.length; i++) sum += arr[i] * arr[i];
+	      return Math.sqrt(sum / arr.length);
+	    }
+
+	    function getPeak(arr) {
+	      let p = 0;
+	      for (let i = 0; i < arr.length; i++) {
+	        const a = Math.abs(arr[i]);
+	        if (a > p) p = a;
+	      }
+	      return p;
+	    }
+
 	    function renderDebugPanel() {
 	      els.debugBuffer.textContent = state.realBufferText || state.mirror.buffer || "—";
 
@@ -1226,6 +1263,38 @@
 	        )
 	      ];
 	      els.debugPlaybackEvents.textContent = eventLines.join("\n");
+
+	      const metricLines = [
+	        `last_peak=${(state.playback.lastPeak || 0).toFixed(4)} last_rms=${(state.playback.lastRMS || 0).toFixed(4)}`,
+	        `boundaries_discontinuity:`,
+	        ...state.playback.boundaries.slice(-10).map(b =>
+	          `+${Math.round(b.t)}ms diff=${b.diff.toFixed(4)} peak=${b.peak.toFixed(4)}`
+	        )
+	      ];
+	      els.debugAudioMetrics.textContent = metricLines.join("\n");
+	    }
+
+	    function resampleHermite(input, fromRate, toRate) {
+	      if (!input.length || fromRate === toRate) return input;
+	      const ratio = fromRate / toRate;
+	      const outLength = Math.max(1, Math.round(input.length / ratio));
+	      const out = new Float32Array(outLength);
+	      for (let i = 0; i < outLength; i++) {
+	        const pos = i * ratio;
+	        const i1 = Math.floor(pos);
+	        const i0 = Math.max(0, i1 - 1);
+	        const i2 = Math.min(input.length - 1, i1 + 1);
+	        const i3 = Math.min(input.length - 1, i1 + 2);
+	        const diff = pos - i1;
+	        const diffSq = diff * diff;
+	        const diffCu = diffSq * diff;
+	        const a0 = input[i3] - input[i2] - input[i0] + input[i1];
+	        const a1 = input[i0] - input[i1] - a0;
+	        const a2 = input[i2] - input[i0];
+	        const a3 = input[i1];
+	        out[i] = a0 * diffCu + a1 * diffSq + a2 * diff + a3;
+	      }
+	      return out;
 	    }
 
     function pickTickStep(maxT) {
@@ -1310,79 +1379,111 @@
 	        state.gainNode.connect(state.audioCtx.destination);
 	      }
 
-	      if (!state.processor) {
-	        state.processor = state.audioCtx.createScriptProcessor(2048, 0, 1);
-	        state.processor.onaudioprocess = (event) => {
-	          const out = event.outputBuffer.getChannelData(0);
-	          out.fill(0);
-
-	          let writePos = 0;
-	          while (writePos < out.length) {
-	            if (!state.playback.currentChunk) {
-	              if (state.playback.pcmQueue.length === 0) {
-	                break;
+	      if (!state.worklet) {
+	        const blob = new Blob([`
+	          class PCMWorklet extends AudioWorkletProcessor {
+	            constructor() {
+	              super();
+	              this.queue = [];
+	              this.currentChunk = null;
+	              this.offset = 0;
+	              this.active = false;
+	              this.expecting = false;
+	              this.prebuffering = true;
+	              this.prebufferSamples = 44100 * 0.2;
+	              this.queuedSamplesCount = 0;
+	              this.port.onmessage = (e) => {
+	                if (e.data.type === "push") {
+	                  this.queue.push(e.data.payload);
+	                  this.queuedSamplesCount += e.data.payload.length;
+	                  this.expecting = true;
+	                } else if (e.data.type === "set_prebuffer") {
+	                  this.prebufferSamples = e.data.samples;
+	                } else if (e.data.type === "reset") {
+	                  this.queue = [];
+	                  this.currentChunk = null;
+	                  this.offset = 0;
+	                  this.active = false;
+	                  this.expecting = false;
+	                  this.prebuffering = true;
+	                  this.queuedSamplesCount = 0;
+	                }
+	              };
+	            }
+	            process(inputs, outputs) {
+	              const output = outputs[0];
+	              const channel = output[0];
+	              channel.fill(0);
+	              let writePos = 0;
+	              if (this.prebuffering) {
+	                if (this.queuedSamplesCount >= this.prebufferSamples) {
+	                  this.prebuffering = false;
+	                } else {
+	                  return true;
+	                }
 	              }
-	              state.playback.currentChunk = state.playback.pcmQueue.shift();
-	              state.playback.currentOffset = 0;
-	            }
+	              while (writePos < channel.length) {
+	                if (!this.currentChunk) {
+	                  if (this.queue.length === 0) break;
+	                  this.currentChunk = this.queue.shift();
+	                  this.offset = 0;
+	                }
+	                const canWrite = channel.length - writePos;
+	                const canRead = this.currentChunk.length - this.offset;
+	                const n = Math.min(canWrite, canRead);
 
-	            const remainingChunk =
-	              state.playback.currentChunk.length - state.playback.currentOffset;
-	            const remainingOut = out.length - writePos;
-	            const n = Math.min(remainingChunk, remainingOut);
+	                channel.set(this.currentChunk.subarray(this.offset, this.offset + n), writePos);
 
-	            out.set(
-	              state.playback.currentChunk.subarray(
-	                state.playback.currentOffset,
-	                state.playback.currentOffset + n
-	              ),
-	              writePos
-	            );
-
-	            state.playback.currentOffset += n;
-	            state.playback.queuedSamples = Math.max(0, state.playback.queuedSamples - n);
-	            writePos += n;
-
-	            if (state.playback.currentOffset >= state.playback.currentChunk.length) {
-	              state.playback.currentChunk = null;
-	              state.playback.currentOffset = 0;
-	            }
-	          }
-
-	          if (writePos > 0 && !state.playback.active) {
-	            state.playback.active = true;
-	            pushPlaybackEvent("audio_play_started", `queued=${state.playback.pcmQueue.length}`);
-	          }
-
-	          if (
-	            writePos < out.length
-	            && state.playback.expectingAudio
-	            && state.playback.active
-	          ) {
-	            const now = nowMs();
-	            state.playback.underruns += 1;
-	            state.playback.gaps += 1;
-	            if (now - state.playback.lastUnderrunLogAt > 350) {
-	              state.playback.lastUnderrunLogAt = now;
-	              pushPlaybackEvent(
-	                "underrun_detected",
-	                `missing_samples=${out.length - writePos}`
-	              );
+	                this.offset += n;
+	                writePos += n;
+	                this.queuedSamplesCount -= n;
+	                if (this.offset >= this.currentChunk.length) {
+	                  this.currentChunk = null;
+	                }
+	              }
+	              if (writePos > 0 && !this.active) {
+	                this.active = true;
+	                this.port.postMessage({ type: "event", kind: "audio_play_started" });
+	              }
+	              if (writePos < channel.length && this.expecting && this.active) {
+	                if (!this.lastUnderrunMsg || currentTime - this.lastUnderrunMsg > 0.35) {
+	                  this.lastUnderrunMsg = currentTime;
+	                  this.port.postMessage({ type: "event", kind: "underrun", samples: channel.length - writePos });
+	                }
+	              }
+	              if (writePos === 0 && this.active && this.queue.length === 0) {
+	                this.active = false;
+	                this.prebuffering = true;
+	                this.port.postMessage({ type: "event", kind: "audio_play_finished" });
+	              }
+	              return true;
 	            }
 	          }
-
-	          if (
-	            writePos > 0
-	            && !state.playback.expectingAudio
-	            && state.playback.queuedSamples === 0
-	            && !state.playback.currentChunk
-	            && state.playback.active
-	          ) {
-	            state.playback.active = false;
-	            pushPlaybackEvent("audio_play_finished", "queue drained");
+	          registerProcessor("pcm-worklet", PCMWorklet);
+	        `], { type: "application/javascript" });
+	        const url = URL.createObjectURL(blob);
+	        await state.audioCtx.audioWorklet.addModule(url);
+	        state.worklet = new AudioWorkletNode(state.audioCtx, "pcm-worklet");
+	        state.worklet.port.postMessage({
+	          type: "set_prebuffer",
+	          samples: Math.round(state.audioCtx.sampleRate * 0.25)
+	        });
+	        state.worklet.port.onmessage = (e) => {
+	          if (e.data.type === "event") {
+	            if (e.data.kind === "underrun") {
+	              const now = performance.now();
+	              state.playback.underruns += 1;
+	              state.playback.gaps += 1;
+	              if (now - state.playback.lastUnderrunLogAt > 350) {
+	                state.playback.lastUnderrunLogAt = now;
+	                pushPlaybackEvent("underrun_detected", `missing_samples=${e.data.samples}`);
+	              }
+	            } else {
+	              pushPlaybackEvent(e.data.kind);
+	            }
 	          }
 	        };
-	        state.processor.connect(state.gainNode);
+	        state.worklet.connect(state.gainNode);
 	      }
 	      if (state.audioCtx.state !== "running") {
 	        await state.audioCtx.resume();
@@ -1899,21 +2000,42 @@
 	    }
 
 	    function schedulePcmChunk(arrayBuffer, sampleRate, channels) {
-	      if (!state.audioCtx) return;
+	      if (!state.audioCtx || !state.worklet) return;
 
 	      const ctx = state.audioCtx;
 	      const mono = pcm16ToMonoFloat32(arrayBuffer, channels);
 	      if (!mono.length) return;
 
-	      const playable = resampleLinear(mono, sampleRate, ctx.sampleRate);
-	      state.playback.pcmQueue.push(playable);
+	      const playable = resampleHermite(mono, sampleRate, ctx.sampleRate);
+
+	      // Boundaries & Metrics
+	      const diff = playable.length > 0 ? Math.abs(playable[0] - state.playback.lastSample) : 0;
+	      const peak = getPeak(playable);
+	      const rms = getRMS(playable);
+	      state.playback.lastSample = playable.length > 0 ? playable[playable.length - 1] : state.playback.lastSample;
+	      state.playback.lastPeak = peak;
+	      state.playback.lastRMS = rms;
+
+	      const base = state.firstDeltaSentAt || nowMs();
+	      state.playback.boundaries.push({
+	        t: nowMs() - base,
+	        diff,
+	        peak,
+	        rms
+	      });
+
+	      // History for download
+	      state.playback.rawHistory.push(new Uint8Array(arrayBuffer));
+	      state.playback.resampledHistory.push(new Float32Array(playable));
+
+	      state.worklet.port.postMessage({ type: "push", payload: playable });
 	      state.playback.queuedSamples += playable.length;
 	      state.playback.expectingAudio = true;
 
 	      const queuedSec = state.playback.queuedSamples / Math.max(1, ctx.sampleRate);
 	      pushPlaybackEvent(
 	        "audio_chunk_queued",
-	        `samples=${playable.length} queue=${state.playback.pcmQueue.length} queued_sec=${queuedSec.toFixed(3)}`
+	        `samples=${playable.length} queued_sec=${queuedSec.toFixed(3)}`
 	      );
 	      refreshStats();
 	    }
@@ -2101,6 +2223,37 @@
 
     els.clearLogBtn.addEventListener("click", () => {
       els.log.textContent = "";
+    });
+
+    function downloadBlob(blob, filename) {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+
+    els.downloadRawBtn.addEventListener("click", () => {
+      if (!state.playback.rawHistory.length) return alert("No audio data yet");
+      const blob = new Blob(state.playback.rawHistory, { type: "application/octet-stream" });
+      downloadBlob(blob, `raw_${state.sessionId || "session"}.pcm`);
+    });
+
+    els.downloadResampledBtn.addEventListener("click", () => {
+      if (!state.playback.resampledHistory.length) return alert("No audio data yet");
+      let totalLen = 0;
+      for (const chunk of state.playback.resampledHistory) totalLen += chunk.length;
+      const joined = new Float32Array(totalLen);
+      let offset = 0;
+      for (const chunk of state.playback.resampledHistory) {
+        joined.set(chunk, offset);
+        offset += chunk.length;
+      }
+      const blob = new Blob([joined.buffer], { type: "application/octet-stream" });
+      downloadBlob(blob, `resampled_${state.sessionId || "session"}.f32`);
     });
 
     window.addEventListener("beforeunload", () => {

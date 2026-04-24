@@ -30,5 +30,9 @@
     "target_emit_bytes": 4096,
     "start_buffer_ms": 120,
     "stop_grace_ms": 150
+  },
+  "session": {
+    "max_buffer_chars": 4000,
+    "auto_close_on_finish": false
   }
 }

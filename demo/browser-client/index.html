@@ -3,85 +3,85 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Fish Speech Session + Committer Demo</title>
+  <title>Fish Speech Session Stream Demo</title>
   <style>
-    body { font-family: system-ui, sans-serif; margin: 24px auto; max-width: 1180px; padding: 0 16px; }
-    h1 { margin-bottom: 8px; }
-    .grid { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 16px; }
-    .card { border: 1px solid #ddd; border-radius: 12px; padding: 14px; background: #fff; }
-    textarea, input, button, select { font: inherit; }
-    textarea, input[type="text"], input[type="number"] { width: 100%; box-sizing: border-box; padding: 10px; border-radius: 8px; border: 1px solid #ccc; }
-    textarea { min-height: 150px; resize: vertical; }
+    body { font-family: system-ui, sans-serif; margin: 24px auto; max-width: 1240px; padding: 0 16px; }
+    h1 { margin: 0 0 8px; }
     .small { font-size: 13px; color: #555; }
+    .grid { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 16px; margin-top: 16px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 14px; background: #fff; }
     .row { display: flex; gap: 8px; flex-wrap: wrap; }
     .row > * { flex: 1 1 auto; }
+    textarea, input, button { font: inherit; }
+    textarea, input[type="text"], input[type="number"] { width: 100%; box-sizing: border-box; padding: 10px; border-radius: 8px; border: 1px solid #ccc; }
+    textarea { min-height: 170px; resize: vertical; }
     button { padding: 10px 14px; border: 1px solid #bbb; border-radius: 10px; background: #f7f7f7; cursor: pointer; }
     button.primary { background: #111; color: #fff; border-color: #111; }
     button:disabled { opacity: 0.55; cursor: default; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
-    .status { margin: 10px 0 0; font-weight: 600; }
     .pane { min-height: 120px; background: #fafafa; border: 1px solid #e5e5e5; border-radius: 10px; padding: 10px; }
+    .status { margin-top: 10px; font-weight: 600; }
+    .danger { color: #b00020; }
     .chunk { padding: 8px 10px; border-radius: 8px; background: #f2f6ff; margin-bottom: 8px; border: 1px solid #d6e4ff; }
     .meta { color: #666; font-size: 12px; margin-bottom: 4px; }
-    .danger { color: #b00020; }
-    #log { min-height: 240px; background: #111; color: #ddd; }
+    #log { min-height: 250px; background: #111; color: #ddd; }
   </style>
 </head>
 <body>
-  <h1>Fish Speech — session config + committer</h1>
-  <div class="small">Один JSON управляет и коммитером на фронте, и TTS-параметрами на прокси. Сначала открывается сессия, сервер возвращает канонический config, после чего по нему работает симуляция потока и коммиты.</div>
+  <h1>Fish Speech — session stream</h1>
+  <div class="small">Сессия теперь живёт на сервере: append → server-side commit → очередь TTS → единый audio stream. Фронт только открывает сессию, докидывает текст и слушает NDJSON-поток аудио.</div>
 
-  <div class="grid" style="margin-top:16px;">
+  <div class="grid">
     <div class="card">
-      <h3>1. Session config JSON</h3>
+      <h3>1. Session config</h3>
       <textarea id="configText" class="mono"></textarea>
       <div class="row" style="margin-top:10px;">
         <button id="openBtn" class="primary">Open session</button>
+        <button id="finishBtn">Finish input</button>
         <button id="closeBtn">Close session</button>
       </div>
-      <div class="status" id="sessionStatus">Сессия не открыта</div>
-      <div class="small mono" id="sessionMeta"></div>
+      <div id="sessionStatus" class="status">Сессия не открыта</div>
+      <div id="sessionMeta" class="small mono"></div>
     </div>
 
     <div class="card">
-      <h3>2. Симулятор стрима от LLM</h3>
+      <h3>2. Симулятор LLM</h3>
       <div class="row">
         <div>
-          <label class="small">Мин. размер куска</label>
-          <input id="fakeMin" type="number" value="3" min="1" max="100" />
+          <label class="small">Мин. кусок</label>
+          <input id="fakeMin" type="number" value="3" min="1" max="100">
         </div>
         <div>
-          <label class="small">Макс. размер куска</label>
-          <input id="fakeMax" type="number" value="12" min="1" max="200" />
+          <label class="small">Макс. кусок</label>
+          <input id="fakeMax" type="number" value="11" min="1" max="200">
         </div>
         <div>
           <label class="small">Интервал, мс</label>
-          <input id="fakeInterval" type="number" value="90" min="10" max="5000" />
+          <input id="fakeInterval" type="number" value="90" min="10" max="5000">
         </div>
       </div>
-      <textarea id="sourceText" style="margin-top:10px; min-height:200px;">Встретил он по дороге Зайчика, Волка и Медведя, спел им свою песенку и убежал от них. Катился дальше Колобок и повстречалась ему Лисичка. Она и говорит: Колобок, Колобок, какая у тебя красивая песенка.</textarea>
+      <textarea id="sourceText" style="margin-top:10px; min-height:220px;">Встретил он по дороге Зайчика, Волка и Медведя, спел им свою песенку и убежал от них. Катился дальше Колобок и повстречалась ему Лисичка. Она и говорит: Колобок, Колобок, какая у тебя красивая песенка.</textarea>
       <div class="row" style="margin-top:10px;">
         <button id="simulateBtn" class="primary">Start fake stream</button>
-        <button id="stopSimulateBtn">Stop</button>
-        <button id="flushBtn">Force flush tail</button>
+        <button id="stopBtn">Stop</button>
+        <button id="flushBtn">Force flush</button>
       </div>
-      <div class="small" style="margin-top:8px;">Коммит автоматически пойдёт в TTS через уже открытую сессию.</div>
+      <div class="small" style="margin-top:8px;">Все incoming chunks уходят на <span class="mono">/session/{id}/append</span>. Коммит решает сервер.</div>
     </div>
   </div>
 
-  <div class="grid" style="margin-top:16px;">
+  <div class="grid">
     <div class="card">
-      <h3>3. Входящий поток и pending buffer</h3>
-      <div class="small">Raw incoming</div>
+      <h3>3. Состояние</h3>
+      <div class="small">Incoming text</div>
       <div id="incomingPane" class="pane mono"></div>
-      <div class="small" style="margin-top:10px;">Pending buffer</div>
+      <div class="small" style="margin-top:10px;">Server pending buffer</div>
       <div id="pendingPane" class="pane mono"></div>
-      <div class="small" style="margin-top:10px;">Последняя причина коммита</div>
-      <div id="lastReason" class="pane mono"></div>
+      <div class="small" style="margin-top:10px;">Последнее событие</div>
+      <div id="lastEventPane" class="pane mono"></div>
     </div>
-
     <div class="card">
-      <h3>4. Committed chunks</h3>
+      <h3>4. Committed segments</h3>
       <div id="committedList" class="mono"></div>
     </div>
   </div>
@@ -105,7 +105,7 @@
         flush_on_newline: true,
         max_wait_ms: 900,
         allow_partial_after_ms: 1400,
-        carry_incomplete_tail: true,
+        carry_incomplete_tail: true
       },
       tts: {
         reference_id: 'voice',
@@ -120,46 +120,47 @@
         temperature: 0.8,
         stream_tokens: true,
         initial_stream_chunk_size: 18,
-        stream_chunk_size: 8,
+        stream_chunk_size: 8
       },
       playback: {
         target_emit_bytes: 4096,
         start_buffer_ms: 120,
-        stop_grace_ms: 150,
+        stop_grace_ms: 150
+      },
+      session: {
+        max_buffer_chars: 4000,
+        auto_close_on_finish: false
       }
     };
 
     const configText = document.getElementById('configText');
     const openBtn = document.getElementById('openBtn');
+    const finishBtn = document.getElementById('finishBtn');
     const closeBtn = document.getElementById('closeBtn');
-    const sessionStatus = document.getElementById('sessionStatus');
-    const sessionMeta = document.getElementById('sessionMeta');
-    const sourceText = document.getElementById('sourceText');
     const simulateBtn = document.getElementById('simulateBtn');
-    const stopSimulateBtn = document.getElementById('stopSimulateBtn');
+    const stopBtn = document.getElementById('stopBtn');
     const flushBtn = document.getElementById('flushBtn');
-    const incomingPane = document.getElementById('incomingPane');
-    const pendingPane = document.getElementById('pendingPane');
-    const committedList = document.getElementById('committedList');
-    const lastReason = document.getElementById('lastReason');
-    const logEl = document.getElementById('log');
+    const sourceText = document.getElementById('sourceText');
     const fakeMinEl = document.getElementById('fakeMin');
     const fakeMaxEl = document.getElementById('fakeMax');
     const fakeIntervalEl = document.getElementById('fakeInterval');
+    const sessionStatus = document.getElementById('sessionStatus');
+    const sessionMeta = document.getElementById('sessionMeta');
+    const incomingPane = document.getElementById('incomingPane');
+    const pendingPane = document.getElementById('pendingPane');
+    const lastEventPane = document.getElementById('lastEventPane');
+    const committedList = document.getElementById('committedList');
+    const logEl = document.getElementById('log');
 
     configText.value = JSON.stringify(defaultConfig, null, 2);
 
     let sessionId = null;
     let activeConfig = structuredClone(defaultConfig);
+    let sourceOffset = 0;
     let incomingText = '';
     let pendingText = '';
-    let committedCounter = 0;
-    let lastAppendTs = 0;
-    let firstPendingTs = 0;
     let simulateTimer = null;
-    let tailWatchTimer = null;
-    let sourceOffset = 0;
-    let ttsQueue = Promise.resolve();
+    let streamAbortController = null;
 
     let audioCtx = null;
     let processor = null;
@@ -180,214 +181,30 @@
       sessionStatus.className = `status${isError ? ' danger' : ''}`;
     }
 
-    function renderBuffers() {
+    function renderState() {
       incomingPane.textContent = incomingText;
       pendingPane.textContent = pendingText;
     }
 
-    function tryParseConfigText() {
-      return JSON.parse(configText.value);
+    function addCommitted(item) {
+      const box = document.createElement('div');
+      box.className = 'chunk';
+      box.innerHTML = `
+        <div class="meta">#${item.seq} • ${item.reason}</div>
+        <div>${escapeHtml(item.text)}</div>
+      `;
+      committedList.prepend(box);
     }
 
-    async function openSession() {
-      let parsed;
-      try {
-        parsed = tryParseConfigText();
-      } catch (e) {
-        setSessionStatus(`JSON ошибка: ${e.message}`, true);
-        return;
-      }
-
-      const configRaw = JSON.stringify(parsed, null, 2);
-      const resp = await fetch(`${BACKEND_BASE}/session/open`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ config_text: configRaw }),
-      });
-      const data = await resp.json();
-      if (!resp.ok) {
-        setSessionStatus(`Open failed: ${JSON.stringify(data.detail ?? data)}`, true);
-        return;
-      }
-
-      sessionId = data.session_id;
-      activeConfig = data.config;
-      configText.value = JSON.stringify(activeConfig, null, 2);
-      setSessionStatus(`Session opened: ${sessionId}`);
-      sessionMeta.textContent = JSON.stringify({ ttl_sec: data.ttl_sec, server_defaults: data.server_defaults }, null, 2);
-      log(`session opened id=${sessionId}`);
+    function escapeHtml(text) {
+      return text
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;');
     }
 
-    async function closeSession() {
-      if (!sessionId) {
-        setSessionStatus('Сессия уже закрыта');
-        return;
-      }
-      const resp = await fetch(`${BACKEND_BASE}/session/close`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: sessionId }),
-      });
-      const data = await resp.json();
-      sessionId = null;
-      setSessionStatus(`Session closed: ${data.closed ? 'ok' : 'not found'}`);
-      sessionMeta.textContent = '';
-      log(`session closed`);
-    }
-
-    function resetSimulation() {
-      if (simulateTimer) clearTimeout(simulateTimer);
-      if (tailWatchTimer) clearInterval(tailWatchTimer);
-      simulateTimer = null;
-      tailWatchTimer = null;
-      incomingText = '';
-      pendingText = '';
-      sourceOffset = 0;
-      committedCounter = 0;
-      committedList.innerHTML = '';
-      lastReason.textContent = '';
-      renderBuffers();
-    }
-
-    function pickChunkSize() {
-      const min = Math.max(1, Number(fakeMinEl.value || 1));
-      const max = Math.max(min, Number(fakeMaxEl.value || min));
-      return min + Math.floor(Math.random() * (max - min + 1));
-    }
-
-    function bestCommitIndex(text, cfg, allowPartial) {
-      const maxLen = Math.min(text.length, cfg.hard_max_chars);
-      const probe = text.slice(0, maxLen);
-      let best = null;
-      let reason = null;
-
-      const sentenceRegex = /[.!?…](?:["»”']|\)|\]|\})*\s*/g;
-      const clauseRegex = /[,;:—-]\s*/g;
-      const newlineRegex = /\n+/g;
-      const whitespaceRegex = /\s+/g;
-
-      function record(regex, kind, minRequired = 1) {
-        regex.lastIndex = 0;
-        let match;
-        while ((match = regex.exec(probe)) !== null) {
-          const idx = match.index + match[0].length;
-          if (idx >= minRequired) {
-            best = idx;
-            reason = kind;
-          }
-        }
-      }
-
-      if (cfg.flush_on_punctuation && probe.length >= cfg.soft_min_chars) {
-        record(sentenceRegex, 'sentence_boundary', cfg.soft_min_chars);
-      }
-      if (!best && cfg.flush_on_newline) {
-        record(newlineRegex, 'newline_boundary', cfg.soft_min_chars);
-      }
-      if (!best && cfg.flush_on_clause_punctuation && probe.length >= cfg.target_chars) {
-        record(clauseRegex, 'clause_boundary', cfg.target_chars);
-      }
-      if (!best && probe.length >= cfg.hard_max_chars) {
-        record(whitespaceRegex, 'hard_max_whitespace', cfg.target_chars);
-        if (!best) {
-          best = cfg.hard_max_chars;
-          reason = 'hard_max_forced';
-        }
-      }
-      if (!best && allowPartial && probe.length >= cfg.soft_min_chars) {
-        record(whitespaceRegex, 'partial_timeout_whitespace', cfg.soft_min_chars);
-        if (!best) {
-          best = probe.length;
-          reason = 'partial_timeout_forced';
-        }
-      }
-
-      if (!best) return null;
-      return { index: best, reason };
-    }
-
-    function maybeCommit(trigger) {
-      const cfg = activeConfig.committer;
-      if (!pendingText) return;
-      const now = performance.now();
-      const idleMs = lastAppendTs ? (now - lastAppendTs) : 0;
-      const ageMs = firstPendingTs ? (now - firstPendingTs) : 0;
-      const allowPartial = idleMs >= cfg.max_wait_ms || ageMs >= cfg.allow_partial_after_ms || trigger === 'flush';
-      const picked = bestCommitIndex(pendingText, cfg, allowPartial);
-      if (!picked) return;
-
-      const commitText = pendingText.slice(0, picked.index).trim();
-      let tail = pendingText.slice(picked.index);
-      if (!cfg.carry_incomplete_tail) tail = '';
-
-      if (!commitText) return;
-      pendingText = tail.trimStart();
-      if (!pendingText) firstPendingTs = 0;
-      renderBuffers();
-      committedCounter += 1;
-      lastReason.textContent = JSON.stringify({ trigger, reason: picked.reason, chars: commitText.length }, null, 2);
-      const div = document.createElement('div');
-      div.className = 'chunk';
-      div.innerHTML = `<div class="meta">#${committedCounter} — ${picked.reason} — ${commitText.length} chars</div><div>${escapeHtml(commitText)}</div>`;
-      committedList.prepend(div);
-      log(`commit #${committedCounter} reason=${picked.reason} chars=${commitText.length}`);
-      enqueueTTS(commitText);
-    }
-
-    function appendIncoming(chunk) {
-      const now = performance.now();
-      incomingText += chunk;
-      pendingText += chunk;
-      if (!firstPendingTs) firstPendingTs = now;
-      lastAppendTs = now;
-      renderBuffers();
-      maybeCommit('append');
-    }
-
-    function startTailWatch() {
-      if (tailWatchTimer) clearInterval(tailWatchTimer);
-      tailWatchTimer = setInterval(() => {
-        maybeCommit('timer');
-      }, 120);
-    }
-
-    function stopSimulation() {
-      if (simulateTimer) clearTimeout(simulateTimer);
-      simulateTimer = null;
-      if (tailWatchTimer) clearInterval(tailWatchTimer);
-      tailWatchTimer = null;
-      log('simulation stopped');
-    }
-
-    function scheduleNextChunk() {
-      const text = sourceText.value;
-      if (sourceOffset >= text.length) {
-        stopSimulation();
-        maybeCommit('flush');
-        return;
-      }
-      const size = pickChunkSize();
-      const chunk = text.slice(sourceOffset, sourceOffset + size);
-      sourceOffset += chunk.length;
-      appendIncoming(chunk);
-      simulateTimer = setTimeout(scheduleNextChunk, Math.max(10, Number(fakeIntervalEl.value || 90)));
-    }
-
-    function startSimulation() {
-      if (!sessionId) {
-        setSessionStatus('Сначала открой сессию', true);
-        return;
-      }
-      stopSimulation();
-      resetSimulation();
-      renderBuffers();
-      startTailWatch();
-      log('simulation started');
-      scheduleNextChunk();
-    }
-
-    function escapeHtml(s) {
-      return s.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+    function setLastEvent(obj) {
+      lastEventPane.textContent = JSON.stringify(obj, null, 2);
     }
 
     async function ensureAudio() {
@@ -405,18 +222,23 @@
           const out = event.outputBuffer.getChannelData(0);
           out.fill(0);
           let writePos = 0;
+
           while (writePos < out.length) {
             if (!currentChunk) {
               if (pcmQueue.length === 0) break;
               currentChunk = pcmQueue.shift();
               currentChunkOffset = 0;
             }
+
             const remainingChunk = currentChunk.length - currentChunkOffset;
             const remainingOut = out.length - writePos;
             const n = Math.min(remainingChunk, remainingOut);
+
             out.set(currentChunk.subarray(currentChunkOffset, currentChunkOffset + n), writePos);
+
             currentChunkOffset += n;
             writePos += n;
+
             if (currentChunkOffset >= currentChunk.length) {
               currentChunk = null;
               currentChunkOffset = 0;
@@ -431,7 +253,9 @@
     function base64ToUint8Array(base64) {
       const binary = atob(base64);
       const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
       return bytes;
     }
 
@@ -446,69 +270,246 @@
       return out;
     }
 
-    async function sendCommitToTTS(text) {
-      await ensureAudio();
-      const resp = await fetch(`${BACKEND_BASE}/pcm-stream?session_id=${encodeURIComponent(sessionId)}&text=${encodeURIComponent(text)}`, {
-        method: 'GET',
-        cache: 'no-store',
+    function resetAudioQueue() {
+      pcmQueue = [];
+      currentChunk = null;
+      currentChunkOffset = 0;
+    }
+
+    function randomChunkSize() {
+      const min = Math.max(1, Number(fakeMinEl.value || 1));
+      const max = Math.max(min, Number(fakeMaxEl.value || min));
+      return min + Math.floor(Math.random() * (max - min + 1));
+    }
+
+    async function apiJson(url, method = 'GET', body = null) {
+      const resp = await fetch(url, {
+        method,
+        headers: body ? { 'Content-Type': 'application/json' } : undefined,
+        body: body ? JSON.stringify(body) : undefined
       });
-      if (!resp.ok || !resp.body) {
-        log(`tts request failed status=${resp.status}`);
-        return;
+      const data = await resp.json();
+      if (!resp.ok) {
+        throw new Error(JSON.stringify(data.detail ?? data));
       }
+      return data;
+    }
+
+    async function openSession() {
+      try {
+        const parsed = JSON.parse(configText.value);
+        const payloadText = JSON.stringify(parsed, null, 2);
+        const data = await apiJson(`${BACKEND_BASE}/session/open`, 'POST', { config_text: payloadText });
+        sessionId = data.session_id;
+        activeConfig = data.config;
+        configText.value = JSON.stringify(activeConfig, null, 2);
+        setSessionStatus(`Session opened: ${sessionId}`);
+        sessionMeta.textContent = JSON.stringify({ ttl_sec: data.ttl_sec, config: activeConfig }, null, 2);
+        log(`session opened id=${sessionId}`);
+        await connectSessionStream();
+      } catch (e) {
+        setSessionStatus(`Open failed: ${e.message}`, true);
+      }
+    }
+
+    async function connectSessionStream() {
+      if (!sessionId) return;
+      if (streamAbortController) {
+        try { streamAbortController.abort(); } catch {}
+      }
+      streamAbortController = new AbortController();
+      resetAudioQueue();
+      await ensureAudio();
+
+      const resp = await fetch(`${BACKEND_BASE}/session/${sessionId}/pcm-stream`, {
+        method: 'GET',
+        signal: streamAbortController.signal,
+        cache: 'no-store'
+      });
+
+      if (!resp.ok || !resp.body) {
+        throw new Error(`stream open failed status=${resp.status}`);
+      }
+
+      log(`session audio stream connected`);
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
       let textBuf = '';
-      let reqTag = null;
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        textBuf += decoder.decode(value, { stream: true });
-        while (true) {
-          const idx = textBuf.indexOf('\n');
-          if (idx === -1) break;
-          const line = textBuf.slice(0, idx).trim();
-          textBuf = textBuf.slice(idx + 1);
-          if (!line) continue;
-          let event;
-          try { event = JSON.parse(line); } catch { continue; }
-          if (!reqTag && event.req_id) reqTag = event.req_id;
-          if (event.type === 'meta') {
-            log(`tts meta req=${reqTag} sr=${event.sample_rate}`);
-          } else if (event.type === 'pcm') {
-            const bytes = base64ToUint8Array(event.data);
-            const floatChunk = pcm16ToFloat32(bytes);
-            pcmQueue.push(floatChunk);
-          } else if (event.type === 'error') {
-            log(`tts error req=${reqTag} ${event.message}`);
-          } else if (event.type === 'done') {
-            log(`tts done req=${reqTag}`);
+
+      (async () => {
+        try {
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            textBuf += decoder.decode(value, { stream: true });
+
+            while (true) {
+              const idx = textBuf.indexOf('\n');
+              if (idx === -1) break;
+              const line = textBuf.slice(0, idx).trim();
+              textBuf = textBuf.slice(idx + 1);
+              if (!line) continue;
+
+              let event;
+              try {
+                event = JSON.parse(line);
+              } catch {
+                log('bad ndjson line');
+                continue;
+              }
+
+              setLastEvent(event);
+
+              if (event.type === 'session_start') {
+                log(`session stream started`);
+              } else if (event.type === 'meta') {
+                log(`audio meta sr=${event.sample_rate} ch=${event.channels}`);
+              } else if (event.type === 'commit_start') {
+                log(`tts commit_start #${event.commit_seq}`);
+              } else if (event.type === 'pcm') {
+                const bytes = base64ToUint8Array(event.data);
+                pcmQueue.push(pcm16ToFloat32(bytes));
+              } else if (event.type === 'commit_done') {
+                log(`tts commit_done #${event.commit_seq}`);
+              } else if (event.type === 'session_done') {
+                log(`session_done commits=${event.commit_count}`);
+              } else if (event.type === 'session_aborted') {
+                log(`session_aborted`);
+              } else if (event.type === 'error') {
+                log(`stream error: ${event.message}`);
+              }
+            }
+          }
+          log(`session audio stream finished`);
+        } catch (e) {
+          if (streamAbortController?.signal.aborted) {
+            log(`session audio stream aborted`);
+          } else {
+            log(`session audio stream error: ${e}`);
           }
         }
+      })();
+    }
+
+    async function appendTextChunk(chunk) {
+      const data = await apiJson(`${BACKEND_BASE}/session/${sessionId}/append`, 'POST', { text: chunk });
+      pendingText = data.buffer_text || '';
+      renderState();
+
+      for (const item of (data.committed || [])) {
+        addCommitted(item);
+        log(`committed #${item.seq} reason=${item.reason} len=${item.text.length}`);
       }
     }
 
-    function enqueueTTS(text) {
-      ttsQueue = ttsQueue.then(() => sendCommitToTTS(text)).catch((e) => {
-        log(`tts queue error: ${e}`);
-      });
+    function scheduleNextChunk() {
+      if (!sessionId) return;
+      const fullText = sourceText.value;
+      if (sourceOffset >= fullText.length) {
+        finishInput();
+        return;
+      }
+
+      const size = randomChunkSize();
+      const chunk = fullText.slice(sourceOffset, sourceOffset + size);
+      sourceOffset += size;
+      incomingText += chunk;
+      renderState();
+
+      appendTextChunk(chunk).catch((e) => log(`append error: ${e.message}`));
+
+      const interval = Math.max(10, Number(fakeIntervalEl.value || 90));
+      simulateTimer = setTimeout(scheduleNextChunk, interval);
     }
 
-    openBtn.addEventListener('click', () => openSession().catch((e) => {
-      setSessionStatus(`Open failed: ${e.message}`, true);
-      log(`open error ${e}`);
-    }));
+    function startFakeStream() {
+      if (!sessionId) {
+        setSessionStatus('Сначала открой сессию', true);
+        return;
+      }
+      stopFakeStream();
+      sourceOffset = 0;
+      incomingText = '';
+      pendingText = '';
+      committedList.innerHTML = '';
+      renderState();
+      log('fake stream started');
+      scheduleNextChunk();
+    }
 
-    closeBtn.addEventListener('click', () => closeSession().catch((e) => {
-      setSessionStatus(`Close failed: ${e.message}`, true);
-      log(`close error ${e}`);
-    }));
+    function stopFakeStream() {
+      if (simulateTimer) clearTimeout(simulateTimer);
+      simulateTimer = null;
+    }
 
-    simulateBtn.addEventListener('click', startSimulation);
-    stopSimulateBtn.addEventListener('click', stopSimulation);
-    flushBtn.addEventListener('click', () => maybeCommit('flush'));
+    async function forceFlush() {
+      if (!sessionId) return;
+      try {
+        const data = await apiJson(`${BACKEND_BASE}/session/${sessionId}/flush`, 'POST', { reason: 'manual_flush' });
+        pendingText = data.buffer_text || '';
+        renderState();
+        for (const item of (data.committed || [])) {
+          addCommitted(item);
+          log(`manual commit #${item.seq} reason=${item.reason} len=${item.text.length}`);
+        }
+      } catch (e) {
+        log(`flush error: ${e.message}`);
+      }
+    }
 
-    renderBuffers();
+    async function finishInput() {
+      if (!sessionId) return;
+      stopFakeStream();
+      try {
+        const data = await apiJson(`${BACKEND_BASE}/session/${sessionId}/finish`, 'POST', { reason: 'input_finished' });
+        pendingText = data.buffer_text || '';
+        renderState();
+        for (const item of (data.committed || [])) {
+          addCommitted(item);
+          log(`finish commit #${item.seq} reason=${item.reason} len=${item.text.length}`);
+        }
+        log('input finished');
+      } catch (e) {
+        log(`finish error: ${e.message}`);
+      }
+    }
+
+    async function closeSession() {
+      stopFakeStream();
+      if (streamAbortController) {
+        try { streamAbortController.abort(); } catch {}
+        streamAbortController = null;
+      }
+      resetAudioQueue();
+
+      if (!sessionId) {
+        setSessionStatus('Сессия уже закрыта');
+        return;
+      }
+
+      try {
+        const data = await apiJson(`${BACKEND_BASE}/session/close`, 'POST', { session_id: sessionId });
+        log(`session closed`);
+        setSessionStatus(`Session closed: ${data.closed ? 'ok' : 'not found'}`);
+      } catch (e) {
+        log(`close error: ${e.message}`);
+      } finally {
+        sessionId = null;
+        sessionMeta.textContent = '';
+      }
+    }
+
+    openBtn.addEventListener('click', () => {
+      openSession().catch((e) => {
+        setSessionStatus(`Open failed: ${e.message}`, true);
+      });
+    });
+
+    simulateBtn.addEventListener('click', startFakeStream);
+    stopBtn.addEventListener('click', stopFakeStream);
+    flushBtn.addEventListener('click', forceFlush);
+    finishBtn.addEventListener('click', finishInput);
+    closeBtn.addEventListener('click', closeSession);
   </script>
 </body>
 </html>

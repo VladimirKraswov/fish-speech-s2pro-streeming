@@ -246,18 +246,13 @@ def decode_n_tokens(
 ) -> Iterator[torch.Tensor]:
     """
     Generate tokens autoregressively.
-
-    Non-streaming mode:
-      - yields once with the full tensor (backward compatible)
-
-    Streaming mode:
-      - keeps the very first emitted chunk slightly larger than steady-state chunks,
-        so the browser/player has a safer startup buffer and starts playback earlier
-        without underrun.
     """
-    _ = compile  # kept for API compatibility with generate()
 
-    need_normal_state = stream_chunk_size is not None
+    # ВАЖНО:
+    # normal/inference-tensor workaround нужен только для compile-path,
+    # а не для любого streaming.
+    need_normal_state = bool(stream_chunk_size is not None and compile)
+
     if need_normal_state:
         cur_token = cast(torch.Tensor, _to_normal_tensor(cur_token))
         input_pos = cast(torch.Tensor, _to_normal_tensor(input_pos))
@@ -369,6 +364,7 @@ def decode_n_tokens(
             previous_tokens[:, -1] = next_token.view(
                 model.config.num_codebooks + 1, -1
             )[:, 0].clone()
+
         new_tokens.append(next_token)
 
         if stream_chunk_size is not None:

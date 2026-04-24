@@ -1,6 +1,4 @@
-# fish_speech/inference_engine/__init__.py
 import gc
-import os
 import queue
 import threading
 import time
@@ -18,15 +16,9 @@ from fish_speech.models.text2semantic.inference import (
     GenerateRequest,
     GenerateResponse,
 )
+from fish_speech.runtime_config import load_runtime_config
 from fish_speech.utils import autocast_exclude_mps, set_seed
 from fish_speech.utils.schema import ServeTTSRequest
-
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 class TTSInferenceEngine(ReferenceLoader, VQManager):
@@ -43,15 +35,13 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         self.decoder_model = decoder_model
         self.precision = precision
         self.compile = compile
+        self.runtime = load_runtime_config()
 
-        # Keep the model "hot" between short session commits by default.
-        # You can re-enable aggressive cleanup with env vars if your VRAM budget is tighter.
-        self.cleanup_after_request = _env_flag("FISH_CLEANUP_AFTER_REQUEST", False)
-        self.cleanup_on_abort = _env_flag("FISH_CLEANUP_ON_ABORT", True)
-        self.empty_cache_per_segment = _env_flag("FISH_EMPTY_CACHE_PER_SEGMENT", False)
-        self.cleanup_every_n_requests = max(
-            0, int(os.getenv("FISH_CLEANUP_EVERY_N_REQUESTS", "0") or "0")
-        )
+        model_cfg = self.runtime.model
+        self.cleanup_after_request = model_cfg.cleanup_after_request
+        self.cleanup_on_abort = model_cfg.cleanup_on_abort
+        self.empty_cache_per_segment = model_cfg.empty_cache_per_segment
+        self.cleanup_every_n_requests = model_cfg.cleanup_every_n_requests
         self._success_since_cleanup = 0
         self._cleanup_lock = threading.Lock()
 
@@ -109,13 +99,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         - Decodes the VQ tokens to audio.
         """
 
-        profile = os.getenv("FISH_PROFILE_INFERENCE", "0") in {
-            "1",
-            "true",
-            "TRUE",
-            "yes",
-            "YES",
-        }
+        profile = self.runtime.model.profile_inference
         req_tag = hex(id(req))[-6:]
         t_start = time.perf_counter()
         t_prev = t_start

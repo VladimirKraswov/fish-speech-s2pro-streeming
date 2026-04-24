@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import copy
 import json
 import logging
-import os
 import re
 import struct
 import time
@@ -17,18 +15,26 @@ import httpx
 from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
-UPSTREAM_TTS_URL = os.environ.get("UPSTREAM_TTS_URL", "http://127.0.0.1:8080/v1/tts")
+from fish_speech.runtime_config import (
+    CommitPolicyConfig,
+    ProxyConfig,
+    load_runtime_config,
+    merge_frontend_proxy_override,
+)
+
+_RUNTIME = load_runtime_config()
+UPSTREAM_TTS_URL = _RUNTIME.network.upstream_tts_url
 UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=None)
-DEFAULT_REFERENCE_ID = os.environ.get("DEFAULT_REFERENCE_ID", "voice")
-SESSION_TTL_SEC = int(os.environ.get("SESSION_TTL_SEC", "1800"))
-SESSION_MAX_COUNT = int(os.environ.get("SESSION_MAX_COUNT", "128"))
+DEFAULT_REFERENCE_ID = _RUNTIME.proxy.default_reference_id
+SESSION_TTL_SEC = _RUNTIME.proxy.session_ttl_sec
+SESSION_MAX_COUNT = _RUNTIME.proxy.session_max_count
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("fish-proxy")
 
-app = FastAPI(title="Fish Speech PCM Proxy", version="1.0.0")
+app = FastAPI(title="Fish Speech PCM Proxy", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -41,103 +47,7 @@ SENTENCE_BOUNDARY_RE = re.compile(r'.+?[.!?…](?:["»”)\]]+)?(?:\s+|$)', re.S
 CLAUSE_BOUNDARY_RE = re.compile(r'.+?[,:;—\-](?:\s+|$)', re.S)
 
 
-class CommitterConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    soft_min_chars: int = Field(140, ge=1, le=500)
-    target_chars: int = Field(220, ge=1, le=800)
-    hard_max_chars: int = Field(320, ge=1, le=1200)
-    flush_on_punctuation: bool = True
-    flush_on_clause_punctuation: bool = False
-    flush_on_newline: bool = True
-    max_wait_ms: int = Field(1800, ge=50, le=20_000)
-    allow_partial_after_ms: int = Field(3500, ge=50, le=60_000)
-    carry_incomplete_tail: bool = True
-
-    @model_validator(mode="after")
-    def validate_lengths(self) -> "CommitterConfig":
-        if self.soft_min_chars > self.target_chars:
-            raise ValueError("soft_min_chars must be <= target_chars")
-        if self.target_chars > self.hard_max_chars:
-            raise ValueError("target_chars must be <= hard_max_chars")
-        if self.max_wait_ms > self.allow_partial_after_ms:
-            raise ValueError("max_wait_ms must be <= allow_partial_after_ms")
-        return self
-
-
-class TTSConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    reference_id: str = Field(DEFAULT_REFERENCE_ID, min_length=1, max_length=255)
-    format: str = Field("wav")
-    normalize: bool = True
-    use_memory_cache: str = Field("on")
-    seed: int | None = None
-    max_new_tokens: int = Field(128, ge=1, le=512)
-    chunk_length: int = Field(200, ge=100, le=300)
-    top_p: float = Field(0.8, ge=0.1, le=1.0)
-    repetition_penalty: float = Field(1.1, ge=0.9, le=2.0)
-    temperature: float = Field(0.8, ge=0.1, le=1.0)
-    stream_tokens: bool = True
-    initial_stream_chunk_size: int = Field(18, ge=1, le=200)
-    stream_chunk_size: int = Field(8, ge=1, le=200)
-
-    @field_validator("format")
-    @classmethod
-    def validate_format(cls, value: str) -> str:
-        value = value.lower().strip()
-        if value != "wav":
-            raise ValueError("proxy currently supports only format='wav'")
-        return value
-
-    @field_validator("use_memory_cache")
-    @classmethod
-    def validate_cache(cls, value: str) -> str:
-        value = value.lower().strip()
-        if value not in {"on", "off"}:
-            raise ValueError("use_memory_cache must be 'on' or 'off'")
-        return value
-
-    @model_validator(mode="after")
-    def validate_chunk_sizes(self) -> "TTSConfig":
-        if self.initial_stream_chunk_size < self.stream_chunk_size:
-            raise ValueError("initial_stream_chunk_size must be >= stream_chunk_size")
-        return self
-
-
-class PlaybackConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    target_emit_bytes: int = Field(16384, ge=512, le=32768)
-    start_buffer_ms: int = Field(450, ge=0, le=5000)
-    stop_grace_ms: int = Field(250, ge=0, le=5000)
-
-    @field_validator("target_emit_bytes")
-    @classmethod
-    def validate_even_bytes(cls, value: int) -> int:
-        if value % 2 != 0:
-            raise ValueError("target_emit_bytes must be even for PCM16")
-        return value
-
-
-class SessionRuntimeConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    max_buffer_chars: int = Field(4000, ge=256, le=100_000)
-    auto_close_on_finish: bool = False
-
-
-class SessionConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    version: int = 1
-    committer: CommitterConfig = Field(default_factory=CommitterConfig)
-    tts: TTSConfig = Field(default_factory=TTSConfig)
-    playback: PlaybackConfig = Field(default_factory=PlaybackConfig)
-    session: SessionRuntimeConfig = Field(default_factory=SessionRuntimeConfig)
-
-
-DEFAULT_SESSION_CONFIG = SessionConfig().model_dump(mode="python")
+DEFAULT_SESSION_CONFIG = _RUNTIME.proxy.model_dump(mode="python")
 
 
 class SessionOpenRequest(BaseModel):
@@ -278,16 +188,6 @@ class SessionStore:
 session_store = SessionStore()
 
 
-def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
-    out = copy.deepcopy(base)
-    for key, value in patch.items():
-        if key in out and isinstance(out[key], dict) and isinstance(value, dict):
-            out[key] = _deep_merge(out[key], value)
-        else:
-            out[key] = value
-    return out
-
-
 def _parse_config_text(config_text: str) -> dict[str, Any]:
     try:
         payload = json.loads(config_text)
@@ -298,24 +198,24 @@ def _parse_config_text(config_text: str) -> dict[str, Any]:
     return payload
 
 
-def normalize_config(config_text: str) -> SessionConfig:
+def normalize_config(config_text: str) -> ProxyConfig:
     payload = _parse_config_text(config_text)
-    merged = _deep_merge(DEFAULT_SESSION_CONFIG, payload)
     try:
-        return SessionConfig.model_validate(merged)
-    except ValidationError as exc:
-        raise HTTPException(400, detail=json.loads(exc.json())) from exc
+        return merge_frontend_proxy_override(payload, runtime=load_runtime_config())
+    except Exception as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
 
 
-def build_upstream_payload(text: str, config: SessionConfig) -> dict[str, Any]:
+def build_upstream_payload(text: str, config: ProxyConfig) -> dict[str, Any]:
     tts = config.tts
+    reference_id = tts.reference_id.strip() or config.default_reference_id
     payload = {
         "text": text,
         "streaming": True,
         "stream_tokens": tts.stream_tokens,
         "initial_stream_chunk_size": tts.initial_stream_chunk_size,
         "stream_chunk_size": tts.stream_chunk_size,
-        "reference_id": tts.reference_id.strip(),
+        "reference_id": reference_id,
         "format": tts.format,
         "normalize": tts.normalize,
         "use_memory_cache": tts.use_memory_cache,
@@ -395,7 +295,13 @@ def _pcm_bytes_for_duration_ms(
     return raw
 
 
-def _last_boundary_before(text: str, limit: int, *, include_clause: bool, include_newline: bool) -> tuple[int, str] | None:
+def _last_boundary_before(
+    text: str,
+    limit: int,
+    *,
+    include_clause: bool,
+    include_newline: bool,
+) -> tuple[int, str] | None:
     candidates: list[tuple[int, str]] = []
 
     for match in SENTENCE_BOUNDARY_RE.finditer(text):
@@ -428,8 +334,9 @@ def _last_boundary_before(text: str, limit: int, *, include_clause: bool, includ
 
 def _extract_commits(
     buffer_text: str,
-    cfg: CommitterConfig,
+    cfg: CommitPolicyConfig,
     *,
+    next_commit_seq: int,
     force: bool = False,
 ) -> tuple[list[tuple[str, str]], str]:
     commits: list[tuple[str, str]] = []
@@ -440,6 +347,8 @@ def _extract_commits(
         if text_len == 0:
             break
 
+        stage = cfg.first if (next_commit_seq + len(commits)) == 1 else cfg.next
+
         if force:
             piece = _right_trim_committed(text)
             if piece:
@@ -447,7 +356,7 @@ def _extract_commits(
             text = ""
             break
 
-        if text_len < cfg.soft_min_chars:
+        if text_len < stage.min_chars:
             break
 
         reason = None
@@ -455,34 +364,34 @@ def _extract_commits(
 
         sentence_boundary = _last_boundary_before(
             text,
-            cfg.target_chars,
+            stage.target_chars,
             include_clause=False,
             include_newline=cfg.flush_on_newline,
         )
-        if sentence_boundary and cfg.flush_on_punctuation:
+        if sentence_boundary and cfg.flush_on_sentence_punctuation:
             end, reason = sentence_boundary
 
-        if end is None and text_len >= cfg.target_chars:
+        if end is None and text_len >= stage.target_chars:
             any_boundary = _last_boundary_before(
                 text,
-                cfg.hard_max_chars,
+                stage.max_chars,
                 include_clause=cfg.flush_on_clause_punctuation,
                 include_newline=cfg.flush_on_newline,
             )
             if any_boundary:
                 end, reason = any_boundary
 
-        if end is None and text_len >= cfg.hard_max_chars:
+        if end is None and text_len >= stage.max_chars:
             hard_boundary = _last_boundary_before(
                 text,
-                cfg.hard_max_chars,
+                stage.max_chars,
                 include_clause=cfg.flush_on_clause_punctuation,
                 include_newline=cfg.flush_on_newline,
             )
             if hard_boundary:
                 end, reason = hard_boundary
             else:
-                end, reason = cfg.hard_max_chars, "hard_limit"
+                end, reason = stage.max_chars, "hard_limit"
 
         if end is None:
             break
@@ -593,7 +502,7 @@ async def session_append(session_id: str, req: SessionAppendRequest) -> JSONResp
     if rec is None:
         raise HTTPException(404, detail="session not found")
 
-    config = SessionConfig.model_validate(rec.config)
+    config = ProxyConfig.model_validate(rec.config)
     if len(req.text) + len(rec.buffer_text) > config.session.max_buffer_chars:
         raise HTTPException(400, detail="session buffer limit exceeded")
 
@@ -602,7 +511,12 @@ async def session_append(session_id: str, req: SessionAppendRequest) -> JSONResp
             raise HTTPException(409, detail="session input already finished")
         rec.append_chars += len(req.text)
         rec.buffer_text += req.text
-        commits, remainder = _extract_commits(rec.buffer_text, config.committer, force=False)
+        commits, remainder = _extract_commits(
+            rec.buffer_text,
+            config.commit,
+            next_commit_seq=rec.next_commit_seq,
+            force=False,
+        )
         rec.buffer_text = remainder
         queued = await _queue_commits(rec, commits)
         await _touch_session(rec)
@@ -651,7 +565,7 @@ async def session_finish(session_id: str, req: SessionFinishRequest) -> JSONResp
     if rec is None:
         raise HTTPException(404, detail="session not found")
 
-    config = SessionConfig.model_validate(rec.config)
+    config = ProxyConfig.model_validate(rec.config)
     async with rec.lock:
         if rec.input_closed:
             return JSONResponse(
@@ -700,7 +614,7 @@ async def session_pcm_stream(session_id: str):
     if rec.stream_lock.locked():
         raise HTTPException(409, detail="session audio stream already opened")
 
-    config = SessionConfig.model_validate(rec.config)
+    config = ProxyConfig.model_validate(rec.config)
     target_emit_bytes = config.playback.target_emit_bytes
 
     async def emit(obj: dict[str, Any]) -> bytes:
@@ -921,7 +835,7 @@ async def session_pcm_stream(session_id: str):
 
 @app.get("/pcm-stream")
 async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
-    config = SessionConfig()
+    config = load_runtime_config().proxy
     req_id = uuid.uuid4().hex[:8]
     payload = build_upstream_payload(text=text, config=config)
     target_emit_bytes = config.playback.target_emit_bytes

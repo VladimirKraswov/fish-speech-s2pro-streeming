@@ -22,6 +22,7 @@ from fish_speech.content_sequence import (
     VQPart,
 )
 from fish_speech.conversation import Conversation, Message
+from fish_speech.runtime_config import load_runtime_config
 from fish_speech.tokenizer import IM_END_TOKEN
 
 
@@ -40,30 +41,14 @@ def _to_normal_tensor(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
 def _iter_no_grad(iterator: Iterator[torch.Tensor]) -> Iterator[torch.Tensor]:
     """
     Iterate a lazy generator under torch.no_grad().
-
-    Important: decorating the factory that *creates* a generator is not enough, because the
-    actual work happens later during iteration. Token streaming uses a lazy decode iterator,
-    so we must wrap the iteration itself to keep autograd disabled and avoid retaining graphs
-    and temporary dequantized weights on GPU.
     """
     with torch.no_grad():
         for item in iterator:
             yield item
 
 
-def _env_flag(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _use_sdpa_math() -> bool:
-    """
-    Do not implicitly force math attention just because torch.compile is enabled.
-    Enable it only explicitly via FISH_SDPA_MATH=1 when it is really needed as a fallback.
-    """
-    return _env_flag("FISH_SDPA_MATH", False)
+    return load_runtime_config().model.sdpa_math
 
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -84,17 +69,8 @@ from fish_speech.models.text2semantic.llama import (
 
 
 def _cache_max_seq_len(model: BaseTransformer) -> int:
-    """
-    Max sequence length used for KV cache and buffers. Tuned for streaming (short turns);
-    512 tokens ~= 41 s audio. Set FISH_CACHE_MAX_SEQ_LEN to override (e.g. 4096 for long form).
-    """
-    default = 512
-    raw = os.environ.get("FISH_CACHE_MAX_SEQ_LEN", str(default))
-    try:
-        n = int(raw)
-    except ValueError:
-        n = default
-    return min(max(1, n), model.config.max_seq_len)
+    configured = load_runtime_config().model.cache_max_seq_len
+    return min(max(1, configured), model.config.max_seq_len)
 
 
 def multinomial_sample_one_no_sync(probs_sort):
@@ -103,7 +79,7 @@ def multinomial_sample_one_no_sync(probs_sort):
     return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.int)
 
 
-RAS_WIN_SIZE = 10  # window for Repetition Aware Sampling
+RAS_WIN_SIZE = 10
 RAS_HIGH_TEMP = 1.0
 RAS_HIGH_TOP_P = 0.9
 
@@ -248,9 +224,6 @@ def decode_n_tokens(
     Generate tokens autoregressively.
     """
 
-    # ВАЖНО:
-    # normal/inference-tensor workaround нужен только для compile-path,
-    # а не для любого streaming.
     need_normal_state = bool(stream_chunk_size is not None and compile)
 
     if need_normal_state:
@@ -618,9 +591,6 @@ class GenerateResponse:
 
 
 def split_text_by_speaker(text: str) -> list[str]:
-    """
-    Split text into turns based on <|speaker:X|> tags.
-    """
     pattern = r"(<\|speaker:\d+\|>)"
     parts = re.split(pattern, text)
 
@@ -643,10 +613,6 @@ def split_text_by_speaker(text: str) -> list[str]:
 
 
 def split_text_by_bytes(text: str, max_bytes: int) -> list[str]:
-    """
-    Split text into chunks of at most max_bytes (UTF-8). Used when there are
-    no speaker turns so that chunk_length still controls batch size for streaming.
-    """
     if max_bytes <= 0 or len(text.encode("utf-8")) <= max_bytes:
         return [text] if text.strip() else []
     chunks = []
@@ -667,9 +633,6 @@ def split_text_by_bytes(text: str, max_bytes: int) -> list[str]:
 def group_turns_into_batches(
     turns: list[str], max_speakers: int = 3, max_bytes: int = 300
 ) -> list[str]:
-    """
-    Group turns into batches based on speaker count or byte limit.
-    """
     batches = []
     current_batch = []
     current_bytes = 0
@@ -718,6 +681,7 @@ def generate_long(
     assert 0 < top_p <= 1, "top_p must be in (0, 1]"
     assert 0 < temperature < 2, "temperature must be in (0, 2)"
 
+    runtime = load_runtime_config()
     use_prompt = bool(prompt_text) and bool(prompt_tokens)
     if use_prompt and isinstance(prompt_text, str):
         prompt_text = [prompt_text]
@@ -843,7 +807,7 @@ def generate_long(
             if prompt_len > max_length:
                 raise ValueError(
                     f"Prompt length {prompt_len} exceeds KV cache size {max_length}. "
-                    f"Increase FISH_CACHE_MAX_SEQ_LEN (e.g. 1024 or 2048) or use a shorter reference."
+                    f"Increase cache_max_seq_len in config/runtime.json or use a shorter reference."
                 )
             if prompt_len + max_new_tokens > max_length:
                 max_new_tokens = max_length - prompt_len
@@ -853,18 +817,14 @@ def generate_long(
                     prompt_len,
                     max_length,
                 )
-            cap_env = os.environ.get("FISH_MAX_NEW_TOKENS_CAP", "").strip()
-            if cap_env:
-                try:
-                    cap = int(cap_env)
-                    if cap >= 1 and max_new_tokens > cap:
-                        max_new_tokens = cap
-                        logger.info(
-                            "Capping max_new_tokens to {} (FISH_MAX_NEW_TOKENS_CAP) for VRAM safety",
-                            max_new_tokens,
-                        )
-                except ValueError:
-                    pass
+
+            cap = runtime.model.max_new_tokens_cap
+            if cap >= 1 and max_new_tokens > cap:
+                max_new_tokens = cap
+                logger.info(
+                    "Capping max_new_tokens to {} (runtime.model.max_new_tokens_cap) for VRAM safety",
+                    max_new_tokens,
+                )
 
             encoded = encoded.to(device=device)
             prompt_length = encoded.size(1)
@@ -1006,7 +966,6 @@ class GenerateRequest:
 
 
 def _model_param_memory_gb(module: torch.nn.Module) -> tuple[float, int]:
-    """Return (param_memory_gb, param_count) for a module (weights only)."""
     total = 0
     count = 0
     for p in module.parameters():
@@ -1029,21 +988,14 @@ def launch_thread_safe_queue(
     init_event = threading.Event()
 
     def worker():
-        profile_cadence = os.getenv("FISH_PROFILE_INFERENCE", "0") in {
-            "1",
-            "true",
-            "TRUE",
-            "yes",
-            "YES",
-        }
-        cleanup_after_request = _env_flag("FISH_CLEANUP_AFTER_REQUEST", False)
-        cleanup_every_n_requests = max(
-            0, int(os.getenv("FISH_CLEANUP_EVERY_N_REQUESTS", "0") or "0")
-        )
-        cleanup_on_error = _env_flag("FISH_CLEANUP_ON_ERROR", True)
-        empty_cache_per_stream_chunk = _env_flag(
-            "FISH_EMPTY_CACHE_PER_STREAM_CHUNK", False
-        )
+        runtime = load_runtime_config()
+        model_cfg = runtime.model
+
+        profile_cadence = model_cfg.profile_inference
+        cleanup_after_request = model_cfg.cleanup_after_request
+        cleanup_every_n_requests = model_cfg.cleanup_every_n_requests
+        cleanup_on_error = model_cfg.cleanup_on_error
+        empty_cache_per_stream_chunk = model_cfg.empty_cache_per_stream_chunk
         requests_since_cleanup = 0
 
         model, decode_one_token = init_model(

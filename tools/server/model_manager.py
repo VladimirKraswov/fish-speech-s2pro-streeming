@@ -1,12 +1,10 @@
-# tools/server/model_manager.py
-import os
-
 import torch
 from loguru import logger
 
 from fish_speech.inference_engine import TTSInferenceEngine
 from fish_speech.models.dac.inference import load_model as load_decoder_model
 from fish_speech.models.text2semantic.inference import launch_thread_safe_queue
+from fish_speech.runtime_config import load_runtime_config
 from fish_speech.utils.schema import ServeTTSRequest
 from tools.server.inference import inference_wrapper as inference
 
@@ -27,10 +25,10 @@ class ModelManager:
         self.device = device
         self.half = half
         self.compile = compile
+        self.runtime = load_runtime_config()
 
         self.precision = torch.half if half else torch.bfloat16
 
-        # Check if MPS or CUDA is available
         if torch.backends.mps.is_available():
             self.device = "mps"
             logger.info("mps is available, running on mps.")
@@ -38,9 +36,8 @@ class ModelManager:
             self.device = "cpu"
             logger.info("CUDA is not available, running on CPU.")
 
-        # Shared dict for worker to report LLM param memory (see /v1/debug/memory).
         self._worker_memory_info = {}
-        # Load the TTS models
+
         self.load_llama_model(
             llama_checkpoint_path, self.device, self.precision, self.compile, self.mode
         )
@@ -54,26 +51,21 @@ class ModelManager:
             compile=self.compile,
         )
 
-        # Optional: record CUDA alloc/free history for debugging (dump via GET /v1/debug/memory?dump=1).
-        if torch.cuda.is_available() and os.environ.get(
-            "FISH_RECORD_MEMORY_HISTORY", ""
-        ).strip() in ("1", "true", "True"):
+        if torch.cuda.is_available() and self.runtime.model.record_memory_history:
             try:
-                max_entries = int(
-                    os.environ.get("FISH_MEMORY_HISTORY_MAX_ENTRIES", "100000")
+                torch.cuda.memory._record_memory_history(
+                    max_entries=self.runtime.model.memory_history_max_entries
                 )
-                torch.cuda.memory._record_memory_history(max_entries=max_entries)
                 logger.info(
-                    "CUDA memory history recording enabled (max_entries=%s); use ?dump=1 on /v1/debug/memory to save snapshot",
-                    max_entries,
+                    "CUDA memory history recording enabled (max_entries=%s)",
+                    self.runtime.model.memory_history_max_entries,
                 )
             except Exception as e:
                 logger.warning("Could not enable CUDA memory history recording: %s", e)
 
-        # When --compile: run warmup before accepting requests so /v1/health "ready" = compiled.
-        if self.mode == "tts" and self.compile:
+        if self.mode == "tts" and self.compile and self.runtime.warmup.enabled:
             logger.warning(
-                "torch.compile enabled — running warmup now (Inductor compiles kernels; typically 2–10 min). "
+                "torch.compile enabled — running warmup now. "
                 "Server will accept connections after this."
             )
             self.warm_up(self.tts_inference_engine, compile=True)
@@ -105,59 +97,34 @@ class ModelManager:
         logger.info("Decoder model loaded.")
 
     def warm_up(self, tts_inference_engine, *, compile: bool = False) -> None:
-        # Compilation is per input shape: short prompt (warmup) compiles one graph; first
-        # request with long prompt (e.g. reference) compiles another → second delay.
-        # Use small max_new_tokens on warmup to reduce peak VRAM (fits ~32 GB with compile).
+        warmup = self.runtime.warmup
+        reference_id = (
+            warmup.reference_id
+            or self.runtime.proxy.tts.reference_id
+            or self.runtime.proxy.default_reference_id
+        )
+
         if compile:
-            logger.info(
-                "Warmup: first inference (triggers torch.compile/Inductor; "
-                "compiling kernels — can take 2–10+ min, then requests are fast)."
-            )
+            logger.info("Warmup: first inference (compile path).")
+
         request = ServeTTSRequest(
-            text="Hello world.",
+            text=warmup.text,
             references=[],
-            reference_id=None,
-            max_new_tokens=64,  # was 1024; lower = less VRAM during compile, still triggers graph
-            chunk_length=200,
-            top_p=0.7,
-            repetition_penalty=1.2,
-            temperature=0.7,
+            reference_id=reference_id if reference_id else None,
+            max_new_tokens=warmup.max_new_tokens,
+            chunk_length=warmup.chunk_length,
+            top_p=self.runtime.proxy.tts.top_p,
+            repetition_penalty=self.runtime.proxy.tts.repetition_penalty,
+            temperature=self.runtime.proxy.tts.temperature,
             format="wav",
+            streaming=warmup.streaming,
+            stream_tokens=warmup.stream_tokens,
+            initial_stream_chunk_size=warmup.initial_stream_chunk_size,
+            stream_chunk_size=warmup.stream_chunk_size,
+            use_memory_cache=self.runtime.proxy.tts.use_memory_cache,
+            seed=self.runtime.proxy.tts.seed,
         )
         list(inference(request, tts_inference_engine))
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()  # free cached VRAM so first request with reference fits in 32 GB
-        logger.info("Warmup: first inference done.")
-
-        # Optional: compile the long-prompt + streaming path so first real request is fast.
-        # Set FISH_WARMUP_REFERENCE_ID to a valid reference id (e.g. en) to run one
-        # streaming request with that reference at startup. Use ~50 word text so the
-        # compiled graph covers typical range (Hello world .. 50 words) and avoids
-        # recompile on first user request.
-        warmup_ref = os.environ.get("FISH_WARMUP_REFERENCE_ID", "").strip()
-        if compile and warmup_ref:
-            # Text ~50 words so prompt length is in "typical long" range; one compile covers short..long.
-            warmup_long_text = (
-                "Hello, this is a longer warmup so the compiled graph covers prompts from a few words "
-                "to about fifty. We run this once at startup to avoid recompiling on the first real request."
-            )
-            logger.info(
-                "Warmup: running streaming inference with reference_id=%s (long prompt compile, ~50 words)",
-                warmup_ref,
-            )
-            request_long = ServeTTSRequest(
-                text=warmup_long_text,
-                references=[],
-                reference_id=warmup_ref,
-                max_new_tokens=64,
-                chunk_length=200,
-                top_p=0.7,
-                repetition_penalty=1.2,
-                temperature=0.7,
-                format="wav",
-                streaming=True,
-            )
-            list(inference(request_long, tts_inference_engine))
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            logger.info("Warmup (long prompt + streaming) done.")
+            torch.cuda.empty_cache()
+        logger.info("Warmup done.")

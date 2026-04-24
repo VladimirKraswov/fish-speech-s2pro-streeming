@@ -1,5 +1,4 @@
-# tools/server/api_utils.py
-from argparse import ArgumentParser
+from argparse import ArgumentParser, BooleanOptionalAction
 from http import HTTPStatus
 from typing import Annotated, Any
 
@@ -15,29 +14,48 @@ from loguru import logger
 from pydantic import BaseModel
 
 from fish_speech.inference_engine import TTSInferenceEngine
+from fish_speech.runtime_config import load_runtime_config
 from fish_speech.utils.schema import ServeTTSRequest
 from tools.server.inference import inference_wrapper as inference
 
 
 def parse_args():
+    cfg = load_runtime_config()
+
     parser = ArgumentParser()
     parser.add_argument("--mode", type=str, choices=["tts"], default="tts")
     parser.add_argument(
         "--llama-checkpoint-path",
         type=str,
-        default="checkpoints/fs-1.2-int8-s2-pro-int8",
+        default=cfg.paths.llama_checkpoint_path,
     )
     parser.add_argument(
         "--decoder-checkpoint-path",
         type=str,
-        default="checkpoints/s2-pro/codec.pth",
+        default=cfg.paths.decoder_checkpoint_path,
     )
-    parser.add_argument("--decoder-config-name", type=str, default="modded_dac_vq")
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--half", action="store_true")
-    parser.add_argument("--compile", action="store_true")
+    parser.add_argument(
+        "--decoder-config-name",
+        type=str,
+        default=cfg.paths.decoder_config_name,
+    )
+    parser.add_argument("--device", type=str, default=cfg.model.device)
+    parser.add_argument(
+        "--half",
+        action=BooleanOptionalAction,
+        default=cfg.model.precision == "float16",
+    )
+    parser.add_argument(
+        "--compile",
+        action=BooleanOptionalAction,
+        default=cfg.model.compile,
+    )
     parser.add_argument("--max-text-length", type=int, default=0)
-    parser.add_argument("--listen", type=str, default="127.0.0.1:8080")
+    parser.add_argument(
+        "--listen",
+        type=str,
+        default=f"{cfg.network.server.host}:{cfg.network.server.port}",
+    )
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--api-key", type=str, default=None)
 
@@ -93,18 +111,6 @@ def get_content_type(audio_format):
 
 
 def wants_json(req):
-    """Helper method to determine if the client wants a JSON response
-
-    Parameters
-    ----------
-    req : Request
-        The request object
-
-    Returns
-    -------
-    bool
-        True if the client wants a JSON response, False otherwise
-    """
     q = req.query_params.get("format", "").strip().lower()
     if q in {"json", "application/json", "msgpack", "application/msgpack"}:
         return q == "json"
@@ -113,21 +119,6 @@ def wants_json(req):
 
 
 def format_response(response: BaseModel, status_code=200):
-    """
-    Helper function to format responses consistently based on client preference.
-
-    Parameters
-    ----------
-    response : BaseModel
-        The response object to format
-    status_code : int
-        HTTP status code (default: 200)
-
-    Returns
-    -------
-    Response
-        Formatted response in the client's preferred format
-    """
     try:
         if wants_json(request):
             return JSONResponse(
@@ -144,7 +135,6 @@ def format_response(response: BaseModel, status_code=200):
         )
     except Exception as e:
         logger.error(f"Error formatting response: {e}", exc_info=True)
-        # Fallback to JSON response if formatting fails
         return JSONResponse(
             {"error": "Response formatting failed", "details": str(e)}, status_code=500
         )

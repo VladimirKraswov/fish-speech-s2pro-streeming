@@ -1,7 +1,7 @@
 === CODE BUNDLE ===
 root: /Volumes/Extend/work/fish-speech-s2pro-streeming
 ignore: .codebundleignore
-generated: 2026-04-24T17:31:18.158Z
+generated: 2026-04-24T19:59:40.835Z
 
 
 
@@ -409,7 +409,7 @@ path: /config/session.default.json
     "carry_incomplete_tail": true
   },
   "tts": {
-    "max_new_tokens": 128,
+    "max_new_tokens": 160,
     "chunk_length": 200,
     "stream_tokens": true,
     "initial_stream_chunk_size": 18,
@@ -4709,6 +4709,14 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _use_sdpa_math() -> bool:
+    """
+    Do not implicitly force math attention just because torch.compile is enabled.
+    Enable it only explicitly via FISH_SDPA_MATH=1 when it is really needed as a fallback.
+    """
+    return _env_flag("FISH_SDPA_MATH", False)
+
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
@@ -4889,16 +4897,13 @@ def decode_n_tokens(
 ) -> Iterator[torch.Tensor]:
     """
     Generate tokens autoregressively.
-
-    Non-streaming mode:
-      - yields once with the full tensor (backward compatible)
-
-    Streaming mode:
-      - keeps the very first emitted chunk slightly larger than steady-state chunks,
-        so the browser/player has a safer startup buffer and starts playback earlier
-        without underrun.
     """
-    need_normal_state = stream_chunk_size is not None
+
+    # ВАЖНО:
+    # normal/inference-tensor workaround нужен только для compile-path,
+    # а не для любого streaming.
+    need_normal_state = bool(stream_chunk_size is not None and compile)
+
     if need_normal_state:
         cur_token = cast(torch.Tensor, _to_normal_tensor(cur_token))
         input_pos = cast(torch.Tensor, _to_normal_tensor(input_pos))
@@ -4951,10 +4956,7 @@ def decode_n_tokens(
                 input_pos.shape,
             )
         try:
-            use_math = compile or (
-                os.environ.get("FISH_SDPA_MATH", "").strip()
-                in ("1", "true", "TRUE", "yes", "YES")
-            )
+            use_math = _use_sdpa_math()
             if use_math:
                 with sdpa_kernel(SDPBackend.MATH):
                     next_token = decode_one_token(
@@ -5013,6 +5015,7 @@ def decode_n_tokens(
             previous_tokens[:, -1] = next_token.view(
                 model.config.num_codebooks + 1, -1
             )[:, 0].clone()
+
         new_tokens.append(next_token)
 
         if stream_chunk_size is not None:
@@ -8624,6 +8627,8 @@ if __name__ == "__main__":
 path: /scripts/up_5090.sh
 ----------------------------------------
 #!/usr/bin/env bash
+# === scripts/up_5090.sh ===
+
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -8648,8 +8653,10 @@ LLAMA_CHECKPOINTS_DIR="${LLAMA_CHECKPOINTS_DIR:-${CHECKPOINTS_DIR:-checkpoints/s
 DECODER_CHECKPOINT_PATH="${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}"
 
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-FISH_CACHE_MAX_SEQ_LEN="${FISH_CACHE_MAX_SEQ_LEN:-512}"
-FISH_MAX_NEW_TOKENS_CAP="${FISH_MAX_NEW_TOKENS_CAP:-160}"
+# 512 токенов часто оказывается слишком тесным для длинного reference prompt.
+# Для 5090 безопаснее держать запас по KV cache побольше.
+FISH_CACHE_MAX_SEQ_LEN="${FISH_CACHE_MAX_SEQ_LEN:-768}"
+FISH_MAX_NEW_TOKENS_CAP="${FISH_MAX_NEW_TOKENS_CAP:-128}"
 FISH_CLEANUP_AFTER_REQUEST="${FISH_CLEANUP_AFTER_REQUEST:-0}"
 FISH_CLEANUP_EVERY_N_REQUESTS="${FISH_CLEANUP_EVERY_N_REQUESTS:-0}"
 FISH_CLEANUP_ON_ERROR="${FISH_CLEANUP_ON_ERROR:-1}"
@@ -8657,6 +8664,7 @@ FISH_CLEANUP_ON_ABORT="${FISH_CLEANUP_ON_ABORT:-1}"
 FISH_EMPTY_CACHE_PER_STREAM_CHUNK="${FISH_EMPTY_CACHE_PER_STREAM_CHUNK:-0}"
 FISH_EMPTY_CACHE_PER_SEGMENT="${FISH_EMPTY_CACHE_PER_SEGMENT:-0}"
 DEFAULT_REFERENCE_ID="${DEFAULT_REFERENCE_ID:-voice}"
+FISH_WARMUP_REFERENCE_ID="${FISH_WARMUP_REFERENCE_ID:-$DEFAULT_REFERENCE_ID}"
 SESSION_TTL_SEC="${SESSION_TTL_SEC:-1800}"
 SESSION_MAX_COUNT="${SESSION_MAX_COUNT:-128}"
 
@@ -8681,6 +8689,7 @@ echo "  PROXY_PORT=$PROXY_PORT"
 echo "  LLAMA_CHECKPOINTS_DIR=$LLAMA_CHECKPOINTS_DIR"
 echo "  DECODER_CHECKPOINT_PATH=$DECODER_CHECKPOINT_PATH"
 echo "  DEFAULT_REFERENCE_ID=$DEFAULT_REFERENCE_ID"
+echo "  FISH_WARMUP_REFERENCE_ID=$FISH_WARMUP_REFERENCE_ID"
 echo "  SESSION_TTL_SEC=$SESSION_TTL_SEC"
 echo
 
@@ -8732,6 +8741,7 @@ CID="$({
     -e FISH_CLEANUP_ON_ABORT="$FISH_CLEANUP_ON_ABORT" \
     -e FISH_EMPTY_CACHE_PER_STREAM_CHUNK="$FISH_EMPTY_CACHE_PER_STREAM_CHUNK" \
     -e FISH_EMPTY_CACHE_PER_SEGMENT="$FISH_EMPTY_CACHE_PER_SEGMENT" \
+    -e FISH_WARMUP_REFERENCE_ID="$FISH_WARMUP_REFERENCE_ID" \
     -e PYTHONPATH=/workspace \
     -v "$REPO_ROOT":/workspace \
     -w /workspace \
@@ -8743,7 +8753,7 @@ CID="$({
     --llama-checkpoint-path "/workspace/$LLAMA_CHECKPOINTS_DIR" \
     --decoder-checkpoint-path "/workspace/$DECODER_CHECKPOINT_PATH" \
     "${COMPILE_ARG[@]}"
-} )"
+})"
 
 echo "Container started: $CID"
 echo
@@ -8781,7 +8791,7 @@ echo "Model is healthy after $(( $(date +%s) - START_TS ))s"
 if [[ "$EXTRA_WARMUP" == "1" ]]; then
   echo "Sending one extra warmup streaming request..."
   BASE_URL="http://127.0.0.1:${PORT}" \
-  WARMUP_REFERENCE_ID="$DEFAULT_REFERENCE_ID" \
+  WARMUP_REFERENCE_ID="$FISH_WARMUP_REFERENCE_ID" \
   bash "$REPO_ROOT/scripts/warmup_5090.sh"
 fi
 
@@ -12242,11 +12252,13 @@ def inference_wrapper(req: ServeTTSRequest, engine: TTSInferenceEngine):
                     yield (result.audio[1] * AMPLITUDE).astype(np.int16).tobytes()
 
             case "final":
-                # В streaming-режиме final уже содержит весь звук целиком,
-                # а segment уже были отправлены ранее.
-                # Если отдать final ещё раз, пользователь услышит дубль.
+                # В streaming-режиме final содержит полную собранную дорожку.
+                # Сегменты уже были отправлены ранее, поэтому финал нельзя
+                # отдавать повторно. Но и завершать генератор здесь тоже нельзя:
+                # иначе engine.inference() не успевает выставить finished_normally,
+                # и finally-ветка ошибочно запускает cleanup_on_abort.
                 if req.streaming:
-                    return None
+                    continue
 
                 count += 1
                 if isinstance(result.audio, tuple):
@@ -13890,4 +13902,4 @@ included: 60
 skipped(binary): 3
 skipped(size): 0
 skipped(ext): 0
-totalBytes(approx): 460320
+totalBytes(approx): 461049

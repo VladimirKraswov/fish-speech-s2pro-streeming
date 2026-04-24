@@ -1,7 +1,7 @@
 === CODE BUNDLE ===
 root: /Volumes/Extend/work/fish-speech-s2pro-streeming
 ignore: .codebundleignore
-generated: 2026-04-24T16:43:19.633Z
+generated: 2026-04-24T17:31:18.158Z
 
 
 
@@ -295,11 +295,7 @@ short.wav
 codebundle.txt
 bundle-code.js
 node_modules/
-
-
-path: /.project-root
-----------------------------------------
-
+results/
 
 
 path: /.vscode/c_cpp_properties.json
@@ -337,400 +333,6 @@ path: /.vscode/c_cpp_properties.json
   ],
   "version": 4
 }
-
-
-path: /clear.py
-----------------------------------------
-# clear.py
-#!/usr/bin/env python3
-"""
-Скрипт для вычистки проекта Fish Speech до минимальной версии,
-необходимой для работы streaming API и прокси (скрипты up_5090.sh, run_proxy.sh).
-
-Все удаляемые файлы и папки перемещаются в папку `temp` в корне проекта.
-Для каждого перемещаемого текстового файла в начало добавляется комментарий
-с его исходным полным путём от корня проекта перед перемещением.
-Файлы, которые нужно отредактировать (pyproject.toml, __init__.py и др.),
-копируются в `temp` (с добавлением пути), а затем заменяются минимальным содержимым.
-Для всех оставшихся текстовых файлов (не удаляемых и не редактируемых)
-также добавляется комментарий с путём (на месте).
-"""
-
-import os
-import shutil
-import sys
-from pathlib import Path
-from typing import List, Tuple, Set
-
-
-# ----------------------------------------------------------------------
-# Конфигурация
-# ----------------------------------------------------------------------
-# Список относительных путей (файлов и директорий), которые нужно ПОЛНОСТЬЮ УДАЛИТЬ (переместить в temp)
-DELETE_PATHS: List[str] = [
-    # Директории
-    "fish_speech/callbacks",
-    "fish_speech/datasets",
-    "fish_speech/text",
-    "fish_speech/configs/lora",
-    "docs",
-    "tests",
-    "tools/llama",
-    "tools/vqgan",
-    "tools/webui",
-    ".vscode",
-    ".github",
-    "__pycache__",       # удалить все __pycache__
-    # Файлы
-    "fish_speech/scheduler.py",
-    "fish_speech/train.py",
-    "fish_speech/utils/braceexpand.py",
-    "fish_speech/utils/rich_utils.py",
-    "fish_speech/utils/logging_utils.py",
-    "fish_speech/utils/instantiators.py",
-    "fish_speech/utils/spectrogram.py",
-    "fish_speech/configs/base.yaml",
-    "fish_speech/configs/text2semantic_finetune.yaml",
-    "inference.ipynb",
-    "mkdocs.yml",
-    ".readthedocs.yaml",
-    ".pre-commit-config.yaml",
-    "tools/run_webui.py",
-    "entrypoint.sh",
-    "dockerfile.dev",
-    "Makefile",
-    ".env",
-    ".project-root",
-    "pyrightconfig.json",
-    "scripts/e2e_smoke.sh",
-    "scripts/e2e_memory.sh",
-    "scripts/preencode.sh",
-    "scripts/upload_references.sh",
-    "scripts/ttfa_smoke.py",
-    "fish_speech/i18n.py",   # если не нужен webui
-]
-
-# Список файлов, которые нужно ОТРЕДАКТИРОВАТЬ (заменить содержимым из констант)
-EDIT_PATHS: List[str] = [
-    "pyproject.toml",
-    "fish_speech/utils/__init__.py",
-    "fish_speech/__init__.py",
-]
-
-# Минимальное содержимое для редактируемых файлов
-NEW_CONTENTS = {
-    "pyproject.toml": '''[project]
-name = "fish-speech"
-version = "2.0.0"
-description = "Fish Speech (streaming-only)"
-requires-python = ">=3.10"
-dependencies = [
-    "numpy",
-    "torch==2.8.0",
-    "torchaudio==2.8.0",
-    "transformers<=4.57.3",
-    "hydra-core>=1.3.2",
-    "omegaconf>=2.3.0",
-    "einops>=0.7.0",
-    "loguru>=0.6.0",
-    "pydantic==2.9.2",
-    "ormsgpack",
-    "uvicorn>=0.30.0",
-    "kui>=1.6.0",
-    "cachetools",
-    "safetensors",
-    "tiktoken>=0.8.0",
-    "click>=8.0.0",
-    "pyrootutils>=1.0.4",
-    "natsort>=8.4.0",
-    "soundfile>=0.12.0",
-    "fastapi",
-    "httpx",
-]
-
-[project.optional-dependencies]
-cpu = ["torch==2.8.0", "torchaudio"]
-cu126 = ["torch==2.8.0", "torchaudio"]
-cu128 = ["torch==2.8.0", "torchaudio"]
-cu129 = ["torch==2.8.0", "torchaudio"]
-
-[tool.uv]
-conflicts = [
-  [
-    { extra = "cpu" },
-    { extra = "cu126" },
-    { extra = "cu128" },
-    { extra = "cu129" },
-  ],
-]
-
-[tool.uv.sources]
-torch = [
-  { index = "pytorch-cpu", extra = "cpu" },
-  { index = "pytorch-cu126", extra = "cu126" },
-  { index = "pytorch-cu128", extra = "cu128" },
-  { index = "pytorch-cu129", extra = "cu129" },
-]
-torchaudio = [
-  { index = "pytorch-cpu", extra = "cpu" },
-  { index = "pytorch-cu126", extra = "cu126" },
-  { index = "pytorch-cu128", extra = "cu128" },
-  { index = "pytorch-cu129", extra = "cu129" },
-]
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cu129"
-url = "https://download.pytorch.org/whl/cu129"
-explicit = true
-
-[build-system]
-requires = ["setuptools", "setuptools-scm"]
-build-backend = "setuptools.build_meta"
-
-[tool.setuptools]
-packages = ["fish_speech", "tools"]
-''',
-
-    "fish_speech/utils/__init__.py": '''from .context import autocast_exclude_mps
-from .file import get_latest_checkpoint
-from .logger import RankedLogger
-from .utils import extras, get_metric_value, set_seed, task_wrapper
-
-__all__ = [
-    "extras",
-    "get_metric_value",
-    "RankedLogger",
-    "task_wrapper",
-    "get_latest_checkpoint",
-    "autocast_exclude_mps",
-    "set_seed",
-]
-''',
-
-    "fish_speech/__init__.py": "# Minimal __init__ for streaming\n",
-}
-
-# Расширения текстовых файлов, в которые можно безопасно добавить комментарий
-TEXT_EXTENSIONS = {
-    ".py", ".yaml", ".yml", ".sh", ".md", ".txt", ".toml",
-    ".gitignore", ".dockerignore", ".env", "Dockerfile", "compose.yml", "compose.base.yml"
-}
-# Дополнительные имена файлов без расширения (например, Dockerfile)
-SPECIFIC_FILES = {"Dockerfile", "compose.yml", "compose.base.yml", ".gitignore", ".dockerignore", ".env"}
-
-
-# ----------------------------------------------------------------------
-# Вспомогательные функции
-# ----------------------------------------------------------------------
-def is_text_file(file_path: Path) -> bool:
-    """Определяет, является ли файл текстовым (по расширению или имени)."""
-    if file_path.name in SPECIFIC_FILES:
-        return True
-    if file_path.suffix in TEXT_EXTENSIONS:
-        return True
-    return False
-
-
-def add_path_comment(file_path: Path, root_dir: Path) -> None:
-    """Добавляет комментарий с относительным путём в начало текстового файла."""
-    if not is_text_file(file_path):
-        return
-
-    rel_path = file_path.relative_to(root_dir)
-    comment_line = f"# {rel_path}\n"
-
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            first_line = f.readline()
-    except (UnicodeDecodeError, OSError):
-        # Не текстовый или не читается – пропускаем
-        return
-
-    # Если уже есть такой комментарий в первой строке – пропускаем (чтобы не дублировать)
-    if first_line.rstrip("\n") == comment_line.rstrip("\n"):
-        return
-
-    # Читаем всё содержимое
-    with open(file_path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    # Записываем комментарий + оригинальное содержимое
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(comment_line)
-        f.write(content)
-
-
-def move_to_temp_with_path_comment(src_rel: str, root_dir: Path, temp_dir: Path) -> None:
-    """
-    Перемещает файл или директорию в temp_dir, сохраняя относительную структуру.
-    Для текстовых файлов перед перемещением добавляет комментарий с исходным путём.
-    """
-    src_path = root_dir / src_rel
-    if not src_path.exists():
-        print(f"⚠️  Пропуск: {src_rel} не существует")
-        return
-
-    dst_path = temp_dir / src_rel
-    dst_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Если это файл и текстовый – добавить комментарий перед перемещением
-    if src_path.is_file() and is_text_file(src_path):
-        # Временно копируем, добавляем комментарий, затем перемещаем?
-        # Проще: прочитать оригинал, создать новый файл в temp с комментарием, затем удалить оригинал.
-        # Но по условию нужно переместить с подписью. Сделаем:
-        # 1. Прочитаем оригинал
-        with open(src_path, "r", encoding="utf-8") as f:
-            content = f.read()
-        # 2. Сформируем новый контент с комментарием
-        rel_path = src_path.relative_to(root_dir)
-        comment_line = f"# {rel_path}\n"
-        new_content = comment_line + content
-        # 3. Запишем в целевой файл (уже внутри temp)
-        with open(dst_path, "w", encoding="utf-8") as f:
-            f.write(new_content)
-        # 4. Удалим оригинал
-        src_path.unlink()
-        print(f"🗑️  Перемещён с подписью: {src_rel} -> {dst_path}")
-    else:
-        # Для бинарных или директорий – просто перемещаем
-        shutil.move(str(src_path), str(dst_path))
-        print(f"🗑️  Перемещён: {src_rel}")
-
-
-def remove_empty_dirs(root_dir: Path) -> None:
-    """Рекурсивно удаляет пустые директории."""
-    for dirpath, dirnames, filenames in os.walk(root_dir, topdown=False):
-        try:
-            if not dirnames and not filenames:
-                os.rmdir(dirpath)
-                print(f"🧹 Удалена пустая папка: {Path(dirpath).relative_to(root_dir)}")
-        except OSError:
-            pass
-
-
-# ----------------------------------------------------------------------
-# Основная функция
-# ----------------------------------------------------------------------
-def main():
-    # Определяем корень проекта (скрипт должен лежать в корне, либо передан аргумент)
-    if len(sys.argv) > 1:
-        root_dir = Path(sys.argv[1]).resolve()
-    else:
-        root_dir = Path(__file__).parent.resolve()
-
-    if not (root_dir / "fish_speech").exists():
-        print(f"❌ Ошибка: {root_dir} не похож на корень проекта Fish Speech (нет папки fish_speech)")
-        sys.exit(1)
-
-    print(f"📁 Корень проекта: {root_dir}")
-
-    # Создаём папку temp в корне
-    temp_dir = root_dir / "temp"
-    if temp_dir.exists():
-        print(f"⚠️  Папка {temp_dir} уже существует. Очищаем её...")
-        shutil.rmtree(temp_dir)
-    temp_dir.mkdir(parents=True)
-    print(f"📦 Создана временная папка: {temp_dir}")
-
-    # 1. Перемещаем все удаляемые пути в temp (с добавлением подписи)
-    print("\n--- 1. Перемещение ненужных файлов и папок в temp ---")
-    for rel_path in DELETE_PATHS:
-        # Если путь оканчивается на __pycache__, обработаем все такие папки рекурсивно
-        if rel_path == "__pycache__":
-            for pycache in root_dir.rglob("__pycache__"):
-                rel = pycache.relative_to(root_dir)
-                move_to_temp_with_path_comment(str(rel), root_dir, temp_dir)
-            continue
-        move_to_temp_with_path_comment(rel_path, root_dir, temp_dir)
-
-    # 2. Редактируем выбранные файлы (с сохранением копии в temp с подписью)
-    print("\n--- 2. Редактирование файлов ---")
-    for rel_path in EDIT_PATHS:
-        src_path = root_dir / rel_path
-        if not src_path.exists():
-            print(f"⚠️  Файл {rel_path} не существует, пропуск")
-            continue
-
-        # Создаём копию в temp с добавлением комментария (как при перемещении)
-        dst_backup = temp_dir / rel_path
-        dst_backup.parent.mkdir(parents=True, exist_ok=True)
-
-        # Копируем оригинал в temp (добавляем комментарий)
-        with open(src_path, "r", encoding="utf-8") as f:
-            original_content = f.read()
-        rel_for_comment = Path(rel_path)
-        comment_line = f"# {rel_for_comment}\n"
-        backup_content = comment_line + original_content
-        with open(dst_backup, "w", encoding="utf-8") as f:
-            f.write(backup_content)
-        print(f"📑 Копия с подписью сохранена: {rel_path} -> {dst_backup}")
-
-        # Заменяем содержимое оригинала минимальным содержимым
-        new_content = NEW_CONTENTS.get(rel_path)
-        if new_content is None:
-            print(f"⚠️  Не найдено новое содержимое для {rel_path}, пропуск")
-            continue
-
-        with open(src_path, "w", encoding="utf-8") as f:
-            f.write(new_content)
-        print(f"✏️  Обновлён: {rel_path}")
-
-    # 2b. Удаляем пустые папки, которые могли образоваться после перемещения
-    print("\n--- 2b. Очистка пустых директорий ---")
-    remove_empty_dirs(root_dir)
-
-    # 3. Добавляем комментарий-путь во все оставшиеся текстовые файлы (которые не были перемещены и не редактировались)
-    print("\n--- 3. Добавление комментария с путём в оставшиеся файлы ---")
-    # Получаем множество путей, которые были обработаны (удалены или отредактированы)
-    processed = set(DELETE_PATHS) | set(EDIT_PATHS)
-    # Также добавим все сработавшие __pycache__ директории (их не нужно комментировать на месте, т.к. они удалены)
-    # Просто обойдём все файлы в корне, кроме temp
-    for file_path in root_dir.rglob("*"):
-        if file_path.is_dir():
-            continue
-        # Пропускаем файлы внутри temp
-        if temp_dir in file_path.parents:
-            continue
-        # Пропускаем .git
-        if ".git" in str(file_path):
-            continue
-        # Получаем относительный путь
-        try:
-            rel = file_path.relative_to(root_dir)
-        except ValueError:
-            continue
-        # Если файл в списке удаляемых или редактируемых – он уже обработан (удалён или обновлён)
-        # Но для отредактированных файлов мы уже заменили содержимое, и новое содержимое не содержит комментарий.
-        # Поэтому нужно добавить комментарий и для них (после замены).
-        if str(rel) in processed:
-            continue
-        # Для всех остальных – добавить комментарий
-        add_path_comment(file_path, root_dir)
-        print(f"📝 Добавлен путь: {rel}")
-
-    print("\n✅ Готово!")
-    print(f"   Все удалённые/заменённые файлы находятся в: {temp_dir}")
-    print("   Проект теперь содержит только минимальный набор для streaming.")
-    print("   *Внимание:* перед повторным запуском скрипта удалите папку temp или скрипт пересоздаст её заново.")
-
-
-if __name__ == "__main__":
-    main()
 
 
 path: /compose.base.yml
@@ -5047,7 +4649,6 @@ path: /fish_speech/models/text2semantic/__init__.py
 
 path: /fish_speech/models/text2semantic/inference.py
 ----------------------------------------
-# fish_speech/models/text2semantic/inference.py
 import gc
 import os
 import queue
@@ -5085,6 +4686,20 @@ def _to_normal_tensor(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         return None
     with torch.inference_mode(False):
         return t.detach().cpu().clone().to(t.device)
+
+
+def _iter_no_grad(iterator: Iterator[torch.Tensor]) -> Iterator[torch.Tensor]:
+    """
+    Iterate a lazy generator under torch.no_grad().
+
+    Important: decorating the factory that *creates* a generator is not enough, because the
+    actual work happens later during iteration. Token streaming uses a lazy decode iterator,
+    so we must wrap the iteration itself to keep autograd disabled and avoid retaining graphs
+    and temporary dequantized weights on GPU.
+    """
+    with torch.no_grad():
+        for item in iterator:
+            yield item
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -5559,7 +5174,7 @@ def generate(
         del first_token, x, prompt, empty, input_pos
         return seq
 
-    return decode_iter
+    return _iter_no_grad(decode_iter)
 
 
 def init_model(checkpoint_path, device, precision, compile=False):
@@ -8458,104 +8073,6 @@ path: /input_ref/voice.lab
 В очередной раз захожу в кабинет ректора, готовая уже отчислиться из аспирантуры. Мнусь у двери, а Андрей Викторович что-то пишет в своём блокноте, не обращая на меня внимания.
 
 
-path: /LICENSE
-----------------------------------------
-# FISH AUDIO RESEARCH LICENSE AGREEMENT
-
-**Last Updated: March 7, 2026**
-
-## I. INTRODUCTION
-
-This Agreement applies to any individual person or entity ("You", "Your" or "Licensee") that uses or distributes any portion or element of the Fish Audio Materials or Derivative Works thereof for any Research, Non-Commercial, or Commercial purpose. Capitalized terms not otherwise defined herein are defined in Section V below.
-
-This Agreement is intended to allow research and non-commercial uses of the Materials free of charge. Any Commercial use of the Materials requires a separate license from Fish Audio.
-
-By clicking "I Accept" or by using, distributing, or accessing any portion or element of the Fish Audio Materials or Derivative Works, You agree that You have read, understood and are bound by the terms of this Agreement. If You are acting on behalf of a company, organization or other entity, then "You" includes you and that entity, and You agree that You: (i) are an authorized representative of such entity with the authority to bind such entity to this Agreement, and (ii) You agree to the terms of this Agreement on that entity's behalf.
-
-## II. RESEARCH & NON-COMMERCIAL USE LICENSE
-
-Subject to the terms of this Agreement, Fish Audio grants You a non-exclusive, worldwide, non-transferable, non-sublicensable, revocable and royalty-free limited license under Fish Audio's intellectual property or other rights owned by Fish Audio embodied in the Fish Audio Materials to use, reproduce, distribute, and create Derivative Works of, and make modifications to, the Fish Audio Materials for any Research or Non-Commercial Purpose.
-
-"Research Purpose" means academic or scientific advancement, and in each case, is not primarily intended for commercial advantage or monetary compensation to You or others.
-
-"Non-Commercial Purpose" means any purpose other than a Research Purpose that is not primarily intended for commercial advantage or monetary compensation to You or others, such as personal use (i.e., hobbyist) or evaluation and testing.
-
-## III. COMMERCIAL USE
-
-**Any use of the Fish Audio Materials or Derivative Works for a Commercial Purpose requires a separate written license agreement from Fish Audio.** No commercial rights are granted under this Agreement.
-
-"Commercial Purpose" means any purpose other than a Research Purpose or Non-Commercial Purpose that is primarily intended for or directed toward commercial advantage or monetary compensation to You or others, including but not limited to: (i) creating, modifying, or distributing Your product or service, including via a hosted service or application programming interface, (ii) Your business's or organization's internal operations, and (iii) any use in connection with a product or service for which You charge a fee or generate revenue, whether directly or indirectly.
-
-To obtain a commercial license, please contact Fish Audio at:
-
-- **Website:** [https://fish.audio](https://fish.audio)
-- **Email:** business@fish.audio
-
-## IV. GENERAL TERMS
-
-Your Research and Non-Commercial License under this Agreement is subject to the following terms.
-
-### a. Distribution & Attribution
-
-If You distribute or make available the Fish Audio Materials or a Derivative Work to a third party, or a product or service that uses any portion of them, You shall: (i) provide a copy of this Agreement to that third party, (ii) retain the following attribution notice within a "Notice" text file distributed as a part of such copies: "This model is licensed under the Fish Audio Research License, Copyright © 39 AI, INC. All Rights Reserved.", and (iii) prominently display "Built with Fish Audio" on a related website, user interface, blogpost, about page, or product documentation.
-
-If You create a Derivative Work, You may add your own attribution notice(s) to the "Notice" text file included with that Derivative Work, provided that You clearly indicate which attributions apply to the Fish Audio Materials and state in the "Notice" text file that You changed the Fish Audio Materials and how it was modified.
-
-### b. Use Restrictions
-
-Your use of the Fish Audio Materials and Derivative Works, including any output or results of the Fish Audio Materials or Derivative Works, must comply with applicable laws and regulations (including Trade Control Laws and equivalent regulations) and adhere to Fish Audio's Acceptable Use Policy, which is hereby incorporated by reference.
-
-Furthermore, You will not use the Fish Audio Materials or Derivative Works, or any output or results of the Fish Audio Materials or Derivative Works, to create or improve any foundational generative AI model (excluding the Models or Derivative Works).
-
-### c. Intellectual Property
-
-**(i) Trademark License.** No trademark licenses are granted under this Agreement, and in connection with the Fish Audio Materials or Derivative Works, You may not use any name or mark owned by or associated with Fish Audio or any of its Affiliates, except as required under Section IV(a) herein.
-
-**(ii) Ownership of Derivative Works.** As between You and Fish Audio, You are the owner of Derivative Works You create, subject to Fish Audio's ownership of the Fish Audio Materials and any Derivative Works made by or for Fish Audio.
-
-**(iii) Ownership of Outputs.** As between You and Fish Audio, You own any outputs generated from the Models or Derivative Works to the extent permitted by applicable law.
-
-**(iv) Disputes.** If You or Your Affiliate(s) institute litigation or other proceedings against Fish Audio (including a cross-claim or counterclaim in a lawsuit) alleging that the Fish Audio Materials, Derivative Works or associated outputs or results, or any portion of any of the foregoing, constitutes infringement of intellectual property or other rights owned or licensable by You, then any licenses granted to You under this Agreement shall terminate as of the date such litigation or claim is filed or instituted. You will indemnify and hold harmless Fish Audio from and against any claim by any third party arising out of or related to Your use or distribution of the Fish Audio Materials or Derivative Works in violation of this Agreement.
-
-**(v) Feedback.** From time to time, You may provide Fish Audio with verbal and/or written suggestions, comments or other feedback related to Fish Audio's existing or prospective technology, products or services (collectively, "Feedback"). You are not obligated to provide Fish Audio with Feedback, but to the extent that You do, You hereby grant Fish Audio a perpetual, irrevocable, royalty-free, fully-paid, sub-licensable, transferable, non-exclusive, worldwide right and license to exploit the Feedback in any manner without restriction. Your Feedback is provided "AS IS" and You make no warranties whatsoever about any Feedback.
-
-### d. Disclaimer of Warranty
-
-UNLESS REQUIRED BY APPLICABLE LAW, THE FISH AUDIO MATERIALS AND ANY OUTPUT AND RESULTS THEREFROM ARE PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING, WITHOUT LIMITATION, ANY WARRANTIES OF TITLE, NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE. YOU ARE SOLELY RESPONSIBLE FOR DETERMINING THE APPROPRIATENESS OR LAWFULNESS OF USING OR REDISTRIBUTING THE FISH AUDIO MATERIALS, DERIVATIVE WORKS OR ANY OUTPUT OR RESULTS AND ASSUME ANY RISKS ASSOCIATED WITH YOUR USE OF THE FISH AUDIO MATERIALS, DERIVATIVE WORKS AND ANY OUTPUT AND RESULTS.
-
-### e. Limitation of Liability
-
-IN NO EVENT WILL FISH AUDIO OR ITS AFFILIATES BE LIABLE UNDER ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, TORT, NEGLIGENCE, PRODUCTS LIABILITY, OR OTHERWISE, ARISING OUT OF THIS AGREEMENT, FOR ANY LOST PROFITS OR ANY DIRECT, INDIRECT, SPECIAL, CONSEQUENTIAL, INCIDENTAL, EXEMPLARY OR PUNITIVE DAMAGES, EVEN IF FISH AUDIO OR ITS AFFILIATES HAVE BEEN ADVISED OF THE POSSIBILITY OF ANY OF THE FOREGOING.
-
-### f. Term and Termination
-
-The term of this Agreement will commence upon Your acceptance of this Agreement or access to the Fish Audio Materials and will continue in full force and effect until terminated in accordance with the terms and conditions herein. Fish Audio may terminate this Agreement if You are in breach of any term or condition of this Agreement. Upon termination of this Agreement, You shall delete and cease use of any Fish Audio Materials or Derivative Works. Sections IV(d), (e), and (g) shall survive the termination of this Agreement.
-
-### g. Governing Law
-
-This Agreement will be governed by and construed in accordance with the laws of the United States and the State of California without regard to choice of law principles, and the UN Convention on Contracts for International Sale of Goods does not apply to this Agreement.
-
-## V. DEFINITIONS
-
-**"Affiliate(s)"** means any entity that directly or indirectly controls, is controlled by, or is under common control with the subject entity; for purposes of this definition, "control" means direct or indirect ownership or control of more than 50% of the voting interests of the subject entity.
-
-**"Agreement"** means this Fish Audio Research License Agreement.
-
-**"Derivative Work(s)"** means (a) any derivative work of the Fish Audio Materials as recognized by U.S. copyright laws and (b) any modifications to a Model, and any other model created which is based on or derived from the Model or the Model's output, including "fine tune" and "low-rank adaptation" models derived from a Model or a Model's output, but do not include the output of any Model.
-
-**"Documentation"** means any specifications, manuals, documentation, and other written information provided by Fish Audio related to the Software or Models.
-
-**"Fish Audio"** or **"we"** means 39 AI, INC. and its Affiliates.
-
-**"Model(s)"** means, collectively, Fish Audio's proprietary models and algorithms, including machine-learning models, trained model weights and other elements of the foregoing.
-
-**"Software"** means Fish Audio's proprietary software made available under this Agreement now or in the future.
-
-**"Fish Audio Materials"** means, collectively, Fish Audio's proprietary Models, Software and Documentation (and any portion or combination thereof) made available under this Agreement.
-
-**"Trade Control Laws"** means any applicable U.S. and non-U.S. export control and trade sanctions laws and regulations.
-
-
 path: /pyproject.toml
 ----------------------------------------
 [project]
@@ -10002,8 +9519,43 @@ class WeightOnlyInt8Linear(torch.nn.Module):
         )
         self.register_buffer("scales", torch.ones(out_features, dtype=torch.bfloat16))
 
+        # Runtime caches for dequantized weights/scales.
+        # Without this, every forward does weight.to(dtype=input.dtype), which creates a
+        # fresh bf16/fp16 copy. In token streaming that can amplify peak VRAM badly.
+        self._runtime_weight: torch.Tensor | None = None
+        self._runtime_scales: torch.Tensor | None = None
+        self._runtime_key: tuple[torch.device, torch.dtype] | None = None
+
+    def _clear_runtime_cache(self) -> None:
+        self._runtime_weight = None
+        self._runtime_scales = None
+        self._runtime_key = None
+
+    def _apply(self, fn):
+        self._clear_runtime_cache()
+        return super()._apply(fn)
+
+    def _get_runtime_tensors(
+        self, input: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (input.device, input.dtype)
+        if (
+            self._runtime_weight is None
+            or self._runtime_scales is None
+            or self._runtime_key != key
+        ):
+            self._runtime_weight = self.weight.to(
+                device=input.device, dtype=input.dtype
+            ).detach()
+            self._runtime_scales = self.scales.to(
+                device=input.device, dtype=input.dtype
+            ).detach()
+            self._runtime_key = key
+        return self._runtime_weight, self._runtime_scales
+
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return F.linear(input, self.weight.to(dtype=input.dtype)) * self.scales
+        weight, scales = self._get_runtime_tensors(input)
+        return F.linear(input, weight) * scales
 
 
 ##### weight only int4 per channel groupwise quantized code ######
@@ -14334,8 +13886,8 @@ async def update_reference(
 
 
 === SUMMARY ===
-included: 63
+included: 60
 skipped(binary): 3
 skipped(size): 0
 skipped(ext): 0
-totalBytes(approx): 485397
+totalBytes(approx): 460320

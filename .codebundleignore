@@ -13,6 +13,7 @@ smoke-test/
 fish_speech/i18n/
 temp/
 results/
+fish_speech/i18n/
 
 
 package-lock.json
@@ -20,6 +21,7 @@ yarn.lock
 pnpm-lock.yaml
 bundle-code.js
 uv.lock
+.project-root
 
 
 *.png

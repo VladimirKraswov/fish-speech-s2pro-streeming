@@ -1,7 +1,7 @@
 === CODE BUNDLE ===
 root: /Volumes/Extend/work/fish-speech-s2pro-streeming
 ignore: .codebundleignore
-generated: 2026-04-24T20:19:19.523Z
+generated: 2026-04-24T20:55:01.745Z
 
 
 
@@ -399,7 +399,7 @@ path: /config/runtime.json
 {
   "version": 1,
   "paths": {
-    "llama_checkpoint_path": "checkpoints/s2-pro",
+    "llama_checkpoint_path": "checkpoints/fs-1.2-int8-s2-pro-int8",
     "decoder_checkpoint_path": "checkpoints/s2-pro/codec.pth",
     "decoder_config_name": "modded_dac_vq",
     "references_dir": "references"
@@ -420,10 +420,10 @@ path: /config/runtime.json
     "precision": "bfloat16",
     "compile": true,
     "cache_max_seq_len": 768,
-    "max_new_tokens_cap": 128,
+    "max_new_tokens_cap": 160,
     "sdpa_math": false,
     "cleanup_after_request": false,
-    "cleanup_every_n_requests": 0,
+    "cleanup_every_n_requests": 24,
     "cleanup_on_error": true,
     "cleanup_on_abort": true,
     "empty_cache_per_stream_chunk": false,
@@ -438,9 +438,9 @@ path: /config/runtime.json
     "text": "Привет. Это дополнительный прогрев стримингового режима для Fish Speech.",
     "streaming": true,
     "stream_tokens": true,
-    "max_new_tokens": 96,
-    "chunk_length": 180,
-    "initial_stream_chunk_size": 8,
+    "max_new_tokens": 128,
+    "chunk_length": 160,
+    "initial_stream_chunk_size": 10,
     "stream_chunk_size": 8
   },
   "proxy": {
@@ -450,18 +450,18 @@ path: /config/runtime.json
     "version": 1,
     "commit": {
       "first": {
-        "min_chars": 48,
-        "target_chars": 72,
-        "max_chars": 96,
-        "max_wait_ms": 180,
-        "allow_partial_after_ms": 260
+        "min_chars": 40,
+        "target_chars": 58,
+        "max_chars": 84,
+        "max_wait_ms": 150,
+        "allow_partial_after_ms": 240
       },
       "next": {
-        "min_chars": 140,
-        "target_chars": 180,
-        "max_chars": 260,
-        "max_wait_ms": 420,
-        "allow_partial_after_ms": 700
+        "min_chars": 120,
+        "target_chars": 160,
+        "max_chars": 240,
+        "max_wait_ms": 340,
+        "allow_partial_after_ms": 600
       },
       "flush_on_sentence_punctuation": true,
       "flush_on_clause_punctuation": true,
@@ -474,19 +474,19 @@ path: /config/runtime.json
       "normalize": true,
       "use_memory_cache": "on",
       "seed": 1234,
-      "max_new_tokens": 128,
-      "chunk_length": 180,
-      "top_p": 0.8,
-      "repetition_penalty": 1.08,
-      "temperature": 0.75,
+      "max_new_tokens": 160,
+      "chunk_length": 160,
+      "top_p": 0.78,
+      "repetition_penalty": 1.12,
+      "temperature": 0.7,
       "stream_tokens": true,
-      "initial_stream_chunk_size": 8,
+      "initial_stream_chunk_size": 10,
       "stream_chunk_size": 8
     },
     "playback": {
-      "target_emit_bytes": 4096,
-      "start_buffer_ms": 90,
-      "stop_grace_ms": 40
+      "target_emit_bytes": 6144,
+      "start_buffer_ms": 120,
+      "stop_grace_ms": 60
     },
     "session": {
       "max_buffer_chars": 4000,
@@ -7777,24 +7777,17 @@ path: /references/voice/voice.lab
 
 path: /scripts/down_5090.sh
 ----------------------------------------
-# scripts/down_5090.sh
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/lib_5090.sh"
+
 cd "$REPO_ROOT"
 
-CONTAINER="${CONTAINER:-fish-speech}"
-RUN_DIR="$REPO_ROOT/run"
-PID_FILE="$RUN_DIR/proxy.pid"
-
-docker_cmd() {
-  if [[ "${DOCKER_USE_SUDO:-0}" == "1" ]]; then
-    sudo docker "$@"
-  else
-    docker "$@"
-  fi
-}
+CONTAINER="${CONTAINER:-fish-speech-5090}"
+PID_FILE="$(proxy_pid_file)"
 
 echo "[1/2] Stopping proxy"
 if [[ -f "$PID_FILE" ]]; then
@@ -7808,6 +7801,7 @@ if [[ -f "$PID_FILE" ]]; then
   fi
   rm -f "$PID_FILE"
 fi
+
 pkill -f 'uvicorn.*tools.proxy.fish_proxy_pcm:app' 2>/dev/null || true
 
 echo "[2/2] Stopping model container"
@@ -7816,20 +7810,14 @@ docker_cmd rm -f "$CONTAINER" 2>/dev/null || true
 echo "All stopped"
 
 
-path: /scripts/logs_5090.sh
+path: /scripts/lib_5090.sh
 ----------------------------------------
-# scripts/logs_5090.sh
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$REPO_ROOT"
-
-CONTAINER="${CONTAINER:-fish-speech}"
-PROXY_LOG_FILE="${PROXY_LOG_FILE:-$REPO_ROOT/logs/proxy.log}"
-
-mkdir -p "$REPO_ROOT/logs"
-touch "$PROXY_LOG_FILE"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RUNTIME_CONFIG="${RUNTIME_CONFIG:-$REPO_ROOT/config/runtime.json}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 docker_cmd() {
   if [[ "${DOCKER_USE_SUDO:-0}" == "1" ]]; then
@@ -7838,6 +7826,119 @@ docker_cmd() {
     docker "$@"
   fi
 }
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "ERROR: required command not found: $1" >&2
+    exit 1
+  }
+}
+
+require_file() {
+  [[ -f "$1" ]] || {
+    echo "ERROR: file not found: $1" >&2
+    exit 1
+  }
+}
+
+require_dir() {
+  [[ -d "$1" ]] || {
+    echo "ERROR: directory not found: $1" >&2
+    exit 1
+  }
+}
+
+runtime_get() {
+  local dotted_path="$1"
+  "$PYTHON_BIN" - "$RUNTIME_CONFIG" "$dotted_path" <<'PY'
+import json
+import sys
+
+cfg_path = sys.argv[1]
+dotted = sys.argv[2]
+
+with open(cfg_path, "r", encoding="utf-8") as f:
+    obj = json.load(f)
+
+cur = obj
+for part in dotted.split("."):
+    cur = cur[part]
+
+if isinstance(cur, bool):
+    print("true" if cur else "false")
+elif cur is None:
+    print("")
+else:
+    print(cur)
+PY
+}
+
+runtime_path() {
+  local dotted_path="$1"
+  local value
+  value="$(runtime_get "$dotted_path")"
+  if [[ -z "$value" ]]; then
+    echo ""
+    return 0
+  fi
+  if [[ "$value" = /* ]]; then
+    echo "$value"
+  else
+    echo "$REPO_ROOT/$value"
+  fi
+}
+
+proxy_pid_file() {
+  echo "$REPO_ROOT/run/proxy.pid"
+}
+
+proxy_log_file() {
+  echo "${PROXY_LOG_FILE:-$REPO_ROOT/logs/proxy.log}"
+}
+
+wait_http_ok() {
+  local url="$1"
+  local timeout="${2:-300}"
+  local step="${3:-2}"
+
+  local started
+  started="$(date +%s)"
+
+  while true; do
+    if curl -sf "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+
+    local now elapsed
+    now="$(date +%s)"
+    elapsed="$((now - started))"
+
+    if [[ "$elapsed" -ge "$timeout" ]]; then
+      echo "ERROR: timeout waiting for $url (${timeout}s)" >&2
+      return 1
+    fi
+
+    sleep "$step"
+  done
+}
+
+
+path: /scripts/logs_5090.sh
+----------------------------------------
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/lib_5090.sh"
+
+cd "$REPO_ROOT"
+
+CONTAINER="${CONTAINER:-fish-speech-5090}"
+PROXY_LOG_FILE="$(proxy_log_file)"
+
+mkdir -p "$REPO_ROOT/logs"
+touch "$PROXY_LOG_FILE"
 
 cleanup() {
   [[ -n "${MODEL_PID:-}" ]] && kill "$MODEL_PID" 2>/dev/null || true
@@ -7865,20 +7966,17 @@ wait
 
 path: /scripts/restart_5090.sh
 ----------------------------------------
-# scripts/restart_5090.sh
 #!/usr/bin/env bash
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-DOCKER_USE_SUDO="${DOCKER_USE_SUDO:-0}" \
-  bash "$REPO_ROOT/scripts/down_5090.sh"
+CONTAINER="${CONTAINER:-fish-speech-5090}"
 
+CONTAINER="$CONTAINER" DOCKER_USE_SUDO="${DOCKER_USE_SUDO:-0}" bash "$REPO_ROOT/scripts/down_5090.sh"
 sleep 2
-
-DOCKER_USE_SUDO="${DOCKER_USE_SUDO:-0}" \
-  bash "$REPO_ROOT/scripts/up_5090.sh"
+CONTAINER="$CONTAINER" DOCKER_USE_SUDO="${DOCKER_USE_SUDO:-0}" bash "$REPO_ROOT/scripts/up_5090.sh"
 
 
 path: /scripts/run_proxy.sh
@@ -7886,48 +7984,28 @@ path: /scripts/run_proxy.sh
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/lib_5090.sh"
+
 cd "$REPO_ROOT"
 
-PROXY_PORT="${PROXY_PORT:-9000}"
-PROXY_HOST="${PROXY_HOST:-0.0.0.0}"
+require_cmd "$PYTHON_BIN"
+require_cmd curl
+require_cmd uv
+
+PROXY_HOST="${PROXY_HOST:-$(runtime_get 'network.proxy.host')}"
+PROXY_PORT="${PROXY_PORT:-$(runtime_get 'network.proxy.port')}"
 PROXY_LOG_LEVEL="${PROXY_LOG_LEVEL:-info}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
-PROXY_START_TIMEOUT="${PROXY_START_TIMEOUT:-60}"
-DEFAULT_REFERENCE_ID="${DEFAULT_REFERENCE_ID:-voice}"
-UPSTREAM_TTS_URL="${UPSTREAM_TTS_URL:-http://127.0.0.1:8080/v1/tts}"
-SESSION_TTL_SEC="${SESSION_TTL_SEC:-1800}"
-SESSION_MAX_COUNT="${SESSION_MAX_COUNT:-128}"
+PROXY_START_TIMEOUT="${PROXY_START_TIMEOUT:-120}"
 
 LOG_DIR="$REPO_ROOT/logs"
 RUN_DIR="$REPO_ROOT/run"
-LOG_FILE="$LOG_DIR/proxy.log"
-PID_FILE="$RUN_DIR/proxy.pid"
-VENV_PATH="$REPO_ROOT/.venv-proxy"
-VENV_PYTHON="$VENV_PATH/bin/python"
+LOG_FILE="$(proxy_log_file)"
+PID_FILE="$(proxy_pid_file)"
 
 mkdir -p "$LOG_DIR" "$RUN_DIR"
 touch "$LOG_FILE"
-
-if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-  echo "ERROR: python not found: $PYTHON_BIN" >&2
-  exit 1
-fi
-
-if [[ ! -d "$VENV_PATH" ]]; then
-  echo "Creating proxy virtualenv at $VENV_PATH"
-  "$PYTHON_BIN" -m venv "$VENV_PATH"
-fi
-
-if ! "$VENV_PYTHON" - <<'PY' >/dev/null 2>&1
-import fastapi, uvicorn, httpx, pydantic
-print("ok")
-PY
-then
-  echo "Installing proxy dependencies into $VENV_PATH"
-  "$VENV_PYTHON" -m pip install -U pip setuptools wheel
-  "$VENV_PYTHON" -m pip install fastapi "uvicorn[standard]" httpx pydantic
-fi
 
 if [[ -f "$PID_FILE" ]]; then
   OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
@@ -7944,12 +8022,8 @@ fi
 pkill -f 'uvicorn.*tools.proxy.fish_proxy_pcm:app' 2>/dev/null || true
 
 export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
-export DEFAULT_REFERENCE_ID
-export UPSTREAM_TTS_URL
-export SESSION_TTL_SEC
-export SESSION_MAX_COUNT
 
-nohup "$VENV_PYTHON" -m uvicorn tools.proxy.fish_proxy_pcm:app \
+nohup uv run python -m uvicorn tools.proxy.fish_proxy_pcm:app \
   --host "$PROXY_HOST" \
   --port "$PROXY_PORT" \
   --log-level "$PROXY_LOG_LEVEL" \
@@ -7959,37 +8033,17 @@ PROXY_PID=$!
 echo "$PROXY_PID" > "$PID_FILE"
 
 echo "Waiting for proxy to become healthy..."
-START_TS="$(date +%s)"
-
-while true; do
-  if curl -sf "http://127.0.0.1:${PROXY_PORT}/health" >/dev/null 2>&1; then
-    break
-  fi
-
-  if ! kill -0 "$PROXY_PID" 2>/dev/null; then
-    echo "ERROR: proxy failed to start. Last log lines:" >&2
-    tail -n 100 "$LOG_FILE" >&2 || true
-    rm -f "$PID_FILE"
-    exit 1
-  fi
-
-  NOW_TS="$(date +%s)"
-  ELAPSED="$((NOW_TS - START_TS))"
-
-  if [[ "$ELAPSED" -ge "$PROXY_START_TIMEOUT" ]]; then
-    echo "ERROR: proxy did not become healthy within ${PROXY_START_TIMEOUT}s" >&2
-    tail -n 100 "$LOG_FILE" >&2 || true
-    exit 1
-  fi
-
-  sleep 1
-done
+if ! wait_http_ok "http://127.0.0.1:${PROXY_PORT}/health" "$PROXY_START_TIMEOUT" 1; then
+  echo "ERROR: proxy failed to become healthy" >&2
+  tail -n 200 "$LOG_FILE" >&2 || true
+  rm -f "$PID_FILE"
+  exit 1
+fi
 
 echo "Proxy started"
 echo "  pid: $PROXY_PID"
 echo "  log: $LOG_FILE"
 echo "  health: http://127.0.0.1:${PROXY_PORT}/health"
-echo "  open session: curl -X POST http://127.0.0.1:${PROXY_PORT}/session/open -H 'Content-Type: application/json' -d '{\"config_text\":\"{\\\"tts\\\":{\\\"reference_id\\\":\\\"voice\\\"}}\"}'"
 
 
 path: /scripts/run_server_32gb.sh
@@ -8101,84 +8155,114 @@ echo "  Memory:  curl -s http://127.0.0.1:$PORT/v1/debug/memory"
 echo "  Logs:    docker logs -f $CONTAINER"
 
 
+path: /scripts/status_5090.sh
+----------------------------------------
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/lib_5090.sh"
+
+cd "$REPO_ROOT"
+
+CONTAINER="${CONTAINER:-fish-speech-5090}"
+SERVER_PORT="${SERVER_PORT:-$(runtime_get 'network.server.port')}"
+PROXY_PORT="${PROXY_PORT:-$(runtime_get 'network.proxy.port')}"
+PID_FILE="$(proxy_pid_file)"
+
+echo "=== Fish Speech status ==="
+echo "runtime:   $RUNTIME_CONFIG"
+echo "container: $CONTAINER"
+echo
+
+echo "[docker]"
+docker_cmd ps -a --filter "name=^/${CONTAINER}$" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' || true
+echo
+
+echo "[server health]"
+curl -sf "http://127.0.0.1:${SERVER_PORT}/v1/health" || echo "server: unavailable"
+echo
+echo
+
+echo "[proxy health]"
+curl -sf "http://127.0.0.1:${PROXY_PORT}/health" || echo "proxy: unavailable"
+echo
+echo
+
+echo "[proxy pid]"
+if [[ -f "$PID_FILE" ]]; then
+  PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
+    echo "proxy pid: $PID (running)"
+  else
+    echo "proxy pid file exists, but process is not running"
+  fi
+else
+  echo "proxy pid file not found"
+fi
+echo
+
+echo "[gpu memory]"
+curl -sf "http://127.0.0.1:${SERVER_PORT}/v1/debug/memory" || echo "memory endpoint unavailable"
+echo
+
+
 path: /scripts/up_5090.sh
 ----------------------------------------
 #!/usr/bin/env bash
-# === scripts/up_5090.sh ===
-
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/lib_5090.sh"
+
 cd "$REPO_ROOT"
 
-IMAGE="${IMAGE:-fish-speech-webui:cu129}"
-CONTAINER="${CONTAINER:-fish-speech}"
-PORT="${PORT:-8080}"
-PROXY_PORT="${PROXY_PORT:-9000}"
+require_cmd "$PYTHON_BIN"
+require_cmd curl
+require_cmd docker
 
-COMPILE="${COMPILE:-1}"
+IMAGE="${IMAGE:-fish-speech-server:cu129}"
+CONTAINER="${CONTAINER:-fish-speech-5090}"
 BUILD_IMAGE="${BUILD_IMAGE:-0}"
 START_PROXY="${START_PROXY:-1}"
 EXTRA_WARMUP="${EXTRA_WARMUP:-1}"
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-1800}"
 
 CUDA_VER="${CUDA_VER:-12.9.0}"
 UV_EXTRA="${UV_EXTRA:-cu129}"
-
-# legacy support:
-# если передан CHECKPOINTS_DIR, используем его только как llama path
-LLAMA_CHECKPOINTS_DIR="${LLAMA_CHECKPOINTS_DIR:-${CHECKPOINTS_DIR:-checkpoints/s2-pro}}"
-DECODER_CHECKPOINT_PATH="${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}"
-
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-# 512 токенов часто оказывается слишком тесным для длинного reference prompt.
-# Для 5090 безопаснее держать запас по KV cache побольше.
-FISH_CACHE_MAX_SEQ_LEN="${FISH_CACHE_MAX_SEQ_LEN:-768}"
-FISH_MAX_NEW_TOKENS_CAP="${FISH_MAX_NEW_TOKENS_CAP:-128}"
-FISH_CLEANUP_AFTER_REQUEST="${FISH_CLEANUP_AFTER_REQUEST:-0}"
-FISH_CLEANUP_EVERY_N_REQUESTS="${FISH_CLEANUP_EVERY_N_REQUESTS:-0}"
-FISH_CLEANUP_ON_ERROR="${FISH_CLEANUP_ON_ERROR:-1}"
-FISH_CLEANUP_ON_ABORT="${FISH_CLEANUP_ON_ABORT:-1}"
-FISH_EMPTY_CACHE_PER_STREAM_CHUNK="${FISH_EMPTY_CACHE_PER_STREAM_CHUNK:-0}"
-FISH_EMPTY_CACHE_PER_SEGMENT="${FISH_EMPTY_CACHE_PER_SEGMENT:-0}"
-DEFAULT_REFERENCE_ID="${DEFAULT_REFERENCE_ID:-voice}"
-FISH_WARMUP_REFERENCE_ID="${FISH_WARMUP_REFERENCE_ID:-$DEFAULT_REFERENCE_ID}"
-SESSION_TTL_SEC="${SESSION_TTL_SEC:-1800}"
-SESSION_MAX_COUNT="${SESSION_MAX_COUNT:-128}"
 
-HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-1800}"
-LOG_DIR="$REPO_ROOT/logs"
-mkdir -p "$LOG_DIR"
+SERVER_HOST="${SERVER_HOST:-$(runtime_get 'network.server.host')}"
+SERVER_PORT="${SERVER_PORT:-$(runtime_get 'network.server.port')}"
+PROXY_PORT="${PROXY_PORT:-$(runtime_get 'network.proxy.port')}"
 
-docker_cmd() {
-  if [[ "${DOCKER_USE_SUDO:-0}" == "1" ]]; then
-    sudo docker "$@"
-  else
-    docker "$@"
-  fi
-}
+LLAMA_CHECKPOINT_PATH="${LLAMA_CHECKPOINT_PATH:-$(runtime_path 'paths.llama_checkpoint_path')}"
+DECODER_CHECKPOINT_PATH="${DECODER_CHECKPOINT_PATH:-$(runtime_path 'paths.decoder_checkpoint_path')}"
+DEFAULT_REFERENCE_ID="${DEFAULT_REFERENCE_ID:-$(runtime_get 'proxy.default_reference_id')}"
+WARMUP_REFERENCE_ID="${WARMUP_REFERENCE_ID:-$(runtime_get 'warmup.reference_id')}"
 
-echo "=== Fish Speech full startup (RTX 5090) ==="
-echo "  REPO_ROOT=$REPO_ROOT"
-echo "  IMAGE=$IMAGE"
-echo "  CONTAINER=$CONTAINER"
-echo "  PORT=$PORT"
-echo "  PROXY_PORT=$PROXY_PORT"
-echo "  LLAMA_CHECKPOINTS_DIR=$LLAMA_CHECKPOINTS_DIR"
-echo "  DECODER_CHECKPOINT_PATH=$DECODER_CHECKPOINT_PATH"
-echo "  DEFAULT_REFERENCE_ID=$DEFAULT_REFERENCE_ID"
-echo "  FISH_WARMUP_REFERENCE_ID=$FISH_WARMUP_REFERENCE_ID"
-echo "  SESSION_TTL_SEC=$SESSION_TTL_SEC"
+if [[ -z "$WARMUP_REFERENCE_ID" ]]; then
+  WARMUP_REFERENCE_ID="$DEFAULT_REFERENCE_ID"
+fi
+
+require_file "$RUNTIME_CONFIG"
+require_dir "$LLAMA_CHECKPOINT_PATH"
+require_file "$DECODER_CHECKPOINT_PATH"
+
+echo "=== Fish Speech startup (RTX 5090) ==="
+echo "REPO_ROOT=$REPO_ROOT"
+echo "RUNTIME_CONFIG=$RUNTIME_CONFIG"
+echo "IMAGE=$IMAGE"
+echo "CONTAINER=$CONTAINER"
+echo "SERVER=${SERVER_HOST}:${SERVER_PORT}"
+echo "PROXY_PORT=$PROXY_PORT"
+echo "LLAMA_CHECKPOINT_PATH=$LLAMA_CHECKPOINT_PATH"
+echo "DECODER_CHECKPOINT_PATH=$DECODER_CHECKPOINT_PATH"
+echo "DEFAULT_REFERENCE_ID=$DEFAULT_REFERENCE_ID"
+echo "WARMUP_REFERENCE_ID=$WARMUP_REFERENCE_ID"
 echo
-
-if [[ ! -d "$LLAMA_CHECKPOINTS_DIR" ]] || [[ -z "$(ls -A "$LLAMA_CHECKPOINTS_DIR" 2>/dev/null)" ]]; then
-  echo "ERROR: llama checkpoints not found in $LLAMA_CHECKPOINTS_DIR" >&2
-  exit 1
-fi
-
-if [[ ! -f "$DECODER_CHECKPOINT_PATH" ]]; then
-  echo "ERROR: decoder checkpoint not found: $DECODER_CHECKPOINT_PATH" >&2
-  exit 1
-fi
 
 if [[ "$BUILD_IMAGE" == "1" ]] || ! docker_cmd image inspect "$IMAGE" >/dev/null 2>&1; then
   echo "[1/5] Building Docker image..."
@@ -8188,111 +8272,73 @@ if [[ "$BUILD_IMAGE" == "1" ]] || ! docker_cmd image inspect "$IMAGE" >/dev/null
     --build-arg BACKEND=cuda \
     --build-arg CUDA_VER="$CUDA_VER" \
     --build-arg UV_EXTRA="$UV_EXTRA" \
-    --target webui \
+    --target server \
     -t "$IMAGE" .
 else
   echo "[1/5] Using existing image: $IMAGE"
 fi
 
 echo "[2/5] Stopping previous processes..."
-DOCKER_USE_SUDO="${DOCKER_USE_SUDO:-0}" bash "$REPO_ROOT/scripts/down_5090.sh"
+CONTAINER="$CONTAINER" DOCKER_USE_SUDO="${DOCKER_USE_SUDO:-0}" bash "$REPO_ROOT/scripts/down_5090.sh"
 
 echo "[3/5] Starting model container..."
-if [[ "$COMPILE" == "1" ]]; then
-  COMPILE_ARG=(--compile)
-else
-  COMPILE_ARG=()
-fi
-
-CID="$({
+CID="$(
   docker_cmd run -d --rm \
     --name "$CONTAINER" \
-    -p "$PORT:8080" \
+    -p "${SERVER_PORT}:${SERVER_PORT}" \
     --gpus all \
     -e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF" \
-    -e FISH_CACHE_MAX_SEQ_LEN="$FISH_CACHE_MAX_SEQ_LEN" \
-    -e FISH_MAX_NEW_TOKENS_CAP="$FISH_MAX_NEW_TOKENS_CAP" \
-    -e FISH_CLEANUP_AFTER_REQUEST="$FISH_CLEANUP_AFTER_REQUEST" \
-    -e FISH_CLEANUP_EVERY_N_REQUESTS="$FISH_CLEANUP_EVERY_N_REQUESTS" \
-    -e FISH_CLEANUP_ON_ERROR="$FISH_CLEANUP_ON_ERROR" \
-    -e FISH_CLEANUP_ON_ABORT="$FISH_CLEANUP_ON_ABORT" \
-    -e FISH_EMPTY_CACHE_PER_STREAM_CHUNK="$FISH_EMPTY_CACHE_PER_STREAM_CHUNK" \
-    -e FISH_EMPTY_CACHE_PER_SEGMENT="$FISH_EMPTY_CACHE_PER_SEGMENT" \
-    -e FISH_WARMUP_REFERENCE_ID="$FISH_WARMUP_REFERENCE_ID" \
     -e PYTHONPATH=/workspace \
     -v "$REPO_ROOT":/workspace \
     -w /workspace \
     --entrypoint /app/.venv/bin/python \
     "$IMAGE" \
     /workspace/tools/api_server.py \
-    --listen 0.0.0.0:8080 \
-    --device cuda \
-    --llama-checkpoint-path "/workspace/$LLAMA_CHECKPOINTS_DIR" \
-    --decoder-checkpoint-path "/workspace/$DECODER_CHECKPOINT_PATH" \
-    "${COMPILE_ARG[@]}"
-})"
+    --listen "0.0.0.0:${SERVER_PORT}"
+)"
 
 echo "Container started: $CID"
 echo
 
 echo "[4/5] Waiting for model health..."
-START_TS="$(date +%s)"
-while true; do
-  if curl -sf "http://127.0.0.1:${PORT}/v1/health" >/dev/null 2>&1; then
-    break
-  fi
-
-  if ! docker_cmd ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
-    echo "ERROR: container exited during startup" >&2
-    docker_cmd ps -a --format 'table {{.Names}}\t{{.Status}}' || true
-    exit 1
-  fi
-
-  NOW_TS="$(date +%s)"
-  ELAPSED="$((NOW_TS - START_TS))"
-  if (( ELAPSED % 30 == 0 )); then
-    echo "Still warming up... ${ELAPSED}s"
-  fi
-
-  if [[ "$ELAPSED" -ge "$HEALTH_TIMEOUT" ]]; then
-    echo "ERROR: model did not become healthy within ${HEALTH_TIMEOUT}s" >&2
-    docker_cmd ps -a --format 'table {{.Names}}\t{{.Status}}' || true
-    exit 1
-  fi
-
-  sleep 5
-done
-
-echo "Model is healthy after $(( $(date +%s) - START_TS ))s"
-
-if [[ "$EXTRA_WARMUP" == "1" ]]; then
-  echo "Sending one extra warmup streaming request..."
-  BASE_URL="http://127.0.0.1:${PORT}" \
-  WARMUP_REFERENCE_ID="$FISH_WARMUP_REFERENCE_ID" \
-  bash "$REPO_ROOT/scripts/warmup_5090.sh"
+if ! wait_http_ok "http://127.0.0.1:${SERVER_PORT}/v1/health" "$HEALTH_TIMEOUT" 5; then
+  echo "ERROR: model did not become healthy" >&2
+  docker_cmd logs --tail 200 "$CONTAINER" || true
+  exit 1
 fi
 
+echo "Model is healthy"
+echo
 echo "Current model memory:"
-curl -sf "http://127.0.0.1:${PORT}/v1/debug/memory" || true
+curl -sf "http://127.0.0.1:${SERVER_PORT}/v1/debug/memory" || true
 echo
 echo
+
+if [[ "$EXTRA_WARMUP" == "1" ]]; then
+  echo "Running extra warmup request..."
+  PORT="$SERVER_PORT" \
+  BASE_URL="http://127.0.0.1:${SERVER_PORT}" \
+  WARMUP_REFERENCE_ID="$WARMUP_REFERENCE_ID" \
+  bash "$REPO_ROOT/scripts/warmup_5090.sh"
+  echo
+fi
 
 if [[ "$START_PROXY" == "1" ]]; then
   echo "[5/5] Starting proxy..."
   PROXY_PORT="$PROXY_PORT" \
-  DEFAULT_REFERENCE_ID="$DEFAULT_REFERENCE_ID" \
-  SESSION_TTL_SEC="$SESSION_TTL_SEC" \
-  SESSION_MAX_COUNT="$SESSION_MAX_COUNT" \
   bash "$REPO_ROOT/scripts/run_proxy.sh"
+else
+  echo "[5/5] Proxy start skipped"
 fi
 
 echo
 echo "=== READY ==="
-echo "Model health:      http://127.0.0.1:${PORT}/v1/health"
-echo "Model memory:      http://127.0.0.1:${PORT}/v1/debug/memory"
-echo "Proxy health:      http://127.0.0.1:${PROXY_PORT}/health"
-echo "Proxy open session:http://127.0.0.1:${PROXY_PORT}/session/open"
-echo "Proxy stream:      http://127.0.0.1:${PROXY_PORT}/pcm-stream?session_id=...&text=Привет"
+echo "Model health:       http://127.0.0.1:${SERVER_PORT}/v1/health"
+echo "Model memory:       http://127.0.0.1:${SERVER_PORT}/v1/debug/memory"
+echo "Proxy health:       http://127.0.0.1:${PROXY_PORT}/health"
+echo "Proxy open session: http://127.0.0.1:${PROXY_PORT}/session/open"
+echo "Logs:               bash scripts/logs_5090.sh"
+echo "Status:             bash scripts/status_5090.sh"
 
 
 path: /scripts/warmup_5090.sh
@@ -8300,47 +8346,87 @@ path: /scripts/warmup_5090.sh
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/lib_5090.sh"
+
 cd "$REPO_ROOT"
 
-PORT="${PORT:-8080}"
+require_cmd "$PYTHON_BIN"
+require_cmd curl
+
+PORT="${PORT:-$(runtime_get 'network.server.port')}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:${PORT}}"
 WARMUP_TIMEOUT="${WARMUP_TIMEOUT:-1800}"
-WARMUP_TEXT="${WARMUP_TEXT:-Привет. Это дополнительный прогрев стримингового режима для Fish Speech.}"
-WARMUP_REFERENCE_ID="${WARMUP_REFERENCE_ID:-voice}"
 OUT_FILE="${OUT_FILE:-$REPO_ROOT/logs/warmup_stream.wav}"
+
+WARMUP_TEXT="${WARMUP_TEXT:-$(runtime_get 'warmup.text')}"
+WARMUP_REFERENCE_ID="${WARMUP_REFERENCE_ID:-$(runtime_get 'warmup.reference_id')}"
+WARMUP_MAX_NEW_TOKENS="${WARMUP_MAX_NEW_TOKENS:-$(runtime_get 'warmup.max_new_tokens')}"
+WARMUP_CHUNK_LENGTH="${WARMUP_CHUNK_LENGTH:-$(runtime_get 'warmup.chunk_length')}"
+WARMUP_INITIAL_STREAM_CHUNK_SIZE="${WARMUP_INITIAL_STREAM_CHUNK_SIZE:-$(runtime_get 'warmup.initial_stream_chunk_size')}"
+WARMUP_STREAM_CHUNK_SIZE="${WARMUP_STREAM_CHUNK_SIZE:-$(runtime_get 'warmup.stream_chunk_size')}"
+
+TOP_P="${TOP_P:-$(runtime_get 'proxy.tts.top_p')}"
+REPETITION_PENALTY="${REPETITION_PENALTY:-$(runtime_get 'proxy.tts.repetition_penalty')}"
+TEMPERATURE="${TEMPERATURE:-$(runtime_get 'proxy.tts.temperature')}"
+USE_MEMORY_CACHE="${USE_MEMORY_CACHE:-$(runtime_get 'proxy.tts.use_memory_cache')}"
+
+if [[ -z "$WARMUP_REFERENCE_ID" ]]; then
+  WARMUP_REFERENCE_ID="$(runtime_get 'proxy.default_reference_id')"
+fi
 
 mkdir -p "$REPO_ROOT/logs"
 
 echo "Waiting for model health: $BASE_URL/v1/health"
+if ! wait_http_ok "$BASE_URL/v1/health" "$WARMUP_TIMEOUT" 5; then
+  echo "ERROR: model did not become healthy within ${WARMUP_TIMEOUT}s" >&2
+  exit 1
+fi
 
-START_TS="$(date +%s)"
-while true; do
-  if curl -sf "$BASE_URL/v1/health" >/dev/null 2>&1; then
-    break
-  fi
+BODY="$(
+  WARMUP_TEXT="$WARMUP_TEXT" \
+  WARMUP_REFERENCE_ID="$WARMUP_REFERENCE_ID" \
+  WARMUP_MAX_NEW_TOKENS="$WARMUP_MAX_NEW_TOKENS" \
+  WARMUP_CHUNK_LENGTH="$WARMUP_CHUNK_LENGTH" \
+  WARMUP_INITIAL_STREAM_CHUNK_SIZE="$WARMUP_INITIAL_STREAM_CHUNK_SIZE" \
+  WARMUP_STREAM_CHUNK_SIZE="$WARMUP_STREAM_CHUNK_SIZE" \
+  TOP_P="$TOP_P" \
+  REPETITION_PENALTY="$REPETITION_PENALTY" \
+  TEMPERATURE="$TEMPERATURE" \
+  USE_MEMORY_CACHE="$USE_MEMORY_CACHE" \
+  "$PYTHON_BIN" - <<'PY'
+import json
+import os
 
-  NOW_TS="$(date +%s)"
-  ELAPSED="$((NOW_TS - START_TS))"
-  echo "Still warming up... ${ELAPSED}s"
+payload = {
+    "text": os.environ["WARMUP_TEXT"],
+    "streaming": True,
+    "stream_tokens": True,
+    "reference_id": os.environ["WARMUP_REFERENCE_ID"],
+    "format": "wav",
+    "normalize": True,
+    "use_memory_cache": os.environ["USE_MEMORY_CACHE"],
+    "max_new_tokens": int(os.environ["WARMUP_MAX_NEW_TOKENS"]),
+    "chunk_length": int(os.environ["WARMUP_CHUNK_LENGTH"]),
+    "top_p": float(os.environ["TOP_P"]),
+    "repetition_penalty": float(os.environ["REPETITION_PENALTY"]),
+    "temperature": float(os.environ["TEMPERATURE"]),
+    "initial_stream_chunk_size": int(os.environ["WARMUP_INITIAL_STREAM_CHUNK_SIZE"]),
+    "stream_chunk_size": int(os.environ["WARMUP_STREAM_CHUNK_SIZE"]),
+}
+print(json.dumps(payload, ensure_ascii=False))
+PY
+)"
 
-  if [[ "$ELAPSED" -ge "$WARMUP_TIMEOUT" ]]; then
-    echo "ERROR: model did not become healthy within ${WARMUP_TIMEOUT}s" >&2
-    exit 1
-  fi
-
-  sleep 10
-done
-
-echo "Model is healthy after $(( $(date +%s) - START_TS ))s"
-echo "Sending one extra warmup streaming request..."
+echo "Sending extra warmup streaming request..."
 echo "Using warmup reference: $WARMUP_REFERENCE_ID"
 
 curl -sf -X POST "$BASE_URL/v1/tts" \
   -H 'Content-Type: application/json' \
-  -d "{\"text\":\"${WARMUP_TEXT}\",\"streaming\":true,\"stream_tokens\":true,\"reference_id\":\"${WARMUP_REFERENCE_ID}\",\"max_new_tokens\":96,\"chunk_length\":200,\"initial_stream_chunk_size\":18,\"stream_chunk_size\":8}" \
+  -d "$BODY" \
   --output "$OUT_FILE" \
-  --max-time 180 >/dev/null
+  --max-time 240 >/dev/null
 
 echo "Warmup completed"
 echo "Current memory:"
@@ -13194,8 +13280,8 @@ async def update_reference(
 
 
 === SUMMARY ===
-included: 57
+included: 59
 skipped(binary): 3
 skipped(size): 0
 skipped(ext): 0
-totalBytes(approx): 432840
+totalBytes(approx): 433862

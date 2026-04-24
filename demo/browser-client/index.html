@@ -134,44 +134,41 @@
   <script>
     const BACKEND_BASE = 'http://192.168.31.32:9000';
 
-    const defaultConfig = {
-      version: 1,
-      committer: {
-        soft_min_chars: 140,
-        target_chars: 220,
-        hard_max_chars: 320,
-        flush_on_punctuation: true,
-        flush_on_clause_punctuation: false,
-        flush_on_newline: true,
-        max_wait_ms: 1800,
-        allow_partial_after_ms: 3500,
-        carry_incomplete_tail: true
-      },
-      tts: {
-        reference_id: 'voice',
-        format: 'wav',
-        normalize: true,
-        use_memory_cache: 'on',
-        seed: 1234,
-        max_new_tokens: 128,
-        chunk_length: 200,
-        top_p: 0.8,
-        repetition_penalty: 1.1,
-        temperature: 0.8,
-        stream_tokens: true,
-        initial_stream_chunk_size: 18,
-        stream_chunk_size: 8
-      },
-      playback: {
-        target_emit_bytes: 16384,
-        start_buffer_ms: 450,
-        stop_grace_ms: 250
-      },
-      session: {
-        max_buffer_chars: 4000,
-        auto_close_on_finish: false
-      }
-    };
+    // Это не "полный runtime config", а только override-поля,
+    // которые текущий proxy реально разрешает присылать в /session/open.
+const defaultConfig = {
+  commit: {
+    first: {
+      min_chars: 48,
+      target_chars: 72,
+      max_chars: 96,
+      max_wait_ms: 180,
+      allow_partial_after_ms: 260
+    },
+    next: {
+      min_chars: 140,
+      target_chars: 180,
+      max_chars: 260,
+      max_wait_ms: 420,
+      allow_partial_after_ms: 700
+    }
+  },
+  tts: {
+    reference_id: 'voice',
+    max_new_tokens: 128,
+    chunk_length: 180,
+    top_p: 0.8,
+    repetition_penalty: 1.08,
+    temperature: 0.75,
+    initial_stream_chunk_size: 10,
+    stream_chunk_size: 8
+  },
+  playback: {
+    target_emit_bytes: 6144,
+    start_buffer_ms: 120,
+    stop_grace_ms: 40
+  }
+};
 
     const configText = document.getElementById('configText');
     const openBtn = document.getElementById('openBtn');
@@ -198,7 +195,7 @@
     const session = {
       runId: 0,
       id: null,
-      status: 'idle', // idle | opening | open | finishing | finished | closing
+      status: 'idle',
       config: JSON.parse(JSON.stringify(defaultConfig)),
       streamAbortController: null,
     };
@@ -369,11 +366,101 @@
       return out;
     }
 
+    function deepClone(obj) {
+      return JSON.parse(JSON.stringify(obj ?? {}));
+    }
+
+    function pickNumber(v, fallback) {
+      return Number.isFinite(Number(v)) ? Number(v) : fallback;
+    }
+
+    function pickBool(v, fallback) {
+      return typeof v === 'boolean' ? v : fallback;
+    }
+
+    // Адаптирует:
+    // - старый `committer`
+    // - полный runtime config
+    // - response config из /session/open или /session/{id}
+    // И оставляет только разрешённые поля для /session/open.
+function sanitizeOpenConfig(raw) {
+  const src = deepClone(raw);
+
+  // Миграция со старого формата committer -> commit
+  if (src && src.committer && !src.commit) {
+    const c = src.committer || {};
+    src.commit = {
+      first: {
+        min_chars: pickNumber(c.soft_min_chars, 48),
+        target_chars: pickNumber(c.target_chars, 72),
+        max_chars: pickNumber(c.hard_max_chars, 96),
+        max_wait_ms: pickNumber(c.max_wait_ms, 180),
+        allow_partial_after_ms: pickNumber(c.allow_partial_after_ms, 260),
+      },
+      next: {
+        min_chars: Math.max(pickNumber(c.soft_min_chars, 140), 1),
+        target_chars: Math.max(pickNumber(c.target_chars, 180), 1),
+        max_chars: Math.max(pickNumber(c.hard_max_chars, 260), 1),
+        max_wait_ms: pickNumber(c.max_wait_ms, 420),
+        allow_partial_after_ms: Math.max(
+          pickNumber(c.allow_partial_after_ms, 700),
+          pickNumber(c.max_wait_ms, 420)
+        ),
+      }
+    };
+  }
+
+  const out = {};
+
+  const commit = src.commit || {};
+  const first = commit.first || {};
+  const next = commit.next || {};
+
+  out.commit = {
+    first: {
+      min_chars: pickNumber(first.min_chars, 48),
+      target_chars: pickNumber(first.target_chars, 72),
+      max_chars: pickNumber(first.max_chars, 96),
+      max_wait_ms: pickNumber(first.max_wait_ms, 180),
+      allow_partial_after_ms: pickNumber(first.allow_partial_after_ms, 260),
+    },
+    next: {
+      min_chars: pickNumber(next.min_chars, 140),
+      target_chars: pickNumber(next.target_chars, 180),
+      max_chars: pickNumber(next.max_chars, 260),
+      max_wait_ms: pickNumber(next.max_wait_ms, 420),
+      allow_partial_after_ms: pickNumber(next.allow_partial_after_ms, 700),
+    }
+  };
+
+  const tts = src.tts || {};
+  out.tts = {
+    reference_id: String(tts.reference_id ?? 'voice'),
+    max_new_tokens: pickNumber(tts.max_new_tokens, 128),
+    chunk_length: pickNumber(tts.chunk_length, 180),
+    top_p: pickNumber(tts.top_p, 0.8),
+    repetition_penalty: pickNumber(tts.repetition_penalty, 1.08),
+    temperature: pickNumber(tts.temperature, 0.75),
+    initial_stream_chunk_size: pickNumber(tts.initial_stream_chunk_size, 10),
+    stream_chunk_size: pickNumber(tts.stream_chunk_size, 8),
+  };
+
+  const playbackCfg = src.playback || {};
+  out.playback = {
+    target_emit_bytes: pickNumber(playbackCfg.target_emit_bytes, 6144),
+    start_buffer_ms: pickNumber(playbackCfg.start_buffer_ms, 120),
+    stop_grace_ms: pickNumber(playbackCfg.stop_grace_ms, 40),
+  };
+
+  return out;
+}
+
     function getConfigSafe() {
       try {
-        return JSON.parse(configText.value);
+        const parsed = JSON.parse(configText.value);
+        return sanitizeOpenConfig(parsed);
       } catch {
-        return session.config || defaultConfig;
+        return sanitizeOpenConfig(session.config || defaultConfig);
       }
     }
 
@@ -400,11 +487,8 @@
       }
 
       if (!resp.ok) {
-        const err = new Error(
-          typeof data === 'string'
-            ? data
-            : JSON.stringify(data?.detail ?? data ?? { status: resp.status })
-        );
+        const detail = data?.detail ?? data?.message ?? data ?? { status: resp.status };
+        const err = new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
         err.status = resp.status;
         err.data = data;
         throw err;
@@ -432,7 +516,6 @@
       playback.drainTimer = setTimeout(async () => {
         if (!isPlaybackContextActive(runId, sessionId)) return;
 
-        // Если в очереди внезапно ещё что-то накопилось — досchedule'им.
         if (playback.pendingChunks.length > 0) {
           await scheduleBufferedAudio(runId, sessionId, true);
           return;
@@ -733,9 +816,17 @@
       setSessionStatus('Открываем сессию...');
 
       try {
+        await ensureAudio();
+
         const parsed = JSON.parse(configText.value);
-        const payloadText = JSON.stringify(parsed, null, 2);
-        const data = await apiJson(`${BACKEND_BASE}/session/open`, 'POST', { config_text: payloadText });
+        const sanitized = sanitizeOpenConfig(parsed);
+
+        // Покажем пользователю, что реально отправляем на сервер.
+        configText.value = JSON.stringify(sanitized, null, 2);
+
+        const data = await apiJson(`${BACKEND_BASE}/session/open`, 'POST', {
+          config_text: JSON.stringify(sanitized)
+        });
 
         if (!isRunActive(runId)) {
           try {
@@ -748,6 +839,7 @@
         session.config = data.config;
         session.status = 'open';
 
+        // После открытия тут уже полный server-side config.
         configText.value = JSON.stringify(session.config, null, 2);
         sessionMeta.textContent = JSON.stringify({ ttl_sec: data.ttl_sec, config: session.config }, null, 2);
         setSessionStatus(`Session opened: ${session.id}`);
@@ -764,11 +856,13 @@
       }
     }
 
-    function startFakeStream() {
+    async function startFakeStream() {
       if (!session.id || session.status !== 'open') {
         setSessionStatus('Сначала открой сессию', true);
         return;
       }
+
+      await ensureAudio();
 
       stopFakeStream();
       clearVisualState();
@@ -896,7 +990,9 @@
       });
     });
 
-    simulateBtn.addEventListener('click', startFakeStream);
+    simulateBtn.addEventListener('click', () => {
+      startFakeStream().catch((e) => log(`fake stream start error: ${e.message}`));
+    });
 
     stopBtn.addEventListener('click', () => {
       stopFakeStream();

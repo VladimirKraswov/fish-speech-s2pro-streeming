@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# === scripts/up_5090.sh ===
+
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -34,6 +36,7 @@ FISH_CLEANUP_ON_ABORT="${FISH_CLEANUP_ON_ABORT:-1}"
 FISH_EMPTY_CACHE_PER_STREAM_CHUNK="${FISH_EMPTY_CACHE_PER_STREAM_CHUNK:-0}"
 FISH_EMPTY_CACHE_PER_SEGMENT="${FISH_EMPTY_CACHE_PER_SEGMENT:-0}"
 DEFAULT_REFERENCE_ID="${DEFAULT_REFERENCE_ID:-voice}"
+FISH_WARMUP_REFERENCE_ID="${FISH_WARMUP_REFERENCE_ID:-$DEFAULT_REFERENCE_ID}"
 SESSION_TTL_SEC="${SESSION_TTL_SEC:-1800}"
 SESSION_MAX_COUNT="${SESSION_MAX_COUNT:-128}"
 
@@ -58,6 +61,7 @@ echo "  PROXY_PORT=$PROXY_PORT"
 echo "  LLAMA_CHECKPOINTS_DIR=$LLAMA_CHECKPOINTS_DIR"
 echo "  DECODER_CHECKPOINT_PATH=$DECODER_CHECKPOINT_PATH"
 echo "  DEFAULT_REFERENCE_ID=$DEFAULT_REFERENCE_ID"
+echo "  FISH_WARMUP_REFERENCE_ID=$FISH_WARMUP_REFERENCE_ID"
 echo "  SESSION_TTL_SEC=$SESSION_TTL_SEC"
 echo
 
@@ -73,7 +77,14 @@ fi
 
 if [[ "$BUILD_IMAGE" == "1" ]] || ! docker_cmd image inspect "$IMAGE" >/dev/null 2>&1; then
   echo "[1/5] Building Docker image..."
-  docker_cmd build     --platform linux/amd64     -f docker/Dockerfile     --build-arg BACKEND=cuda     --build-arg CUDA_VER="$CUDA_VER"     --build-arg UV_EXTRA="$UV_EXTRA"     --target webui     -t "$IMAGE" .
+  docker_cmd build \
+    --platform linux/amd64 \
+    -f docker/Dockerfile \
+    --build-arg BACKEND=cuda \
+    --build-arg CUDA_VER="$CUDA_VER" \
+    --build-arg UV_EXTRA="$UV_EXTRA" \
+    --target webui \
+    -t "$IMAGE" .
 else
   echo "[1/5] Using existing image: $IMAGE"
 fi
@@ -89,8 +100,32 @@ else
 fi
 
 CID="$({
-  docker_cmd run -d --rm     --name "$CONTAINER"     -p "$PORT:8080"     --gpus all     -e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF"     -e FISH_CACHE_MAX_SEQ_LEN="$FISH_CACHE_MAX_SEQ_LEN"     -e FISH_MAX_NEW_TOKENS_CAP="$FISH_MAX_NEW_TOKENS_CAP"     -e FISH_CLEANUP_AFTER_REQUEST="$FISH_CLEANUP_AFTER_REQUEST"     -e FISH_CLEANUP_EVERY_N_REQUESTS="$FISH_CLEANUP_EVERY_N_REQUESTS"     -e FISH_CLEANUP_ON_ERROR="$FISH_CLEANUP_ON_ERROR"     -e FISH_CLEANUP_ON_ABORT="$FISH_CLEANUP_ON_ABORT"     -e FISH_EMPTY_CACHE_PER_STREAM_CHUNK="$FISH_EMPTY_CACHE_PER_STREAM_CHUNK"     -e FISH_EMPTY_CACHE_PER_SEGMENT="$FISH_EMPTY_CACHE_PER_SEGMENT"     -e PYTHONPATH=/workspace     -v "$REPO_ROOT":/workspace     -w /workspace     --entrypoint /app/.venv/bin/python     "$IMAGE"     /workspace/tools/api_server.py     --listen 0.0.0.0:8080     --device cuda     --llama-checkpoint-path "/workspace/$LLAMA_CHECKPOINTS_DIR"     --decoder-checkpoint-path "/workspace/$DECODER_CHECKPOINT_PATH"     "${COMPILE_ARG[@]}"
-} )"
+  docker_cmd run -d --rm \
+    --name "$CONTAINER" \
+    -p "$PORT:8080" \
+    --gpus all \
+    -e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF" \
+    -e FISH_CACHE_MAX_SEQ_LEN="$FISH_CACHE_MAX_SEQ_LEN" \
+    -e FISH_MAX_NEW_TOKENS_CAP="$FISH_MAX_NEW_TOKENS_CAP" \
+    -e FISH_CLEANUP_AFTER_REQUEST="$FISH_CLEANUP_AFTER_REQUEST" \
+    -e FISH_CLEANUP_EVERY_N_REQUESTS="$FISH_CLEANUP_EVERY_N_REQUESTS" \
+    -e FISH_CLEANUP_ON_ERROR="$FISH_CLEANUP_ON_ERROR" \
+    -e FISH_CLEANUP_ON_ABORT="$FISH_CLEANUP_ON_ABORT" \
+    -e FISH_EMPTY_CACHE_PER_STREAM_CHUNK="$FISH_EMPTY_CACHE_PER_STREAM_CHUNK" \
+    -e FISH_EMPTY_CACHE_PER_SEGMENT="$FISH_EMPTY_CACHE_PER_SEGMENT" \
+    -e FISH_WARMUP_REFERENCE_ID="$FISH_WARMUP_REFERENCE_ID" \
+    -e PYTHONPATH=/workspace \
+    -v "$REPO_ROOT":/workspace \
+    -w /workspace \
+    --entrypoint /app/.venv/bin/python \
+    "$IMAGE" \
+    /workspace/tools/api_server.py \
+    --listen 0.0.0.0:8080 \
+    --device cuda \
+    --llama-checkpoint-path "/workspace/$LLAMA_CHECKPOINTS_DIR" \
+    --decoder-checkpoint-path "/workspace/$DECODER_CHECKPOINT_PATH" \
+    "${COMPILE_ARG[@]}"
+})"
 
 echo "Container started: $CID"
 echo
@@ -127,7 +162,9 @@ echo "Model is healthy after $(( $(date +%s) - START_TS ))s"
 
 if [[ "$EXTRA_WARMUP" == "1" ]]; then
   echo "Sending one extra warmup streaming request..."
-  BASE_URL="http://127.0.0.1:${PORT}"   WARMUP_REFERENCE_ID="$DEFAULT_REFERENCE_ID"   bash "$REPO_ROOT/scripts/warmup_5090.sh"
+  BASE_URL="http://127.0.0.1:${PORT}" \
+  WARMUP_REFERENCE_ID="$FISH_WARMUP_REFERENCE_ID" \
+  bash "$REPO_ROOT/scripts/warmup_5090.sh"
 fi
 
 echo "Current model memory:"
@@ -137,7 +174,11 @@ echo
 
 if [[ "$START_PROXY" == "1" ]]; then
   echo "[5/5] Starting proxy..."
-  PROXY_PORT="$PROXY_PORT"   DEFAULT_REFERENCE_ID="$DEFAULT_REFERENCE_ID"   SESSION_TTL_SEC="$SESSION_TTL_SEC"   SESSION_MAX_COUNT="$SESSION_MAX_COUNT"   bash "$REPO_ROOT/scripts/run_proxy.sh"
+  PROXY_PORT="$PROXY_PORT" \
+  DEFAULT_REFERENCE_ID="$DEFAULT_REFERENCE_ID" \
+  SESSION_TTL_SEC="$SESSION_TTL_SEC" \
+  SESSION_MAX_COUNT="$SESSION_MAX_COUNT" \
+  bash "$REPO_ROOT/scripts/run_proxy.sh"
 fi
 
 echo

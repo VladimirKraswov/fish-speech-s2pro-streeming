@@ -57,6 +57,13 @@ def _env_flag(name: str, default: bool = False) -> bool:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
+def _use_sdpa_math() -> bool:
+    """
+    Do not implicitly force math attention just because torch.compile is enabled.
+    Enable it only explicitly via FISH_SDPA_MATH=1 when it is really needed as a fallback.
+    """
+    return _env_flag("FISH_SDPA_MATH", False)
+
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 torch._inductor.config.coordinate_descent_tuning = True
@@ -218,7 +225,6 @@ def decode_one_token_ar(
     del logits, hidden_states, forward_result
     return codebooks.T
 
-
 def decode_n_tokens(
     model: DualARTransformer,
     cur_token: torch.Tensor,
@@ -234,7 +240,6 @@ def decode_n_tokens(
     stream_chunk_size: Optional[int] = None,
     initial_stream_chunk_size: Optional[int] = None,
     initial_token_chunk: Optional[torch.Tensor] = None,
-    compile: bool = False,
 ) -> Iterator[torch.Tensor]:
     """
     Generate tokens autoregressively.
@@ -300,10 +305,7 @@ def decode_n_tokens(
                 input_pos.shape,
             )
         try:
-            use_math = compile or (
-                os.environ.get("FISH_SDPA_MATH", "").strip()
-                in ("1", "true", "TRUE", "yes", "YES")
-            )
+            use_math = _use_sdpa_math()
             if use_math:
                 with sdpa_kernel(SDPBackend.MATH):
                     next_token = decode_one_token(

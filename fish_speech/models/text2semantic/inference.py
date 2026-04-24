@@ -57,6 +57,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
+
 def _use_sdpa_math() -> bool:
     """
     Do not implicitly force math attention just because torch.compile is enabled.
@@ -225,6 +226,7 @@ def decode_one_token_ar(
     del logits, hidden_states, forward_result
     return codebooks.T
 
+
 def decode_n_tokens(
     model: DualARTransformer,
     cur_token: torch.Tensor,
@@ -240,6 +242,7 @@ def decode_n_tokens(
     stream_chunk_size: Optional[int] = None,
     initial_stream_chunk_size: Optional[int] = None,
     initial_token_chunk: Optional[torch.Tensor] = None,
+    compile: bool = False,
 ) -> Iterator[torch.Tensor]:
     """
     Generate tokens autoregressively.
@@ -252,6 +255,8 @@ def decode_n_tokens(
         so the browser/player has a safer startup buffer and starts playback earlier
         without underrun.
     """
+    _ = compile  # kept for API compatibility with generate()
+
     need_normal_state = stream_chunk_size is not None
     if need_normal_state:
         cur_token = cast(torch.Tensor, _to_normal_tensor(cur_token))

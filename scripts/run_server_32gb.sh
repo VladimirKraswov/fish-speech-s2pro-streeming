@@ -11,8 +11,16 @@ CONTAINER="${CONTAINER:-fish-speech}"
 PORT="${PORT:-8080}"
 COMPILE="${COMPILE:-0}"
 CHECKPOINTS_DIR="${CHECKPOINTS_DIR:-checkpoints/s2-pro}"
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+FISH_CACHE_MAX_SEQ_LEN="${FISH_CACHE_MAX_SEQ_LEN:-512}"
+FISH_MAX_NEW_TOKENS_CAP="${FISH_MAX_NEW_TOKENS_CAP:-160}"
+FISH_CLEANUP_AFTER_REQUEST="${FISH_CLEANUP_AFTER_REQUEST:-0}"
+FISH_CLEANUP_EVERY_N_REQUESTS="${FISH_CLEANUP_EVERY_N_REQUESTS:-0}"
+FISH_CLEANUP_ON_ERROR="${FISH_CLEANUP_ON_ERROR:-1}"
+FISH_CLEANUP_ON_ABORT="${FISH_CLEANUP_ON_ABORT:-1}"
+FISH_EMPTY_CACHE_PER_STREAM_CHUNK="${FISH_EMPTY_CACHE_PER_STREAM_CHUNK:-0}"
+FISH_EMPTY_CACHE_PER_SEGMENT="${FISH_EMPTY_CACHE_PER_SEGMENT:-0}"
 
-# When running from a parent repo: mount parent as /workspace so checkpoints and repo are both visible
 if [[ -n "${WORKSPACE_DIR:-}" ]]; then
   WORKSPACE_DIR="$(cd "$WORKSPACE_DIR" && pwd)"
   REPO_REL="$(python3 -c "import os; print(os.path.relpath('$REPO_ROOT', '$WORKSPACE_DIR'))")"
@@ -27,9 +35,8 @@ fi
 echo "=== Fish Speech API (32GB / RTX 5090 style) ==="
 echo "  MOUNT_ROOT=$MOUNT_ROOT  REPO_REL=$REPO_REL  CHECKPOINTS=$CHECKPOINTS_REL"
 echo "  IMAGE=$IMAGE  CONTAINER=$CONTAINER  PORT=$PORT  COMPILE=$COMPILE"
-echo ""
+echo
 
-# 1) Build image if not present (CUDA 12.9 for modern GPUs)
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   echo "Building image $IMAGE (this may take a while)..."
   docker build --platform linux/amd64 -f docker/Dockerfile \
@@ -43,7 +50,6 @@ else
   echo "Using existing image $IMAGE"
 fi
 
-# 2) Download checkpoints if missing (only when checkpoints live under repo)
 if [[ -z "${WORKSPACE_DIR:-}" ]]; then
   if [[ ! -d "$REPO_ROOT/$CHECKPOINTS_DIR" ]] || [[ -z "$(ls -A "$REPO_ROOT/$CHECKPOINTS_DIR" 2>/dev/null)" ]]; then
     echo "Downloading s2-pro checkpoints to $CHECKPOINTS_DIR ..."
@@ -65,17 +71,21 @@ else
   echo "Checkpoints found at $WORKSPACE_DIR/$CHECKPOINTS_DIR"
 fi
 
-# 3) Stop existing container if any
 docker rm -f "$CONTAINER" 2>/dev/null || true
 
-# 4) Run server
 echo "Starting server on port $PORT ..."
 docker run -d --rm --name "$CONTAINER" \
   -p "$PORT:8080" \
   --gpus all \
-  -e PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
-  -e FISH_CACHE_MAX_SEQ_LEN="${FISH_CACHE_MAX_SEQ_LEN:-512}" \
-  -e FISH_MAX_NEW_TOKENS_CAP="${FISH_MAX_NEW_TOKENS_CAP:-64}" \
+  -e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF" \
+  -e FISH_CACHE_MAX_SEQ_LEN="$FISH_CACHE_MAX_SEQ_LEN" \
+  -e FISH_MAX_NEW_TOKENS_CAP="$FISH_MAX_NEW_TOKENS_CAP" \
+  -e FISH_CLEANUP_AFTER_REQUEST="$FISH_CLEANUP_AFTER_REQUEST" \
+  -e FISH_CLEANUP_EVERY_N_REQUESTS="$FISH_CLEANUP_EVERY_N_REQUESTS" \
+  -e FISH_CLEANUP_ON_ERROR="$FISH_CLEANUP_ON_ERROR" \
+  -e FISH_CLEANUP_ON_ABORT="$FISH_CLEANUP_ON_ABORT" \
+  -e FISH_EMPTY_CACHE_PER_STREAM_CHUNK="$FISH_EMPTY_CACHE_PER_STREAM_CHUNK" \
+  -e FISH_EMPTY_CACHE_PER_SEGMENT="$FISH_EMPTY_CACHE_PER_SEGMENT" \
   -e PYTHONPATH=/workspace/"$REPO_REL" \
   -v "$MOUNT_ROOT":/workspace -w /workspace \
   --entrypoint /app/.venv/bin/python \
@@ -87,7 +97,7 @@ docker run -d --rm --name "$CONTAINER" \
   --decoder-checkpoint-path "/workspace/$CHECKPOINTS_REL/codec.pth" \
   $([ "$COMPILE" = "1" ] && echo --compile || true)
 
-echo ""
+echo
 echo "Server starting. With COMPILE=1, warmup runs at startup; then /v1/health returns 200."
 echo "  Health:  curl -s http://127.0.0.1:$PORT/v1/health"
 echo "  TTS:     curl -X POST http://127.0.0.1:$PORT/v1/tts -H 'Content-Type: application/json' -d '{\"text\":\"Hello\",\"streaming\":true}' --output out.wav"

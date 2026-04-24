@@ -4,7 +4,7 @@ Minimal Docker-based setup to run the TTS API server on a single GPU with ~32GB 
 
 ## What we did (32GB tuning summary)
 
-- **KV cache cap**: `FISH_CACHE_MAX_SEQ_LEN=384` and `FISH_MAX_NEW_TOKENS_CAP=80` to keep VRAM under ~32GB.
+- **KV cache cap**: `FISH_CACHE_MAX_SEQ_LEN=384` and `FISH_MAX_NEW_TOKENS_CAP=160` to keep VRAM under ~32GB.
 - **Memory between requests**: LLM `clear_caches()` after each request (KV cache released) plus `gc` / `empty_cache` so the second request does not OOM.
 - **Back-pressure**: LLM and DAC do not run in parallel; codes are passed on CPU to avoid holding extra tensors on GPU.
 - **Debug**: `/v1/debug/memory` returns allocated/reserved/max VRAM; optional `?dump=1` for PyTorch snapshot.

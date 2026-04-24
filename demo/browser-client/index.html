@@ -5,31 +5,69 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Fish Speech Session Stream Demo</title>
   <style>
-    body { font-family: system-ui, sans-serif; margin: 24px auto; max-width: 1240px; padding: 0 16px; }
+    body { font-family: system-ui, sans-serif; margin: 24px auto; max-width: 1240px; padding: 0 16px; background: #f6f7fb; color: #111; }
     h1 { margin: 0 0 8px; }
+    h3 { margin-top: 0; }
     .small { font-size: 13px; color: #555; }
     .grid { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 16px; margin-top: 16px; }
-    .card { border: 1px solid #ddd; border-radius: 12px; padding: 14px; background: #fff; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 14px; background: #fff; box-shadow: 0 2px 10px rgba(0,0,0,.03); }
     .row { display: flex; gap: 8px; flex-wrap: wrap; }
     .row > * { flex: 1 1 auto; }
     textarea, input, button { font: inherit; }
-    textarea, input[type="text"], input[type="number"] { width: 100%; box-sizing: border-box; padding: 10px; border-radius: 8px; border: 1px solid #ccc; }
+    textarea, input[type="text"], input[type="number"] {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 10px;
+      border-radius: 8px;
+      border: 1px solid #ccc;
+      background: #fff;
+    }
     textarea { min-height: 170px; resize: vertical; }
-    button { padding: 10px 14px; border: 1px solid #bbb; border-radius: 10px; background: #f7f7f7; cursor: pointer; }
+    button {
+      padding: 10px 14px;
+      border: 1px solid #bbb;
+      border-radius: 10px;
+      background: #f7f7f7;
+      cursor: pointer;
+      transition: .15s ease;
+    }
+    button:hover:not(:disabled) { background: #efefef; }
     button.primary { background: #111; color: #fff; border-color: #111; }
+    button.primary:hover:not(:disabled) { background: #222; }
     button:disabled { opacity: 0.55; cursor: default; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
     .pane { min-height: 120px; background: #fafafa; border: 1px solid #e5e5e5; border-radius: 10px; padding: 10px; }
     .status { margin-top: 10px; font-weight: 600; }
     .danger { color: #b00020; }
-    .chunk { padding: 8px 10px; border-radius: 8px; background: #f2f6ff; margin-bottom: 8px; border: 1px solid #d6e4ff; }
+    .chunk {
+      padding: 8px 10px;
+      border-radius: 8px;
+      background: #f2f6ff;
+      margin-bottom: 8px;
+      border: 1px solid #d6e4ff;
+    }
     .meta { color: #666; font-size: 12px; margin-bottom: 4px; }
     #log { min-height: 250px; background: #111; color: #ddd; }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      line-height: 18px;
+      background: #eef3ff;
+      color: #2850a7;
+      margin-left: 6px;
+      border: 1px solid #d7e4ff;
+    }
   </style>
 </head>
 <body>
   <h1>Fish Speech — session stream</h1>
-  <div class="small">Сессия теперь живёт на сервере: append → server-side commit → очередь TTS → единый audio stream. Фронт только открывает сессию, докидывает текст и слушает NDJSON-поток аудио.</div>
+  <div class="small">
+    Сессия живёт на сервере: append → server-side commit → очередь TTS → единый audio stream.
+    Фронт только открывает сессию, докидывает текст и слушает NDJSON-поток аудио.
+    <span id="audioBadge" class="badge">audio: idle</span>
+  </div>
 
   <div class="grid">
     <div class="card">
@@ -66,7 +104,9 @@
         <button id="stopBtn">Stop</button>
         <button id="flushBtn">Force flush</button>
       </div>
-      <div class="small" style="margin-top:8px;">Все incoming chunks уходят на <span class="mono">/session/{id}/append</span>. Коммит решает сервер.</div>
+      <div class="small" style="margin-top:8px;">
+        Все incoming chunks уходят на <span class="mono">/session/{id}/append</span>. Коммит решает сервер.
+      </div>
     </div>
   </div>
 
@@ -92,19 +132,19 @@
   </div>
 
   <script>
-    const BACKEND_BASE = 'http://127.0.0.1:9000';
+    const BACKEND_BASE = 'http://192.168.31.32:9000';
 
     const defaultConfig = {
       version: 1,
       committer: {
-        soft_min_chars: 40,
-        target_chars: 120,
-        hard_max_chars: 180,
+        soft_min_chars: 140,
+        target_chars: 220,
+        hard_max_chars: 320,
         flush_on_punctuation: true,
-        flush_on_clause_punctuation: true,
+        flush_on_clause_punctuation: false,
         flush_on_newline: true,
-        max_wait_ms: 900,
-        allow_partial_after_ms: 1400,
+        max_wait_ms: 1800,
+        allow_partial_after_ms: 3500,
         carry_incomplete_tail: true
       },
       tts: {
@@ -113,7 +153,7 @@
         normalize: true,
         use_memory_cache: 'on',
         seed: 1234,
-        max_new_tokens: 96,
+        max_new_tokens: 128,
         chunk_length: 200,
         top_p: 0.8,
         repetition_penalty: 1.1,
@@ -123,9 +163,9 @@
         stream_chunk_size: 8
       },
       playback: {
-        target_emit_bytes: 4096,
-        start_buffer_ms: 120,
-        stop_grace_ms: 150
+        target_emit_bytes: 16384,
+        start_buffer_ms: 450,
+        stop_grace_ms: 250
       },
       session: {
         max_buffer_chars: 4000,
@@ -151,23 +191,37 @@
     const lastEventPane = document.getElementById('lastEventPane');
     const committedList = document.getElementById('committedList');
     const logEl = document.getElementById('log');
+    const audioBadge = document.getElementById('audioBadge');
 
     configText.value = JSON.stringify(defaultConfig, null, 2);
 
-    let sessionId = null;
-    let activeConfig = structuredClone(defaultConfig);
+    const session = {
+      runId: 0,
+      id: null,
+      status: 'idle', // idle | opening | open | finishing | finished | closing
+      config: JSON.parse(JSON.stringify(defaultConfig)),
+      streamAbortController: null,
+    };
+
     let sourceOffset = 0;
     let incomingText = '';
     let pendingText = '';
     let simulateTimer = null;
-    let streamAbortController = null;
 
     let audioCtx = null;
-    let processor = null;
     let gainNode = null;
-    let pcmQueue = [];
-    let currentChunk = null;
-    let currentChunkOffset = 0;
+
+    const playback = {
+      runId: 0,
+      sessionId: null,
+      meta: null,
+      started: false,
+      pendingChunks: [],
+      pendingSamples: 0,
+      scheduledUntil: 0,
+      streamEnded: false,
+      drainTimer: null,
+    };
 
     function log(msg) {
       const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
@@ -186,6 +240,22 @@
       pendingPane.textContent = pendingText;
     }
 
+    function clearVisualState() {
+      sourceOffset = 0;
+      incomingText = '';
+      pendingText = '';
+      committedList.innerHTML = '';
+      lastEventPane.textContent = '';
+      renderState();
+    }
+
+    function escapeHtml(text) {
+      return String(text)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;');
+    }
+
     function addCommitted(item) {
       const box = document.createElement('div');
       box.className = 'chunk';
@@ -196,15 +266,73 @@
       committedList.prepend(box);
     }
 
-    function escapeHtml(text) {
-      return text
-        .replaceAll('&', '&amp;')
-        .replaceAll('<', '&lt;')
-        .replaceAll('>', '&gt;');
-    }
-
     function setLastEvent(obj) {
       lastEventPane.textContent = JSON.stringify(obj, null, 2);
+    }
+
+    function updateControls() {
+      const hasSession = !!session.id;
+      const isOpen = session.status === 'open';
+      const isFinishing = session.status === 'finishing';
+      const busyOpeningOrClosing = session.status === 'opening' || session.status === 'closing';
+
+      openBtn.disabled = busyOpeningOrClosing;
+      simulateBtn.disabled = !isOpen;
+      finishBtn.disabled = !isOpen;
+      flushBtn.disabled = !(isOpen || isFinishing);
+      stopBtn.disabled = !simulateTimer;
+      closeBtn.disabled = !hasSession && !busyOpeningOrClosing;
+    }
+
+    function updateAudioBadge(text) {
+      audioBadge.textContent = `audio: ${text}`;
+    }
+
+    function isRunActive(runId) {
+      return session.runId === runId;
+    }
+
+    function isSessionWritable(runId) {
+      return isRunActive(runId) && !!session.id && session.status === 'open';
+    }
+
+    function stopFakeStream() {
+      if (simulateTimer) {
+        clearTimeout(simulateTimer);
+        simulateTimer = null;
+      }
+      updateControls();
+    }
+
+    function abortStreamConnection() {
+      if (session.streamAbortController) {
+        try { session.streamAbortController.abort(); } catch {}
+        session.streamAbortController = null;
+      }
+    }
+
+    function clearDrainTimer() {
+      if (playback.drainTimer) {
+        clearTimeout(playback.drainTimer);
+        playback.drainTimer = null;
+      }
+    }
+
+    function resetPlaybackState(runId = session.runId, sessionId = session.id) {
+      clearDrainTimer();
+      playback.runId = runId;
+      playback.sessionId = sessionId;
+      playback.meta = null;
+      playback.started = false;
+      playback.pendingChunks = [];
+      playback.pendingSamples = 0;
+      playback.scheduledUntil = 0;
+      playback.streamEnded = false;
+      updateAudioBadge('idle');
+    }
+
+    function isPlaybackContextActive(runId, sessionId) {
+      return playback.runId === runId && playback.sessionId === sessionId;
     }
 
     async function ensureAudio() {
@@ -216,38 +344,9 @@
         gainNode.gain.value = 1.0;
         gainNode.connect(audioCtx.destination);
       }
-      if (!processor) {
-        processor = audioCtx.createScriptProcessor(2048, 0, 1);
-        processor.onaudioprocess = (event) => {
-          const out = event.outputBuffer.getChannelData(0);
-          out.fill(0);
-          let writePos = 0;
-
-          while (writePos < out.length) {
-            if (!currentChunk) {
-              if (pcmQueue.length === 0) break;
-              currentChunk = pcmQueue.shift();
-              currentChunkOffset = 0;
-            }
-
-            const remainingChunk = currentChunk.length - currentChunkOffset;
-            const remainingOut = out.length - writePos;
-            const n = Math.min(remainingChunk, remainingOut);
-
-            out.set(currentChunk.subarray(currentChunkOffset, currentChunkOffset + n), writePos);
-
-            currentChunkOffset += n;
-            writePos += n;
-
-            if (currentChunkOffset >= currentChunk.length) {
-              currentChunk = null;
-              currentChunkOffset = 0;
-            }
-          }
-        };
-        processor.connect(gainNode);
+      if (audioCtx.state !== 'running') {
+        await audioCtx.resume();
       }
-      await audioCtx.resume();
     }
 
     function base64ToUint8Array(base64) {
@@ -270,10 +369,12 @@
       return out;
     }
 
-    function resetAudioQueue() {
-      pcmQueue = [];
-      currentChunk = null;
-      currentChunkOffset = 0;
+    function getConfigSafe() {
+      try {
+        return JSON.parse(configText.value);
+      } catch {
+        return session.config || defaultConfig;
+      }
     }
 
     function randomChunkSize() {
@@ -282,56 +383,169 @@
       return min + Math.floor(Math.random() * (max - min + 1));
     }
 
-    async function apiJson(url, method = 'GET', body = null) {
+    async function apiJson(url, method = 'GET', body = null, signal = undefined) {
       const resp = await fetch(url, {
         method,
         headers: body ? { 'Content-Type': 'application/json' } : undefined,
-        body: body ? JSON.stringify(body) : undefined
+        body: body ? JSON.stringify(body) : undefined,
+        signal
       });
-      const data = await resp.json();
-      if (!resp.ok) {
-        throw new Error(JSON.stringify(data.detail ?? data));
+
+      const raw = await resp.text();
+      let data;
+      try {
+        data = raw ? JSON.parse(raw) : null;
+      } catch {
+        data = raw;
       }
+
+      if (!resp.ok) {
+        const err = new Error(
+          typeof data === 'string'
+            ? data
+            : JSON.stringify(data?.detail ?? data ?? { status: resp.status })
+        );
+        err.status = resp.status;
+        err.data = data;
+        throw err;
+      }
+
       return data;
     }
 
-    async function openSession() {
-      try {
-        const parsed = JSON.parse(configText.value);
-        const payloadText = JSON.stringify(parsed, null, 2);
-        const data = await apiJson(`${BACKEND_BASE}/session/open`, 'POST', { config_text: payloadText });
-        sessionId = data.session_id;
-        activeConfig = data.config;
-        configText.value = JSON.stringify(activeConfig, null, 2);
-        setSessionStatus(`Session opened: ${sessionId}`);
-        sessionMeta.textContent = JSON.stringify({ ttl_sec: data.ttl_sec, config: activeConfig }, null, 2);
-        log(`session opened id=${sessionId}`);
-        await connectSessionStream();
-      } catch (e) {
-        setSessionStatus(`Open failed: ${e.message}`, true);
+    function armPlaybackDrainCheck(runId, sessionId) {
+      clearDrainTimer();
+
+      if (!isPlaybackContextActive(runId, sessionId) || !playback.streamEnded) {
+        return;
       }
+
+      const cfg = session.config || defaultConfig;
+      const graceMs = Number(cfg?.playback?.stop_grace_ms || 0);
+      const now = audioCtx ? audioCtx.currentTime : 0;
+      const remainingMs = playback.started
+        ? Math.max(0, (playback.scheduledUntil - now) * 1000)
+        : 0;
+
+      const waitMs = remainingMs + graceMs;
+
+      playback.drainTimer = setTimeout(async () => {
+        if (!isPlaybackContextActive(runId, sessionId)) return;
+
+        // Если в очереди внезапно ещё что-то накопилось — досchedule'им.
+        if (playback.pendingChunks.length > 0) {
+          await scheduleBufferedAudio(runId, sessionId, true);
+          return;
+        }
+
+        if (playback.started && audioCtx && playback.scheduledUntil > audioCtx.currentTime + 0.03) {
+          armPlaybackDrainCheck(runId, sessionId);
+          return;
+        }
+
+        updateAudioBadge('done');
+
+        if (isRunActive(runId) && session.id === sessionId) {
+          session.status = 'finished';
+          setSessionStatus(`Session finished: ${sessionId}`);
+          updateControls();
+        }
+
+        log(`playback drained sid=${sessionId}`);
+      }, waitMs);
     }
 
-    async function connectSessionStream() {
-      if (!sessionId) return;
-      if (streamAbortController) {
-        try { streamAbortController.abort(); } catch {}
+    async function scheduleBufferedAudio(runId, sessionId, force = false) {
+      if (!isPlaybackContextActive(runId, sessionId)) return;
+      if (!playback.meta) return;
+      if (playback.pendingChunks.length === 0) {
+        armPlaybackDrainCheck(runId, sessionId);
+        return;
       }
-      streamAbortController = new AbortController();
-      resetAudioQueue();
+
       await ensureAudio();
 
-      const resp = await fetch(`${BACKEND_BASE}/session/${sessionId}/pcm-stream`, {
-        method: 'GET',
-        signal: streamAbortController.signal,
-        cache: 'no-store'
-      });
+      const cfg = session.config || defaultConfig;
+      const sr = playback.meta.sample_rate;
+      const pendingMs = (playback.pendingSamples / sr) * 1000;
+
+      if (!playback.started) {
+        if (!force && pendingMs < Number(cfg.playback?.start_buffer_ms || 0)) {
+          updateAudioBadge(`buffering ${pendingMs.toFixed(0)}ms`);
+          return;
+        }
+        playback.started = true;
+        playback.scheduledUntil = Math.max(audioCtx.currentTime + 0.05, playback.scheduledUntil || 0);
+        updateAudioBadge(`playing @${sr}Hz`);
+        log(`audio playback started sid=${sessionId} buffered=${pendingMs.toFixed(0)}ms sr=${sr}`);
+      } else {
+        playback.scheduledUntil = Math.max(playback.scheduledUntil, audioCtx.currentTime + 0.02);
+      }
+
+      while (playback.pendingChunks.length > 0) {
+        if (!isPlaybackContextActive(runId, sessionId)) return;
+
+        const chunk = playback.pendingChunks.shift();
+        playback.pendingSamples -= chunk.length;
+
+        const buffer = audioCtx.createBuffer(1, chunk.length, sr);
+        buffer.copyToChannel(chunk, 0);
+
+        const src = audioCtx.createBufferSource();
+        src.buffer = buffer;
+        src.connect(gainNode);
+        src.start(playback.scheduledUntil);
+
+        playback.scheduledUntil += buffer.duration;
+      }
+
+      armPlaybackDrainCheck(runId, sessionId);
+    }
+
+    async function handlePcmEvent(event, runId, sessionId) {
+      if (!isPlaybackContextActive(runId, sessionId)) return;
+      if (!playback.meta) {
+        log('pcm arrived before meta; dropped');
+        return;
+      }
+
+      const bytes = base64ToUint8Array(event.data);
+      const floatChunk = pcm16ToFloat32(bytes);
+
+      playback.pendingChunks.push(floatChunk);
+      playback.pendingSamples += floatChunk.length;
+
+      await scheduleBufferedAudio(runId, sessionId, false);
+    }
+
+    async function connectSessionStream(sessionId, runId) {
+      if (!isRunActive(runId) || session.id !== sessionId) return;
+
+      abortStreamConnection();
+      resetPlaybackState(runId, sessionId);
+      await ensureAudio();
+
+      const controller = new AbortController();
+      session.streamAbortController = controller;
+
+      let resp;
+      try {
+        resp = await fetch(`${BACKEND_BASE}/session/${sessionId}/pcm-stream`, {
+          method: 'GET',
+          signal: controller.signal,
+          cache: 'no-store'
+        });
+      } catch (e) {
+        if (controller.signal.aborted || !isRunActive(runId)) return;
+        throw e;
+      }
 
       if (!resp.ok || !resp.body) {
         throw new Error(`stream open failed status=${resp.status}`);
       }
 
-      log(`session audio stream connected`);
+      log(`session audio stream connected sid=${sessionId}`);
+
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
       let textBuf = '';
@@ -341,11 +555,18 @@
           while (true) {
             const { value, done } = await reader.read();
             if (done) break;
+
+            if (!isRunActive(runId) || session.id !== sessionId) {
+              try { await reader.cancel(); } catch {}
+              break;
+            }
+
             textBuf += decoder.decode(value, { stream: true });
 
             while (true) {
               const idx = textBuf.indexOf('\n');
               if (idx === -1) break;
+
               const line = textBuf.slice(0, idx).trim();
               textBuf = textBuf.slice(idx + 1);
               if (!line) continue;
@@ -358,55 +579,121 @@
                 continue;
               }
 
+              if (!isRunActive(runId) || session.id !== sessionId) {
+                break;
+              }
+
               setLastEvent(event);
 
               if (event.type === 'session_start') {
+                updateAudioBadge('stream connected');
                 log(`session stream started`);
               } else if (event.type === 'meta') {
+                playback.meta = {
+                  sample_rate: event.sample_rate,
+                  channels: event.channels,
+                  sample_width: event.sample_width
+                };
+                updateAudioBadge(`meta ${event.sample_rate}Hz`);
                 log(`audio meta sr=${event.sample_rate} ch=${event.channels}`);
               } else if (event.type === 'commit_start') {
                 log(`tts commit_start #${event.commit_seq}`);
               } else if (event.type === 'pcm') {
-                const bytes = base64ToUint8Array(event.data);
-                pcmQueue.push(pcm16ToFloat32(bytes));
+                await handlePcmEvent(event, runId, sessionId);
               } else if (event.type === 'commit_done') {
                 log(`tts commit_done #${event.commit_seq}`);
               } else if (event.type === 'session_done') {
+                playback.streamEnded = true;
+                await scheduleBufferedAudio(runId, sessionId, true);
+                armPlaybackDrainCheck(runId, sessionId);
+
+                if (isRunActive(runId) && session.id === sessionId) {
+                  session.status = 'finishing';
+                  setSessionStatus(`Audio tail draining: ${sessionId}`);
+                  updateControls();
+                }
+
                 log(`session_done commits=${event.commit_count}`);
               } else if (event.type === 'session_aborted') {
+                playback.streamEnded = true;
+                await scheduleBufferedAudio(runId, sessionId, true);
+                armPlaybackDrainCheck(runId, sessionId);
+
+                if (isRunActive(runId) && session.id === sessionId) {
+                  session.status = 'finishing';
+                  setSessionStatus(`Session aborted, draining tail: ${sessionId}`, true);
+                  updateControls();
+                }
+
                 log(`session_aborted`);
               } else if (event.type === 'error') {
                 log(`stream error: ${event.message}`);
               }
             }
           }
-          log(`session audio stream finished`);
+
+          if (isRunActive(runId) && session.id === sessionId) {
+            log(`session audio stream finished`);
+          }
         } catch (e) {
-          if (streamAbortController?.signal.aborted) {
+          if (controller.signal.aborted) {
             log(`session audio stream aborted`);
           } else {
             log(`session audio stream error: ${e}`);
+            if (isRunActive(runId) && session.id === sessionId) {
+              setSessionStatus(`Stream error: ${e.message || e}`, true);
+            }
+          }
+        } finally {
+          if (isRunActive(runId) && session.streamAbortController === controller) {
+            session.streamAbortController = null;
+            updateControls();
           }
         }
       })();
     }
 
-    async function appendTextChunk(chunk) {
-      const data = await apiJson(`${BACKEND_BASE}/session/${sessionId}/append`, 'POST', { text: chunk });
-      pendingText = data.buffer_text || '';
-      renderState();
+    async function appendTextChunk(chunk, runId) {
+      if (!isSessionWritable(runId)) return false;
 
-      for (const item of (data.committed || [])) {
-        addCommitted(item);
-        log(`committed #${item.seq} reason=${item.reason} len=${item.text.length}`);
+      try {
+        const sid = session.id;
+        const data = await apiJson(`${BACKEND_BASE}/session/${sid}/append`, 'POST', { text: chunk });
+
+        if (!isRunActive(runId) || session.id !== sid) return false;
+
+        pendingText = data.buffer_text || '';
+        renderState();
+
+        for (const item of (data.committed || [])) {
+          addCommitted(item);
+          log(`committed #${item.seq} reason=${item.reason} len=${item.text.length}`);
+        }
+
+        return true;
+      } catch (e) {
+        if (!isRunActive(runId)) return false;
+
+        if (e.status === 409) {
+          stopFakeStream();
+          session.status = 'finished';
+          setSessionStatus(`Session closed for append: ${session.id}`, true);
+          updateControls();
+          log(`append rejected with 409; stop sending more chunks`);
+          return false;
+        }
+
+        log(`append error: ${e.message}`);
+        return false;
       }
     }
 
-    function scheduleNextChunk() {
-      if (!sessionId) return;
+    async function tickFakeStream(runId) {
+      if (!isSessionWritable(runId)) return;
+
       const fullText = sourceText.value;
       if (sourceOffset >= fullText.length) {
-        finishInput();
+        await finishInput(runId);
         return;
       }
 
@@ -416,86 +703,190 @@
       incomingText += chunk;
       renderState();
 
-      appendTextChunk(chunk).catch((e) => log(`append error: ${e.message}`));
+      const ok = await appendTextChunk(chunk, runId);
+      if (!ok) return;
+
+      if (!isSessionWritable(runId)) return;
 
       const interval = Math.max(10, Number(fakeIntervalEl.value || 90));
-      simulateTimer = setTimeout(scheduleNextChunk, interval);
+      simulateTimer = setTimeout(() => {
+        tickFakeStream(runId).catch((e) => log(`fake tick error: ${e.message}`));
+      }, interval);
+      updateControls();
+    }
+
+    async function openSession() {
+      if (session.id) {
+        await closeSession({ silent: true });
+      }
+
+      stopFakeStream();
+      abortStreamConnection();
+      resetPlaybackState();
+      clearVisualState();
+
+      const runId = session.runId + 1;
+      session.runId = runId;
+      session.status = 'opening';
+      session.id = null;
+      updateControls();
+      setSessionStatus('Открываем сессию...');
+
+      try {
+        const parsed = JSON.parse(configText.value);
+        const payloadText = JSON.stringify(parsed, null, 2);
+        const data = await apiJson(`${BACKEND_BASE}/session/open`, 'POST', { config_text: payloadText });
+
+        if (!isRunActive(runId)) {
+          try {
+            await apiJson(`${BACKEND_BASE}/session/close`, 'POST', { session_id: data.session_id });
+          } catch {}
+          return;
+        }
+
+        session.id = data.session_id;
+        session.config = data.config;
+        session.status = 'open';
+
+        configText.value = JSON.stringify(session.config, null, 2);
+        sessionMeta.textContent = JSON.stringify({ ttl_sec: data.ttl_sec, config: session.config }, null, 2);
+        setSessionStatus(`Session opened: ${session.id}`);
+        updateControls();
+
+        log(`session opened id=${session.id}`);
+        await connectSessionStream(session.id, runId);
+      } catch (e) {
+        if (!isRunActive(runId)) return;
+        session.status = 'idle';
+        session.id = null;
+        updateControls();
+        setSessionStatus(`Open failed: ${e.message}`, true);
+      }
     }
 
     function startFakeStream() {
-      if (!sessionId) {
+      if (!session.id || session.status !== 'open') {
         setSessionStatus('Сначала открой сессию', true);
         return;
       }
-      stopFakeStream();
-      sourceOffset = 0;
-      incomingText = '';
-      pendingText = '';
-      committedList.innerHTML = '';
-      renderState();
-      log('fake stream started');
-      scheduleNextChunk();
-    }
 
-    function stopFakeStream() {
-      if (simulateTimer) clearTimeout(simulateTimer);
-      simulateTimer = null;
+      stopFakeStream();
+      clearVisualState();
+
+      const runId = session.runId;
+      log(`fake stream started run=${runId} sid=${session.id}`);
+      tickFakeStream(runId).catch((e) => log(`fake stream error: ${e.message}`));
+      updateControls();
     }
 
     async function forceFlush() {
-      if (!sessionId) return;
+      if (!session.id) return;
+      if (!(session.status === 'open' || session.status === 'finishing')) return;
+
+      const runId = session.runId;
+      const sid = session.id;
+
       try {
-        const data = await apiJson(`${BACKEND_BASE}/session/${sessionId}/flush`, 'POST', { reason: 'manual_flush' });
+        const data = await apiJson(`${BACKEND_BASE}/session/${sid}/flush`, 'POST', { reason: 'manual_flush' });
+        if (!isRunActive(runId) || session.id !== sid) return;
+
         pendingText = data.buffer_text || '';
         renderState();
+
         for (const item of (data.committed || [])) {
           addCommitted(item);
           log(`manual commit #${item.seq} reason=${item.reason} len=${item.text.length}`);
         }
       } catch (e) {
+        if (e.status === 409) {
+          session.status = 'finished';
+          setSessionStatus(`Flush rejected: session finished`, true);
+          updateControls();
+          return;
+        }
         log(`flush error: ${e.message}`);
       }
     }
 
-    async function finishInput() {
-      if (!sessionId) return;
+    async function finishInput(runId = session.runId) {
+      if (!isRunActive(runId)) return;
+      if (!session.id) return;
+      if (session.status !== 'open') return;
+
       stopFakeStream();
+
+      const sid = session.id;
+      session.status = 'finishing';
+      setSessionStatus(`Input finished, waiting audio: ${sid}`);
+      updateControls();
+
       try {
-        const data = await apiJson(`${BACKEND_BASE}/session/${sessionId}/finish`, 'POST', { reason: 'input_finished' });
+        const data = await apiJson(`${BACKEND_BASE}/session/${sid}/finish`, 'POST', { reason: 'input_finished' });
+
+        if (!isRunActive(runId) || session.id !== sid) return;
+
         pendingText = data.buffer_text || '';
         renderState();
+
         for (const item of (data.committed || [])) {
           addCommitted(item);
           log(`finish commit #${item.seq} reason=${item.reason} len=${item.text.length}`);
         }
-        log('input finished');
+
+        log(`input finished sid=${sid}`);
       } catch (e) {
+        if (!isRunActive(runId)) return;
+
+        if (e.status === 409) {
+          session.status = 'finished';
+          setSessionStatus(`Finish ignored: session already closed`, true);
+          updateControls();
+          log(`finish got 409; session already closed`);
+          return;
+        }
+
+        session.status = 'open';
+        updateControls();
         log(`finish error: ${e.message}`);
       }
     }
 
-    async function closeSession() {
+    async function closeSession({ silent = false } = {}) {
       stopFakeStream();
-      if (streamAbortController) {
-        try { streamAbortController.abort(); } catch {}
-        streamAbortController = null;
-      }
-      resetAudioQueue();
+      abortStreamConnection();
+      resetPlaybackState();
 
-      if (!sessionId) {
-        setSessionStatus('Сессия уже закрыта');
+      const sid = session.id;
+      if (!sid) {
+        session.status = 'idle';
+        updateControls();
+        if (!silent) setSessionStatus('Сессия уже закрыта');
         return;
       }
 
+      const runId = session.runId + 1;
+      session.runId = runId;
+      session.status = 'closing';
+      session.id = null;
+      updateControls();
+
+      if (!silent) {
+        setSessionStatus(`Закрываем сессию: ${sid}...`);
+      }
+
       try {
-        const data = await apiJson(`${BACKEND_BASE}/session/close`, 'POST', { session_id: sessionId });
-        log(`session closed`);
-        setSessionStatus(`Session closed: ${data.closed ? 'ok' : 'not found'}`);
+        const data = await apiJson(`${BACKEND_BASE}/session/close`, 'POST', { session_id: sid });
+        log(`session closed sid=${sid} closed=${!!data?.closed}`);
       } catch (e) {
         log(`close error: ${e.message}`);
       } finally {
-        sessionId = null;
+        if (!isRunActive(runId)) return;
+        session.status = 'idle';
         sessionMeta.textContent = '';
+        updateControls();
+        if (!silent) {
+          setSessionStatus(`Session closed: ${sid}`);
+        }
       }
     }
 
@@ -506,10 +897,27 @@
     });
 
     simulateBtn.addEventListener('click', startFakeStream);
-    stopBtn.addEventListener('click', stopFakeStream);
-    flushBtn.addEventListener('click', forceFlush);
-    finishBtn.addEventListener('click', finishInput);
-    closeBtn.addEventListener('click', closeSession);
+
+    stopBtn.addEventListener('click', () => {
+      stopFakeStream();
+      log('fake stream stopped');
+    });
+
+    flushBtn.addEventListener('click', () => {
+      forceFlush().catch((e) => log(`flush error: ${e.message}`));
+    });
+
+    finishBtn.addEventListener('click', () => {
+      finishInput().catch((e) => log(`finish error: ${e.message}`));
+    });
+
+    closeBtn.addEventListener('click', () => {
+      closeSession().catch((e) => log(`close error: ${e.message}`));
+    });
+
+    renderState();
+    updateControls();
+    updateAudioBadge('idle');
   </script>
 </body>
 </html>

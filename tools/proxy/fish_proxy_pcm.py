@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import asyncio
@@ -29,7 +28,7 @@ SESSION_MAX_COUNT = int(os.environ.get("SESSION_MAX_COUNT", "128"))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("fish-proxy")
 
-app = FastAPI(title="Fish Speech PCM Proxy", version="0.9.0")
+app = FastAPI(title="Fish Speech PCM Proxy", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,14 +44,14 @@ CLAUSE_BOUNDARY_RE = re.compile(r'.+?[,:;—\-](?:\s+|$)', re.S)
 class CommitterConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    soft_min_chars: int = Field(40, ge=1, le=500)
-    target_chars: int = Field(120, ge=1, le=800)
-    hard_max_chars: int = Field(180, ge=1, le=1200)
+    soft_min_chars: int = Field(140, ge=1, le=500)
+    target_chars: int = Field(220, ge=1, le=800)
+    hard_max_chars: int = Field(320, ge=1, le=1200)
     flush_on_punctuation: bool = True
-    flush_on_clause_punctuation: bool = True
+    flush_on_clause_punctuation: bool = False
     flush_on_newline: bool = True
-    max_wait_ms: int = Field(900, ge=50, le=20_000)
-    allow_partial_after_ms: int = Field(1400, ge=50, le=60_000)
+    max_wait_ms: int = Field(1800, ge=50, le=20_000)
+    allow_partial_after_ms: int = Field(3500, ge=50, le=60_000)
     carry_incomplete_tail: bool = True
 
     @model_validator(mode="after")
@@ -74,7 +73,7 @@ class TTSConfig(BaseModel):
     normalize: bool = True
     use_memory_cache: str = Field("on")
     seed: int | None = None
-    max_new_tokens: int = Field(96, ge=1, le=512)
+    max_new_tokens: int = Field(128, ge=1, le=512)
     chunk_length: int = Field(200, ge=100, le=300)
     top_p: float = Field(0.8, ge=0.1, le=1.0)
     repetition_penalty: float = Field(1.1, ge=0.9, le=2.0)
@@ -109,9 +108,9 @@ class TTSConfig(BaseModel):
 class PlaybackConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    target_emit_bytes: int = Field(4096, ge=512, le=32768)
-    start_buffer_ms: int = Field(120, ge=0, le=5000)
-    stop_grace_ms: int = Field(150, ge=0, le=5000)
+    target_emit_bytes: int = Field(16384, ge=512, le=32768)
+    start_buffer_ms: int = Field(450, ge=0, le=5000)
+    stop_grace_ms: int = Field(250, ge=0, le=5000)
 
     @field_validator("target_emit_bytes")
     @classmethod
@@ -165,14 +164,6 @@ class SessionFlushRequest(BaseModel):
 class SessionFinishRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     reason: str = Field("input_finished", min_length=1, max_length=200)
-
-
-@dataclass
-class CommitItem:
-    seq: int
-    text: str
-    reason: str
-    created_at: float
 
 
 @dataclass
@@ -389,6 +380,21 @@ def _normalize_tail_after_commit(text: str) -> str:
     return text.lstrip()
 
 
+def _pcm_bytes_for_duration_ms(
+    sample_rate: int,
+    channels: int,
+    bits_per_sample: int,
+    duration_ms: int,
+) -> int:
+    if duration_ms <= 0:
+        return 0
+    bytes_per_second = sample_rate * channels * (bits_per_sample // 8)
+    raw = int(bytes_per_second * (duration_ms / 1000.0))
+    if raw % 2 != 0:
+        raw += 1
+    return raw
+
+
 def _last_boundary_before(text: str, limit: int, *, include_clause: bool, include_newline: bool) -> tuple[int, str] | None:
     candidates: list[tuple[int, str]] = []
 
@@ -447,7 +453,6 @@ def _extract_commits(
         reason = None
         end = None
 
-        # Prefer a complete sentence around target size.
         sentence_boundary = _last_boundary_before(
             text,
             cfg.target_chars,
@@ -710,18 +715,32 @@ async def session_pcm_stream(session_id: str):
         pending_pcm = bytearray()
         header_sent = rec.audio_meta is not None
         upstream_bytes = 0
+        first_emit_done = False
+        start_buffer_bytes = 0
 
         async def flush_pending(force: bool = False) -> AsyncGenerator[bytes, None]:
-            while len(pending_pcm) >= target_emit_bytes or (force and pending_pcm):
-                if len(pending_pcm) >= target_emit_bytes:
-                    out = bytes(pending_pcm[:target_emit_bytes])
-                    del pending_pcm[:target_emit_bytes]
+            nonlocal first_emit_done
+            while True:
+                if not pending_pcm:
+                    return
+
+                threshold = target_emit_bytes
+                if not first_emit_done:
+                    threshold = max(target_emit_bytes, start_buffer_bytes)
+
+                if not force and len(pending_pcm) < threshold:
+                    return
+
+                if len(pending_pcm) >= threshold:
+                    out = bytes(pending_pcm[:threshold])
+                    del pending_pcm[:threshold]
                 else:
                     out = bytes(pending_pcm)
                     pending_pcm.clear()
 
                 pcm_seq = rec.next_pcm_seq
                 rec.next_pcm_seq += 1
+                first_emit_done = True
                 yield await emit(
                     {
                         "type": "pcm",
@@ -779,6 +798,14 @@ async def session_pcm_stream(session_id: str):
                             "channels": channels,
                             "sample_width": bits_per_sample // 8,
                         }
+                        start_buffer_bytes = _pcm_bytes_for_duration_ms(
+                            sample_rate,
+                            channels,
+                            bits_per_sample,
+                            config.playback.start_buffer_ms,
+                        )
+                        if start_buffer_bytes % 2 != 0:
+                            start_buffer_bytes += 1
                         header_sent = True
                         yield await emit(
                             {
@@ -800,6 +827,9 @@ async def session_pcm_stream(session_id: str):
                         pending_pcm.extend(chunk)
                         async for event in flush_pending(force=False):
                             yield event
+
+        if config.playback.stop_grace_ms > 0:
+            await asyncio.sleep(config.playback.stop_grace_ms / 1000.0)
 
         async for event in flush_pending(force=True):
             yield event
@@ -889,7 +919,6 @@ async def session_pcm_stream(session_id: str):
     )
 
 
-# Optional stateless single-shot route remains handy for debugging.
 @app.get("/pcm-stream")
 async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
     config = SessionConfig()
@@ -905,13 +934,22 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
         pending_pcm = bytearray()
         header_sent = False
         pcm_seq = 1
+        start_buffer_bytes = 0
+        first_emit_done = False
 
         async def flush_pending(force: bool = False) -> AsyncGenerator[bytes, None]:
-            nonlocal pcm_seq
-            while len(pending_pcm) >= target_emit_bytes or (force and pending_pcm):
-                if len(pending_pcm) >= target_emit_bytes:
-                    out = bytes(pending_pcm[:target_emit_bytes])
-                    del pending_pcm[:target_emit_bytes]
+            nonlocal pcm_seq, first_emit_done
+            while True:
+                if not pending_pcm:
+                    return
+                threshold = target_emit_bytes
+                if not first_emit_done:
+                    threshold = max(target_emit_bytes, start_buffer_bytes)
+                if not force and len(pending_pcm) < threshold:
+                    return
+                if len(pending_pcm) >= threshold:
+                    out = bytes(pending_pcm[:threshold])
+                    del pending_pcm[:threshold]
                 else:
                     out = bytes(pending_pcm)
                     pending_pcm.clear()
@@ -924,6 +962,7 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
                     }
                 )
                 pcm_seq += 1
+                first_emit_done = True
 
         yield await emit({"type": "proxy_start", "req_id": req_id, "mode": "stateless"})
         async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
@@ -942,6 +981,14 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
                             continue
                         sample_rate, channels, bits_per_sample, data_offset = parsed
                         header_sent = True
+                        start_buffer_bytes = _pcm_bytes_for_duration_ms(
+                            sample_rate,
+                            channels,
+                            bits_per_sample,
+                            config.playback.start_buffer_ms,
+                        )
+                        if start_buffer_bytes % 2 != 0:
+                            start_buffer_bytes += 1
                         yield await emit(
                             {
                                 "type": "meta",
@@ -962,6 +1009,8 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
                         async for event in flush_pending():
                             yield event
 
+        if config.playback.stop_grace_ms > 0:
+            await asyncio.sleep(config.playback.stop_grace_ms / 1000.0)
         async for event in flush_pending(force=True):
             yield event
         yield await emit({"type": "done", "req_id": req_id})

@@ -1,4 +1,3 @@
-# scripts/warmup_5090.sh
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -40,7 +39,7 @@ echo "Using warmup reference: $WARMUP_REFERENCE_ID"
 
 curl -sf -X POST "$BASE_URL/v1/tts" \
   -H 'Content-Type: application/json' \
-  -d "{\"text\":\"${WARMUP_TEXT}\",\"streaming\":true,\"reference_id\":\"${WARMUP_REFERENCE_ID}\"}" \
+  -d "{\"text\":\"${WARMUP_TEXT}\",\"streaming\":true,\"stream_tokens\":true,\"reference_id\":\"${WARMUP_REFERENCE_ID}\",\"max_new_tokens\":96,\"chunk_length\":200,\"initial_stream_chunk_size\":18,\"stream_chunk_size\":8}" \
   --output "$OUT_FILE" \
   --max-time 180 >/dev/null
 

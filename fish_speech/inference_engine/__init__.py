@@ -2,6 +2,7 @@
 import gc
 import os
 import queue
+import threading
 import time
 from typing import Generator
 
@@ -16,10 +17,16 @@ from fish_speech.models.dac.modded_dac import DAC
 from fish_speech.models.text2semantic.inference import (
     GenerateRequest,
     GenerateResponse,
-    WrappedGenerateResponse,
 )
 from fish_speech.utils import autocast_exclude_mps, set_seed
 from fish_speech.utils.schema import ServeTTSRequest
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 class TTSInferenceEngine(ReferenceLoader, VQManager):
@@ -36,6 +43,63 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         self.decoder_model = decoder_model
         self.precision = precision
         self.compile = compile
+
+        # Keep the model "hot" between short session commits by default.
+        # You can re-enable aggressive cleanup with env vars if your VRAM budget is tighter.
+        self.cleanup_after_request = _env_flag("FISH_CLEANUP_AFTER_REQUEST", False)
+        self.cleanup_on_abort = _env_flag("FISH_CLEANUP_ON_ABORT", True)
+        self.empty_cache_per_segment = _env_flag("FISH_EMPTY_CACHE_PER_SEGMENT", False)
+        self.cleanup_every_n_requests = max(
+            0, int(os.getenv("FISH_CLEANUP_EVERY_N_REQUESTS", "0") or "0")
+        )
+        self._success_since_cleanup = 0
+        self._cleanup_lock = threading.Lock()
+
+    def _cuda_cleanup(self, *, reason: str) -> None:
+        if not torch.cuda.is_available():
+            return
+
+        with self._cleanup_lock:
+            before_alloc = round(torch.cuda.memory_allocated() / (1024**3), 2)
+            before_reserved = round(torch.cuda.memory_reserved() / (1024**3), 2)
+            logger.info(
+                "cuda cleanup start reason={} alloc_gb={} reserved_gb={}",
+                reason,
+                before_alloc,
+                before_reserved,
+            )
+
+            gc.collect()
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            after_alloc = round(torch.cuda.memory_allocated() / (1024**3), 2)
+            after_reserved = round(torch.cuda.memory_reserved() / (1024**3), 2)
+            logger.info(
+                "cuda cleanup done reason={} alloc_gb={} reserved_gb={}",
+                reason,
+                after_alloc,
+                after_reserved,
+            )
+            self._success_since_cleanup = 0
+
+    def _maybe_cleanup_after_success(self) -> None:
+        if not torch.cuda.is_available():
+            return
+
+        self._success_since_cleanup += 1
+        should_cleanup = self.cleanup_after_request
+        if (
+            not should_cleanup
+            and self.cleanup_every_n_requests > 0
+            and self._success_since_cleanup >= self.cleanup_every_n_requests
+        ):
+            should_cleanup = True
+
+        if should_cleanup:
+            self._cuda_cleanup(reason="success")
 
     def inference(self, req: ServeTTSRequest) -> Generator[InferenceResult, None, None]:
         """
@@ -55,6 +119,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         req_tag = hex(id(req))[-6:]
         t_start = time.perf_counter()
         t_prev = t_start
+        finished_normally = False
 
         def _vram_gb() -> dict:
             if not torch.cuda.is_available():
@@ -100,14 +165,11 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                 )
                 _mark("ref_loaded", mode="hash", refs=len(req.references))
 
-            # Set the random seed if provided
             if req.seed is not None:
                 set_seed(req.seed)
                 logger.warning(f"set seed: {req.seed}")
 
-            # Get the symbolic tokens from the LLAMA model
             stream_tokens = bool(getattr(req, "stream_tokens", False))
-            # Back-pressure: worker waits for ack after each chunk so DAC decode and LLM don't run on GPU concurrently (avoids OOM on 32 GB).
             ack_queue = queue.Queue() if stream_tokens else None
             response_queue = self.send_Llama_request(
                 req, prompt_tokens, prompt_texts, req_tag=req_tag, ack_queue=ack_queue
@@ -118,13 +180,11 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                     "stream: inference started (token streaming), req={}", req_tag
                 )
 
-            # Get the sample rate from the decoder model
             if hasattr(self.decoder_model, "spec_transform"):
                 sample_rate = self.decoder_model.spec_transform.sample_rate
             else:
                 sample_rate = self.decoder_model.sample_rate
 
-            # If streaming, send the header
             if req.streaming:
                 _mark("yield_header")
                 yield InferenceResult(
@@ -140,7 +200,6 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             seg_idx = 0
 
             while True:
-                # Get the response from the LLAMA model
                 if stream_tokens:
                     logger.info(
                         "stream: waiting for next chunk from queue, req={}", req_tag
@@ -159,6 +218,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                         action,
                         req_tag,
                     )
+
                 if wrapped_result.status == "error":
                     logger.error(
                         "stream: got error from worker req={} err={}",
@@ -179,7 +239,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
                 if not isinstance(wrapped_result.response, GenerateResponse):
                     raise TypeError(
-                        "Expected GenerateResponse, got {type(wrapped_result.response).__name__}"
+                        f"Expected GenerateResponse, got {type(wrapped_result.response).__name__}"
                     )
 
                 result = wrapped_result.response
@@ -220,6 +280,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                                 seg_err,
                             )
                         raise
+
                     seg_idx += 1
                     _mark("segment_decoded", segment_idx=seg_idx, samples=len(segment))
                     if stream_tokens:
@@ -240,7 +301,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                     if ack_queue is not None:
                         ack_queue.put(None)
                     segments.append(segment)
-                    if torch.cuda.is_available():
+                    if self.empty_cache_per_segment and torch.cuda.is_available():
                         torch.cuda.empty_cache()
                 else:
                     if stream_tokens:
@@ -253,16 +314,6 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                         ack_queue.put(None)
                     _mark("got_next")
                     break
-
-            # Clean up the memory so next request starts near baseline (~14 GB); otherwise second request OOMs on 32 GB.
-            if torch.cuda.is_available():
-                wrapped_result = None
-                result = None
-                gc.collect()
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-                gc.collect()
-                torch.cuda.empty_cache()
 
             if len(segments) == 0:
                 _mark("yield_error_empty")
@@ -282,15 +333,12 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                     error=None,
                 )
 
+            finished_normally = True
+            self._maybe_cleanup_after_success()
             return None
         finally:
-            # When generator is closed (client done), try to free VRAM again so next request does not OOM.
-            if torch.cuda.is_available():
-                gc.collect()
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-                gc.collect()
-                torch.cuda.empty_cache()
+            if not finished_normally and self.cleanup_on_abort:
+                self._cuda_cleanup(reason="abort")
 
     def send_Llama_request(
         self,
@@ -304,8 +352,6 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         Send a request to the LLAMA model to generate the symbolic tokens.
         """
 
-        # Prepare the request
-        # When streaming API is used, enable token-level streaming for low TTFA
         stream_tokens = bool(getattr(req, "stream_tokens", False))
         request = dict(
             device=self.decoder_model.device,
@@ -326,17 +372,13 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             ack_queue=ack_queue,
         )
 
-        # Create a queue to get the response
         response_queue = queue.Queue()
-
-        # Send the request to the LLAMA model
         self.llama_queue.put(
             GenerateRequest(
                 request=request,
                 response_queue=response_queue,
             )
         )
-
         return response_queue
 
     def get_audio_segment(self, result: GenerateResponse) -> np.ndarray:
@@ -344,12 +386,9 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         Decode the VQ tokens to audio.
         """
 
-        # Don't use autocast on MPS devices
         with autocast_exclude_mps(
             device_type=self.decoder_model.device.type, dtype=self.precision
         ):
-            # Decode the symbolic tokens to audio
             segment = self.decode_vq_tokens(codes=result.codes)
 
-        # Convert the audio to numpy (detach: inference path has no grad, but we no longer use inference_mode)
         return segment.float().detach().cpu().numpy()

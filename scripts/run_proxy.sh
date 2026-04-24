@@ -9,6 +9,10 @@ PROXY_HOST="${PROXY_HOST:-0.0.0.0}"
 PROXY_LOG_LEVEL="${PROXY_LOG_LEVEL:-info}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 PROXY_START_TIMEOUT="${PROXY_START_TIMEOUT:-60}"
+DEFAULT_REFERENCE_ID="${DEFAULT_REFERENCE_ID:-voice}"
+UPSTREAM_TTS_URL="${UPSTREAM_TTS_URL:-http://127.0.0.1:8080/v1/tts}"
+SESSION_TTL_SEC="${SESSION_TTL_SEC:-1800}"
+SESSION_MAX_COUNT="${SESSION_MAX_COUNT:-128}"
 
 LOG_DIR="$REPO_ROOT/logs"
 RUN_DIR="$REPO_ROOT/run"
@@ -31,13 +35,13 @@ if [[ ! -d "$VENV_PATH" ]]; then
 fi
 
 if ! "$VENV_PYTHON" - <<'PY' >/dev/null 2>&1
-import fastapi, uvicorn, httpx
+import fastapi, uvicorn, httpx, pydantic
 print("ok")
 PY
 then
   echo "Installing proxy dependencies into $VENV_PATH"
   "$VENV_PYTHON" -m pip install -U pip setuptools wheel
-  "$VENV_PYTHON" -m pip install fastapi "uvicorn[standard]" httpx
+  "$VENV_PYTHON" -m pip install fastapi "uvicorn[standard]" httpx pydantic
 fi
 
 if [[ -f "$PID_FILE" ]]; then
@@ -55,6 +59,10 @@ fi
 pkill -f 'uvicorn.*tools.proxy.fish_proxy_pcm:app' 2>/dev/null || true
 
 export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
+export DEFAULT_REFERENCE_ID
+export UPSTREAM_TTS_URL
+export SESSION_TTL_SEC
+export SESSION_MAX_COUNT
 
 nohup "$VENV_PYTHON" -m uvicorn tools.proxy.fish_proxy_pcm:app \
   --host "$PROXY_HOST" \
@@ -95,4 +103,5 @@ done
 echo "Proxy started"
 echo "  pid: $PROXY_PID"
 echo "  log: $LOG_FILE"
-echo "  url: http://127.0.0.1:${PROXY_PORT}/health"
+echo "  health: http://127.0.0.1:${PROXY_PORT}/health"
+echo "  open session: curl -X POST http://127.0.0.1:${PROXY_PORT}/session/open -H 'Content-Type: application/json' -d '{\"config_text\":\"{\\\"tts\\\":{\\\"reference_id\\\":\\\"voice\\\"}}\"}'"

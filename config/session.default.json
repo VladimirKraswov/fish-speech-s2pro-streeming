@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "committer": {
+    "soft_min_chars": 40,
+    "target_chars": 120,
+    "hard_max_chars": 180,
+    "flush_on_punctuation": true,
+    "flush_on_clause_punctuation": true,
+    "flush_on_newline": true,
+    "max_wait_ms": 900,
+    "allow_partial_after_ms": 1400,
+    "carry_incomplete_tail": true
+  },
+  "tts": {
+    "reference_id": "voice",
+    "format": "wav",
+    "normalize": true,
+    "use_memory_cache": "on",
+    "seed": 1234,
+    "max_new_tokens": 96,
+    "chunk_length": 200,
+    "top_p": 0.8,
+    "repetition_penalty": 1.1,
+    "temperature": 0.8,
+    "stream_tokens": true,
+    "initial_stream_chunk_size": 18,
+    "stream_chunk_size": 8
+  },
+  "playback": {
+    "target_emit_bytes": 4096,
+    "start_buffer_ms": 120,
+    "stop_grace_ms": 150
+  }
+}

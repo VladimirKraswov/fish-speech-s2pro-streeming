@@ -1,7 +1,7 @@
 === CODE BUNDLE ===
 root: /Volumes/Extend/work/fish-speech-s2pro-streeming
 ignore: .codebundleignore
-generated: 2026-04-24T12:53:00.904Z
+generated: 2026-04-24T13:35:08.496Z
 
 
 

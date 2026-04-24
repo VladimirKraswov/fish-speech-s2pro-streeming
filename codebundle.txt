@@ -1,7 +1,7 @@
 === CODE BUNDLE ===
 root: /Volumes/Extend/work/fish-speech-s2pro-streeming
 ignore: .codebundleignore
-generated: 2026-04-24T09:40:12.764Z
+generated: 2026-04-24T12:53:00.904Z
 
 
 
@@ -8617,6 +8617,11 @@ build-backend = "setuptools.build_meta"
 packages = ["fish_speech", "tools"]
 
 
+path: /references/voice/voice.lab
+----------------------------------------
+В очередной раз захожу в кабинет ректора, готовая уже отчислиться из аспирантуры. Мнусь у двери, а Андрей Викторович что-то пишет в своём блокноте, не обращая на меня внимания.
+
+
 path: /scripts/down_5090.sh
 ----------------------------------------
 # scripts/down_5090.sh
@@ -8725,7 +8730,6 @@ DOCKER_USE_SUDO="${DOCKER_USE_SUDO:-0}" \
 
 path: /scripts/run_proxy.sh
 ----------------------------------------
-# scripts/run_proxy.sh
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -8736,12 +8740,14 @@ PROXY_PORT="${PROXY_PORT:-9000}"
 PROXY_HOST="${PROXY_HOST:-0.0.0.0}"
 PROXY_LOG_LEVEL="${PROXY_LOG_LEVEL:-info}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+PROXY_START_TIMEOUT="${PROXY_START_TIMEOUT:-60}"
 
 LOG_DIR="$REPO_ROOT/logs"
 RUN_DIR="$REPO_ROOT/run"
 LOG_FILE="$LOG_DIR/proxy.log"
 PID_FILE="$RUN_DIR/proxy.pid"
 VENV_PATH="$REPO_ROOT/.venv-proxy"
+VENV_PYTHON="$VENV_PATH/bin/python"
 
 mkdir -p "$LOG_DIR" "$RUN_DIR"
 touch "$LOG_FILE"
@@ -8756,18 +8762,14 @@ if [[ ! -d "$VENV_PATH" ]]; then
   "$PYTHON_BIN" -m venv "$VENV_PATH"
 fi
 
-set +u
-source "$VENV_PATH/bin/activate"
-set -u
-
-if ! python - <<'PY' >/dev/null 2>&1
+if ! "$VENV_PYTHON" - <<'PY' >/dev/null 2>&1
 import fastapi, uvicorn, httpx
 print("ok")
 PY
 then
   echo "Installing proxy dependencies into $VENV_PATH"
-  python -m pip install -U pip setuptools wheel
-  python -m pip install fastapi "uvicorn[standard]" httpx
+  "$VENV_PYTHON" -m pip install -U pip setuptools wheel
+  "$VENV_PYTHON" -m pip install fastapi "uvicorn[standard]" httpx
 fi
 
 if [[ -f "$PID_FILE" ]]; then
@@ -8775,29 +8777,55 @@ if [[ -f "$PID_FILE" ]]; then
   if [[ -n "${OLD_PID:-}" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
     kill "$OLD_PID" 2>/dev/null || true
     sleep 1
+    if kill -0 "$OLD_PID" 2>/dev/null; then
+      kill -9 "$OLD_PID" 2>/dev/null || true
+    fi
   fi
   rm -f "$PID_FILE"
 fi
 
 pkill -f 'uvicorn.*tools.proxy.fish_proxy_pcm:app' 2>/dev/null || true
 
-nohup python -m uvicorn tools.proxy.fish_proxy_pcm:app \
+export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
+
+nohup "$VENV_PYTHON" -m uvicorn tools.proxy.fish_proxy_pcm:app \
   --host "$PROXY_HOST" \
   --port "$PROXY_PORT" \
   --log-level "$PROXY_LOG_LEVEL" \
   >> "$LOG_FILE" 2>&1 &
 
-echo $! > "$PID_FILE"
+PROXY_PID=$!
+echo "$PROXY_PID" > "$PID_FILE"
 
-sleep 1
+echo "Waiting for proxy to become healthy..."
+START_TS="$(date +%s)"
 
-if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-  echo "ERROR: proxy failed to start. Check $LOG_FILE" >&2
-  exit 1
-fi
+while true; do
+  if curl -sf "http://127.0.0.1:${PROXY_PORT}/health" >/dev/null 2>&1; then
+    break
+  fi
+
+  if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    echo "ERROR: proxy failed to start. Last log lines:" >&2
+    tail -n 100 "$LOG_FILE" >&2 || true
+    rm -f "$PID_FILE"
+    exit 1
+  fi
+
+  NOW_TS="$(date +%s)"
+  ELAPSED="$((NOW_TS - START_TS))"
+
+  if [[ "$ELAPSED" -ge "$PROXY_START_TIMEOUT" ]]; then
+    echo "ERROR: proxy did not become healthy within ${PROXY_START_TIMEOUT}s" >&2
+    tail -n 100 "$LOG_FILE" >&2 || true
+    exit 1
+  fi
+
+  sleep 1
+done
 
 echo "Proxy started"
-echo "  pid: $(cat "$PID_FILE")"
+echo "  pid: $PROXY_PID"
 echo "  log: $LOG_FILE"
 echo "  url: http://127.0.0.1:${PROXY_PORT}/health"
 
@@ -9175,11 +9203,6 @@ echo
 if [[ "$START_PROXY" == "1" ]]; then
   echo "[5/5] Starting proxy..."
   PROXY_PORT="$PROXY_PORT" bash "$REPO_ROOT/scripts/run_proxy.sh"
-
-  echo "Checking proxy health..."
-  sleep 1
-  curl -sf "http://127.0.0.1:${PROXY_PORT}/health" >/dev/null
-  echo "Proxy is healthy"
 fi
 
 echo
@@ -9382,7 +9405,7 @@ PORT="${PORT:-8080}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:${PORT}}"
 WARMUP_TIMEOUT="${WARMUP_TIMEOUT:-1800}"
 WARMUP_TEXT="${WARMUP_TEXT:-Привет. Это дополнительный прогрев стримингового режима для Fish Speech.}"
-WARMUP_REFERENCE_ID="${WARMUP_REFERENCE_ID:-ref}"
+WARMUP_REFERENCE_ID="${WARMUP_REFERENCE_ID:-voice}"
 OUT_FILE="${OUT_FILE:-$REPO_ROOT/logs/warmup_stream.wav}"
 
 mkdir -p "$REPO_ROOT/logs"
@@ -10702,7 +10725,7 @@ from fastapi.responses import StreamingResponse
 
 UPSTREAM_TTS_URL = "http://127.0.0.1:8080/v1/tts"
 UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=None)
-DEFAULT_REFERENCE_ID = os.environ.get("DEFAULT_REFERENCE_ID", "ref")
+DEFAULT_REFERENCE_ID = os.environ.get("DEFAULT_REFERENCE_ID", "voice")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -10797,7 +10820,14 @@ async def pcm_stream(
 ):
     req_id = uuid.uuid4().hex[:8]
     effective_reference_id = (reference_id or DEFAULT_REFERENCE_ID).strip()
-    payload = {"text": text, "streaming": True, "reference_id": effective_reference_id}
+    payload = {
+        "text": text,
+        "streaming": True,
+        "stream_tokens": True,
+        "initial_stream_chunk_size": 18,
+        "stream_chunk_size": 8,
+        "reference_id": effective_reference_id,
+    }
 
     logger.info(
         "REQ %s start text_len=%s reference_id=%s (query=%s default=%s)",
@@ -11360,7 +11390,7 @@ CONNECT_TIMEOUT = float(os.environ.get("PROXY_CONNECT_TIMEOUT", "10"))
 WRITE_TIMEOUT = float(os.environ.get("PROXY_WRITE_TIMEOUT", "30"))
 # read=None because upstream is a stream
 REQUEST_TIMEOUT = httpx.Timeout(connect=CONNECT_TIMEOUT, read=None, write=WRITE_TIMEOUT, pool=None)
-DEFAULT_REFERENCE_ID = os.environ.get("DEFAULT_REFERENCE_ID", "ref")
+DEFAULT_REFERENCE_ID = os.environ.get("DEFAULT_REFERENCE_ID", "voice")
 
 
 @asynccontextmanager
@@ -13719,8 +13749,8 @@ async def update_reference(
 
 
 === SUMMARY ===
-included: 62
-skipped(binary): 2
+included: 63
+skipped(binary): 3
 skipped(size): 0
 skipped(ext): 0
-totalBytes(approx): 464753
+totalBytes(approx): 465784

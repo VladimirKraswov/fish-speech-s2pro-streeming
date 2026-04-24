@@ -1,0 +1,635 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Fish Speech Committer Demo</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 1100px;
+      margin: 24px auto;
+      padding: 0 16px 32px;
+      background: #fafafa;
+      color: #111;
+    }
+
+    h1 {
+      font-size: 24px;
+      margin: 0 0 16px;
+    }
+
+    .grid {
+      display: grid;
+      gap: 12px;
+    }
+
+    .grid-2 {
+      grid-template-columns: 1fr 1fr;
+    }
+
+    .card {
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 12px;
+      padding: 14px;
+      box-shadow: 0 1px 2px rgba(0,0,0,.04);
+    }
+
+    .title {
+      font-size: 14px;
+      font-weight: 700;
+      margin-bottom: 8px;
+      color: #333;
+    }
+
+    textarea, input, button {
+      font: inherit;
+    }
+
+    textarea, input[type="number"] {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 10px 12px;
+      border: 1px solid #ccc;
+      border-radius: 10px;
+      background: #fff;
+    }
+
+    textarea {
+      min-height: 150px;
+      resize: vertical;
+      line-height: 1.5;
+    }
+
+    .row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      border: 0;
+      border-radius: 10px;
+      padding: 10px 14px;
+      cursor: pointer;
+      background: #111;
+      color: #fff;
+    }
+
+    button.secondary {
+      background: #666;
+    }
+
+    button:disabled {
+      opacity: .5;
+      cursor: default;
+    }
+
+    .params {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(120px, 1fr));
+      gap: 8px;
+    }
+
+    .param label {
+      display: block;
+      font-size: 12px;
+      margin-bottom: 4px;
+      color: #555;
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      line-height: 1.45;
+    }
+
+    #status {
+      font-size: 14px;
+      color: #333;
+    }
+
+    #streamView, #pendingView {
+      min-height: 140px;
+      background: #0f172a;
+      color: #e5e7eb;
+      border-radius: 10px;
+      padding: 12px;
+    }
+
+    #streamView .live {
+      color: #93c5fd;
+    }
+
+    #pendingView .hot {
+      background: rgba(250, 204, 21, .18);
+      color: #fde68a;
+      padding: 0 2px;
+      border-radius: 4px;
+    }
+
+    #pendingView .tail {
+      color: #cbd5e1;
+    }
+
+    #commits {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      min-height: 120px;
+    }
+
+    .commit-item {
+      border: 1px solid #d6d6d6;
+      border-radius: 10px;
+      padding: 10px 12px;
+      background: #fcfcfc;
+    }
+
+    .commit-meta {
+      font-size: 12px;
+      color: #666;
+      margin-bottom: 6px;
+    }
+
+    #log {
+      min-height: 180px;
+      background: #111;
+      color: #ddd;
+      border-radius: 10px;
+      padding: 12px;
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+
+    .hint {
+      font-size: 13px;
+      color: #555;
+      line-height: 1.45;
+    }
+  </style>
+</head>
+<body>
+  <h1>Committer demo: поток текста → красивые чанки</h1>
+
+  <div class="grid">
+    <div class="card">
+      <div class="title">Исходный текст для симуляции LLM-потока</div>
+      <textarea id="sourceText">Колобок – сказка, знакомая каждому взрослому, придется по душе и маленьким детям. Они быстро учат простые слова песенки Колобка и с удовольствием подпевают родителям. Из этой сказки малыши узнают, как испекла бабка для деда Колобка и положила на окошко остывать. Устал Колобок лежать, да решил спрыгнуть с окошка и укатиться со двора за ворота. Встретил он по дороге Зайчика, Волка и Медведя, спел им свою песенку и убежал от них. Катился дальше Колобок и повстречалась ему Лисичка. Попытался и её Колобок обмануть, да не получилось у него.</textarea>
+
+      <div class="row" style="margin-top:10px;">
+        <button id="startBtn">Старт</button>
+        <button id="stopBtn" class="secondary">Стоп</button>
+        <button id="forceCommitBtn" class="secondary">Commit now</button>
+      </div>
+
+      <div id="status" style="margin-top:10px;">Готово</div>
+    </div>
+
+    <div class="card">
+      <div class="title">Параметры коммиттера</div>
+      <div class="params">
+        <div class="param">
+          <label for="firstMinChars">firstMinChars</label>
+          <input id="firstMinChars" type="number" value="70" />
+        </div>
+        <div class="param">
+          <label for="normalMinChars">normalMinChars</label>
+          <input id="normalMinChars" type="number" value="110" />
+        </div>
+        <div class="param">
+          <label for="softTargetChars">softTargetChars</label>
+          <input id="softTargetChars" type="number" value="140" />
+        </div>
+        <div class="param">
+          <label for="hardMaxChars">hardMaxChars</label>
+          <input id="hardMaxChars" type="number" value="220" />
+        </div>
+        <div class="param">
+          <label for="idleTimeoutMs">idleTimeoutMs</label>
+          <input id="idleTimeoutMs" type="number" value="350" />
+        </div>
+        <div class="param">
+          <label for="idleMinChars">idleMinChars</label>
+          <input id="idleMinChars" type="number" value="90" />
+        </div>
+      </div>
+      <div class="hint" style="margin-top:10px;">
+        Стартовые значения для русского: первый чанк короче для быстрого старта, следующие — чуть длиннее для лучшей интонации.
+      </div>
+    </div>
+
+    <div class="grid grid-2">
+      <div class="card">
+        <div class="title">То, что уже “настримила” LLM</div>
+        <div id="streamView" class="mono"></div>
+      </div>
+
+      <div class="card">
+        <div class="title">Буфер ожидания commit</div>
+        <div id="pendingView" class="mono"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="title">Уже закоммиченные чанки</div>
+      <div id="commits"></div>
+    </div>
+
+    <div class="card">
+      <div class="title">Лог</div>
+      <div id="log" class="mono"></div>
+    </div>
+  </div>
+
+  <script>
+    const sourceTextEl = document.getElementById('sourceText');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const forceCommitBtn = document.getElementById('forceCommitBtn');
+    const statusEl = document.getElementById('status');
+    const streamView = document.getElementById('streamView');
+    const pendingView = document.getElementById('pendingView');
+    const commitsEl = document.getElementById('commits');
+    const logEl = document.getElementById('log');
+
+    const firstMinCharsEl = document.getElementById('firstMinChars');
+    const normalMinCharsEl = document.getElementById('normalMinChars');
+    const softTargetCharsEl = document.getElementById('softTargetChars');
+    const hardMaxCharsEl = document.getElementById('hardMaxChars');
+    const idleTimeoutMsEl = document.getElementById('idleTimeoutMs');
+    const idleMinCharsEl = document.getElementById('idleMinChars');
+
+    let streamTimer = null;
+    let idleTimer = null;
+
+    let sourceText = '';
+    let emitPos = 0;
+
+    let fullStreamedText = '';
+    let pendingBuffer = '';
+    let committedChunks = [];
+    let isRunning = false;
+    let isFirstCommit = true;
+    let llmDeltaCounter = 0;
+
+    function setStatus(msg) {
+      statusEl.textContent = msg;
+    }
+
+    function log(msg) {
+      const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      logEl.textContent += line + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+      console.log(line);
+    }
+
+    function escapeHtml(s) {
+      return s
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;');
+    }
+
+    function getConfig() {
+      return {
+        firstMinChars: Number(firstMinCharsEl.value || 70),
+        normalMinChars: Number(normalMinCharsEl.value || 110),
+        softTargetChars: Number(softTargetCharsEl.value || 140),
+        hardMaxChars: Number(hardMaxCharsEl.value || 220),
+        idleTimeoutMs: Number(idleTimeoutMsEl.value || 350),
+        idleMinChars: Number(idleMinCharsEl.value || 90),
+      };
+    }
+
+    function resetState() {
+      clearTimeout(streamTimer);
+      clearTimeout(idleTimer);
+      streamTimer = null;
+      idleTimer = null;
+
+      emitPos = 0;
+      fullStreamedText = '';
+      pendingBuffer = '';
+      committedChunks = [];
+      isFirstCommit = true;
+      llmDeltaCounter = 0;
+
+      streamView.innerHTML = '';
+      pendingView.innerHTML = '';
+      commitsEl.innerHTML = '';
+      logEl.textContent = '';
+    }
+
+    function updateStreamView() {
+      streamView.innerHTML = `<span class="live">${escapeHtml(fullStreamedText)}</span>`;
+    }
+
+    function updatePendingView(hotIndex = null) {
+      if (!pendingBuffer) {
+        pendingView.innerHTML = '<span class="tail">Буфер пуст</span>';
+        return;
+      }
+
+      if (hotIndex == null || hotIndex < 0 || hotIndex >= pendingBuffer.length) {
+        pendingView.innerHTML = `<span class="tail">${escapeHtml(pendingBuffer)}</span>`;
+        return;
+      }
+
+      const left = pendingBuffer.slice(0, hotIndex + 1);
+      const right = pendingBuffer.slice(hotIndex + 1);
+
+      pendingView.innerHTML =
+        `<span class="hot">${escapeHtml(left)}</span>` +
+        `<span class="tail">${escapeHtml(right)}</span>`;
+    }
+
+    function updateCommits() {
+      if (committedChunks.length === 0) {
+        commitsEl.innerHTML = '<div class="hint">Пока ничего не закоммичено.</div>';
+        return;
+      }
+
+      commitsEl.innerHTML = committedChunks.map((item, idx) => {
+        return `
+          <div class="commit-item">
+            <div class="commit-meta">
+              #${idx + 1} · reason=${escapeHtml(item.reason)} · chars=${item.text.length}
+            </div>
+            <div class="mono">${escapeHtml(item.text)}</div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function restartIdleTimer() {
+      clearTimeout(idleTimer);
+
+      if (!isRunning) return;
+
+      const cfg = getConfig();
+      idleTimer = setTimeout(() => {
+        if (!pendingBuffer.trim()) return;
+        maybeCommit('idle');
+      }, cfg.idleTimeoutMs);
+    }
+
+    function isStrongPunctuation(ch) {
+      return /[.!?…]/.test(ch);
+    }
+
+    function isSoftPunctuation(ch) {
+      return /[,;:]/.test(ch);
+    }
+
+    function isWhitespace(ch) {
+      return /\s/.test(ch);
+    }
+
+    function collectBreakCandidates(buffer) {
+      const strong = [];
+      const soft = [];
+      const spaces = [];
+
+      for (let i = 0; i < buffer.length; i++) {
+        const ch = buffer[i];
+        if (isStrongPunctuation(ch)) strong.push(i);
+        else if (isSoftPunctuation(ch)) soft.push(i);
+        else if (isWhitespace(ch)) spaces.push(i);
+      }
+
+      return { strong, soft, spaces };
+    }
+
+    function pickLastInRange(list, min, max) {
+      let found = null;
+      for (const i of list) {
+        if (i >= min && i <= max) found = i;
+      }
+      return found;
+    }
+
+    function pickBreakIndex(buffer, reasonKind) {
+      const cfg = getConfig();
+      const len = buffer.length;
+      const minChars = isFirstCommit ? cfg.firstMinChars : cfg.normalMinChars;
+      const { strong, soft, spaces } = collectBreakCandidates(buffer);
+
+      if (reasonKind === 'normal') {
+        if (len < minChars) return null;
+
+        // 1. Идеально: сильная пунктуация до softTarget/hardMax
+        let idx = pickLastInRange(strong, minChars - 1, Math.min(cfg.softTargetChars, len - 1));
+        if (idx != null) return { index: idx, reason: 'strong-punctuation' };
+
+        idx = pickLastInRange(strong, minChars - 1, Math.min(cfg.hardMaxChars, len - 1));
+        if (idx != null) return { index: idx, reason: 'strong-punctuation-late' };
+
+        // 2. Нормально: мягкая пунктуация, если уже доросли до softTarget
+        if (len >= cfg.softTargetChars) {
+          idx = pickLastInRange(soft, minChars - 1, Math.min(cfg.hardMaxChars, len - 1));
+          if (idx != null) return { index: idx, reason: 'soft-punctuation' };
+        }
+
+        // 3. Если буфер стал слишком длинным — режем по пробелу
+        if (len >= cfg.hardMaxChars) {
+          idx = pickLastInRange(spaces, minChars - 1, cfg.hardMaxChars - 1);
+          if (idx != null) return { index: idx, reason: 'hard-max-space' };
+          return { index: cfg.hardMaxChars - 1, reason: 'hard-max-cut' };
+        }
+
+        return null;
+      }
+
+      if (reasonKind === 'idle') {
+        if (len < cfg.idleMinChars) return null;
+
+        let idx = pickLastInRange(strong, cfg.idleMinChars - 1, len - 1);
+        if (idx != null) return { index: idx, reason: 'idle-strong' };
+
+        idx = pickLastInRange(soft, cfg.idleMinChars - 1, len - 1);
+        if (idx != null) return { index: idx, reason: 'idle-soft' };
+
+        idx = pickLastInRange(spaces, cfg.idleMinChars - 1, len - 1);
+        if (idx != null) return { index: idx, reason: 'idle-space' };
+
+        return null;
+      }
+
+      if (reasonKind === 'force') {
+        const { strong, soft, spaces } = collectBreakCandidates(buffer);
+
+        let idx = pickLastInRange(strong, 0, len - 1);
+        if (idx != null) return { index: idx, reason: 'force-strong' };
+
+        idx = pickLastInRange(soft, 0, len - 1);
+        if (idx != null) return { index: idx, reason: 'force-soft' };
+
+        idx = pickLastInRange(spaces, 0, len - 1);
+        if (idx != null) return { index: idx, reason: 'force-space' };
+
+        return { index: len - 1, reason: 'force-cut' };
+      }
+
+      return null;
+    }
+
+    function commitByIndex(index, reason) {
+      const rawChunk = pendingBuffer.slice(0, index + 1);
+      const rest = pendingBuffer.slice(index + 1);
+
+      const chunk = rawChunk.trim();
+      pendingBuffer = rest.replace(/^\s+/, '');
+
+      if (!chunk) {
+        updatePendingView();
+        return;
+      }
+
+      committedChunks.push({
+        text: chunk,
+        reason,
+      });
+
+      isFirstCommit = false;
+
+      updatePendingView();
+      updateCommits();
+
+      log(`COMMIT reason=${reason} chars=${chunk.length} text="${chunk}"`);
+
+      // Здесь позже будет реальная отправка в TTS session.
+      mockSendToTTS(chunk, reason);
+    }
+
+    function maybeCommit(mode = 'normal') {
+      const picked = pickBreakIndex(pendingBuffer, mode);
+
+      if (!picked) {
+        updatePendingView();
+        return false;
+      }
+
+      updatePendingView(picked.index);
+      commitByIndex(picked.index, picked.reason);
+      return true;
+    }
+
+    function mockSendToTTS(text, reason) {
+      log(`SEND_TO_TTS reason=${reason} chars=${text.length}`);
+    }
+
+    function nextMockDelta(text, pos) {
+      const remain = text.length - pos;
+      if (remain <= 0) return null;
+
+      // Иногда по 1-4 символа, иногда по 5-12, иногда до пробела/пунктуации.
+      const mode = Math.random();
+
+      if (mode < 0.35) {
+        const size = Math.min(remain, 1 + Math.floor(Math.random() * 4));
+        return text.slice(pos, pos + size);
+      }
+
+      if (mode < 0.75) {
+        const size = Math.min(remain, 5 + Math.floor(Math.random() * 8));
+        return text.slice(pos, pos + size);
+      }
+
+      // Попытка отдать кусок до ближайшего пробела/знака, чтобы имитировать более “умные” токены
+      const maxLookahead = Math.min(remain, 14 + Math.floor(Math.random() * 10));
+      let end = pos + maxLookahead;
+
+      for (let i = pos + 1; i < pos + maxLookahead; i++) {
+        const ch = text[i];
+        if (ch && /[\s,.;:!?…]/.test(ch)) {
+          end = i + 1;
+        }
+      }
+
+      return text.slice(pos, end);
+    }
+
+    function scheduleNextTick() {
+      if (!isRunning) return;
+
+      const done = emitPos >= sourceText.length;
+      if (done) {
+        clearTimeout(streamTimer);
+        streamTimer = null;
+
+        log('LLM stream finished');
+        setStatus('LLM поток завершён');
+
+        if (pendingBuffer.trim()) {
+          maybeCommit('idle') || maybeCommit('force');
+        }
+
+        return;
+      }
+
+      const delta = nextMockDelta(sourceText, emitPos);
+      if (!delta) return;
+
+      emitPos += delta.length;
+      llmDeltaCounter += 1;
+
+      fullStreamedText += delta;
+      pendingBuffer += delta;
+
+      updateStreamView();
+      maybeCommit('normal');
+      updatePendingView();
+      restartIdleTimer();
+
+      log(`DELTA #${llmDeltaCounter} len=${delta.length} raw="${delta.replace(/\n/g, '\\n')}"`);
+
+      const delay = 40 + Math.floor(Math.random() * 120);
+      streamTimer = setTimeout(scheduleNextTick, delay);
+    }
+
+    function startSimulation() {
+      resetState();
+
+      sourceText = sourceTextEl.value;
+      if (!sourceText.trim()) {
+        setStatus('Введите текст');
+        return;
+      }
+
+      isRunning = true;
+      setStatus('Идёт симуляция потока LLM...');
+      log('START');
+
+      updateStreamView();
+      updatePendingView();
+      updateCommits();
+
+      scheduleNextTick();
+    }
+
+    function stopSimulation() {
+      isRunning = false;
+      clearTimeout(streamTimer);
+      clearTimeout(idleTimer);
+      streamTimer = null;
+      idleTimer = null;
+      setStatus('Остановлено');
+      log('STOP');
+    }
+
+    startBtn.addEventListener('click', startSimulation);
+    stopBtn.addEventListener('click', stopSimulation);
+
+    forceCommitBtn.addEventListener('click', () => {
+      if (!pendingBuffer.trim()) return;
+      maybeCommit('force');
+    });
+
+    updatePendingView();
+    updateCommits();
+  </script>
+</body>
+</html>

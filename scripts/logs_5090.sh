@@ -1,23 +1,17 @@
-# scripts/logs_5090.sh
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/lib_5090.sh"
+
 cd "$REPO_ROOT"
 
-CONTAINER="${CONTAINER:-fish-speech}"
-PROXY_LOG_FILE="${PROXY_LOG_FILE:-$REPO_ROOT/logs/proxy.log}"
+CONTAINER="${CONTAINER:-fish-speech-5090}"
+PROXY_LOG_FILE="$(proxy_log_file)"
 
 mkdir -p "$REPO_ROOT/logs"
 touch "$PROXY_LOG_FILE"
-
-docker_cmd() {
-  if [[ "${DOCKER_USE_SUDO:-0}" == "1" ]]; then
-    sudo docker "$@"
-  else
-    docker "$@"
-  fi
-}
 
 cleanup() {
   [[ -n "${MODEL_PID:-}" ]] && kill "$MODEL_PID" 2>/dev/null || true

@@ -1,7 +1,7 @@
 === CODE BUNDLE ===
 root: /Volumes/Extend/work/fish-speech-s2pro-streeming
 ignore: .codebundleignore
-generated: 2026-04-24T19:59:40.835Z
+generated: 2026-04-24T20:19:19.523Z
 
 
 
@@ -394,31 +394,130 @@ services:
       - "${API_PORT:-8080}:8080"
 
 
-path: /config/session.default.json
+path: /config/runtime.json
 ----------------------------------------
 {
-  "committer": {
-    "soft_min_chars": 140,
-    "target_chars": 220,
-    "hard_max_chars": 320,
-    "flush_on_punctuation": true,
-    "flush_on_clause_punctuation": false,
-    "flush_on_newline": true,
-    "max_wait_ms": 1800,
-    "allow_partial_after_ms": 3500,
-    "carry_incomplete_tail": true
+  "version": 1,
+  "paths": {
+    "llama_checkpoint_path": "checkpoints/s2-pro",
+    "decoder_checkpoint_path": "checkpoints/s2-pro/codec.pth",
+    "decoder_config_name": "modded_dac_vq",
+    "references_dir": "references"
   },
-  "tts": {
-    "max_new_tokens": 160,
-    "chunk_length": 200,
+  "network": {
+    "server": {
+      "host": "0.0.0.0",
+      "port": 8080
+    },
+    "proxy": {
+      "host": "0.0.0.0",
+      "port": 9000
+    },
+    "upstream_tts_url": "http://127.0.0.1:8080/v1/tts"
+  },
+  "model": {
+    "device": "cuda",
+    "precision": "bfloat16",
+    "compile": true,
+    "cache_max_seq_len": 768,
+    "max_new_tokens_cap": 128,
+    "sdpa_math": false,
+    "cleanup_after_request": false,
+    "cleanup_every_n_requests": 0,
+    "cleanup_on_error": true,
+    "cleanup_on_abort": true,
+    "empty_cache_per_stream_chunk": false,
+    "empty_cache_per_segment": false,
+    "profile_inference": false,
+    "record_memory_history": false,
+    "memory_history_max_entries": 100000
+  },
+  "warmup": {
+    "enabled": true,
+    "reference_id": "voice",
+    "text": "Привет. Это дополнительный прогрев стримингового режима для Fish Speech.",
+    "streaming": true,
     "stream_tokens": true,
-    "initial_stream_chunk_size": 18,
+    "max_new_tokens": 96,
+    "chunk_length": 180,
+    "initial_stream_chunk_size": 8,
     "stream_chunk_size": 8
   },
-  "playback": {
-    "target_emit_bytes": 16384,
-    "start_buffer_ms": 450,
-    "stop_grace_ms": 250
+  "proxy": {
+    "default_reference_id": "voice",
+    "session_ttl_sec": 1800,
+    "session_max_count": 128,
+    "version": 1,
+    "commit": {
+      "first": {
+        "min_chars": 48,
+        "target_chars": 72,
+        "max_chars": 96,
+        "max_wait_ms": 180,
+        "allow_partial_after_ms": 260
+      },
+      "next": {
+        "min_chars": 140,
+        "target_chars": 180,
+        "max_chars": 260,
+        "max_wait_ms": 420,
+        "allow_partial_after_ms": 700
+      },
+      "flush_on_sentence_punctuation": true,
+      "flush_on_clause_punctuation": true,
+      "flush_on_newline": true,
+      "carry_incomplete_tail": true
+    },
+    "tts": {
+      "reference_id": "voice",
+      "format": "wav",
+      "normalize": true,
+      "use_memory_cache": "on",
+      "seed": 1234,
+      "max_new_tokens": 128,
+      "chunk_length": 180,
+      "top_p": 0.8,
+      "repetition_penalty": 1.08,
+      "temperature": 0.75,
+      "stream_tokens": true,
+      "initial_stream_chunk_size": 8,
+      "stream_chunk_size": 8
+    },
+    "playback": {
+      "target_emit_bytes": 4096,
+      "start_buffer_ms": 90,
+      "stop_grace_ms": 40
+    },
+    "session": {
+      "max_buffer_chars": 4000,
+      "auto_close_on_finish": false
+    }
+  },
+  "frontend_overrides": {
+    "enabled": true,
+    "allowed_paths": [
+      "commit.first.min_chars",
+      "commit.first.target_chars",
+      "commit.first.max_chars",
+      "commit.first.max_wait_ms",
+      "commit.first.allow_partial_after_ms",
+      "commit.next.min_chars",
+      "commit.next.target_chars",
+      "commit.next.max_chars",
+      "commit.next.max_wait_ms",
+      "commit.next.allow_partial_after_ms",
+      "tts.reference_id",
+      "tts.max_new_tokens",
+      "tts.chunk_length",
+      "tts.top_p",
+      "tts.repetition_penalty",
+      "tts.temperature",
+      "tts.initial_stream_chunk_size",
+      "tts.stream_chunk_size",
+      "playback.target_emit_bytes",
+      "playback.start_buffer_ms",
+      "playback.stop_grace_ms"
+    ]
   }
 }
 
@@ -1469,9 +1568,7 @@ if __name__ == "__main__":
 
 path: /fish_speech/inference_engine/__init__.py
 ----------------------------------------
-# fish_speech/inference_engine/__init__.py
 import gc
-import os
 import queue
 import threading
 import time
@@ -1489,15 +1586,9 @@ from fish_speech.models.text2semantic.inference import (
     GenerateRequest,
     GenerateResponse,
 )
+from fish_speech.runtime_config import load_runtime_config
 from fish_speech.utils import autocast_exclude_mps, set_seed
 from fish_speech.utils.schema import ServeTTSRequest
-
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 class TTSInferenceEngine(ReferenceLoader, VQManager):
@@ -1514,15 +1605,13 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         self.decoder_model = decoder_model
         self.precision = precision
         self.compile = compile
+        self.runtime = load_runtime_config()
 
-        # Keep the model "hot" between short session commits by default.
-        # You can re-enable aggressive cleanup with env vars if your VRAM budget is tighter.
-        self.cleanup_after_request = _env_flag("FISH_CLEANUP_AFTER_REQUEST", False)
-        self.cleanup_on_abort = _env_flag("FISH_CLEANUP_ON_ABORT", True)
-        self.empty_cache_per_segment = _env_flag("FISH_EMPTY_CACHE_PER_SEGMENT", False)
-        self.cleanup_every_n_requests = max(
-            0, int(os.getenv("FISH_CLEANUP_EVERY_N_REQUESTS", "0") or "0")
-        )
+        model_cfg = self.runtime.model
+        self.cleanup_after_request = model_cfg.cleanup_after_request
+        self.cleanup_on_abort = model_cfg.cleanup_on_abort
+        self.empty_cache_per_segment = model_cfg.empty_cache_per_segment
+        self.cleanup_every_n_requests = model_cfg.cleanup_every_n_requests
         self._success_since_cleanup = 0
         self._cleanup_lock = threading.Lock()
 
@@ -1580,13 +1669,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         - Decodes the VQ tokens to audio.
         """
 
-        profile = os.getenv("FISH_PROFILE_INFERENCE", "0") in {
-            "1",
-            "true",
-            "TRUE",
-            "yes",
-            "YES",
-        }
+        profile = self.runtime.model.profile_inference
         req_tag = hex(id(req))[-6:]
         t_start = time.perf_counter()
         t_prev = t_start
@@ -1865,365 +1948,6 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         return segment.float().detach().cpu().numpy()
 
 
-path: /fish_speech/inference_engine/__init__.py.bak_step1
-----------------------------------------
-# fish_speech/inference_engine/__init__.py
-import gc
-import os
-import queue
-import time
-from typing import Generator
-
-import numpy as np
-import torch
-from loguru import logger
-
-from fish_speech.inference_engine.reference_loader import ReferenceLoader
-from fish_speech.inference_engine.utils import InferenceResult, wav_chunk_header
-from fish_speech.inference_engine.vq_manager import VQManager
-from fish_speech.models.dac.modded_dac import DAC
-from fish_speech.models.text2semantic.inference import (
-    GenerateRequest,
-    GenerateResponse,
-    WrappedGenerateResponse,
-)
-from fish_speech.utils import autocast_exclude_mps, set_seed
-from fish_speech.utils.schema import ServeTTSRequest
-
-
-class TTSInferenceEngine(ReferenceLoader, VQManager):
-    def __init__(
-        self,
-        llama_queue: queue.Queue,
-        decoder_model: DAC,
-        precision: torch.dtype,
-        compile: bool,
-    ) -> None:
-        super().__init__()
-
-        self.llama_queue = llama_queue
-        self.decoder_model = decoder_model
-        self.precision = precision
-        self.compile = compile
-
-    def inference(self, req: ServeTTSRequest) -> Generator[InferenceResult, None, None]:
-        """
-        Main inference function:
-        - Loads the reference audio and text.
-        - Calls the LLAMA model for inference.
-        - Decodes the VQ tokens to audio.
-        """
-
-        profile = os.getenv("FISH_PROFILE_INFERENCE", "0") in {
-            "1",
-            "true",
-            "TRUE",
-            "yes",
-            "YES",
-        }
-        req_tag = hex(id(req))[-6:]
-        t_start = time.perf_counter()
-        t_prev = t_start
-
-        def _vram_gb() -> dict:
-            if not torch.cuda.is_available():
-                return {}
-            return {
-                "vram_alloc_gb": round(torch.cuda.memory_allocated() / (1024**3), 2),
-                "vram_reserved_gb": round(torch.cuda.memory_reserved() / (1024**3), 2),
-                "vram_max_alloc_gb": round(
-                    torch.cuda.max_memory_allocated() / (1024**3), 2
-                ),
-            }
-
-        def _mark(event: str, **extra) -> None:
-            nonlocal t_prev
-            if not profile:
-                return
-            now = time.perf_counter()
-            delta_ms = (now - t_prev) * 1000.0
-            total_ms = (now - t_start) * 1000.0
-            t_prev = now
-            vram = _vram_gb()
-            details = " ".join(f"{k}={v}" for k, v in (*vram.items(), *extra.items()))
-            logger.info(
-                "inference_timing req={} event={} delta_ms={:.1f} total_ms={:.1f} {}",
-                req_tag,
-                event,
-                delta_ms,
-                total_ms,
-                details,
-            )
-
-        try:
-            ref_id = req.reference_id
-            prompt_tokens, prompt_texts = [], []
-            if ref_id is not None:
-                prompt_tokens, prompt_texts = self.load_by_id(
-                    ref_id, req.use_memory_cache
-                )
-                _mark("ref_loaded", mode="id")
-            elif req.references:
-                prompt_tokens, prompt_texts = self.load_by_hash(
-                    req.references, req.use_memory_cache
-                )
-                _mark("ref_loaded", mode="hash", refs=len(req.references))
-
-            # Set the random seed if provided
-            if req.seed is not None:
-                set_seed(req.seed)
-                logger.warning(f"set seed: {req.seed}")
-
-            # Get the symbolic tokens from the LLAMA model
-            stream_tokens = getattr(req, "stream_tokens", False) or req.streaming
-            # Back-pressure: worker waits for ack after each chunk so DAC decode and LLM don't run on GPU concurrently (avoids OOM on 32 GB).
-            ack_queue = queue.Queue() if stream_tokens else None
-            response_queue = self.send_Llama_request(
-                req, prompt_tokens, prompt_texts, req_tag=req_tag, ack_queue=ack_queue
-            )
-            _mark("llama_queued")
-            if stream_tokens:
-                logger.info(
-                    "stream: inference started (token streaming), req={}", req_tag
-                )
-
-            # Get the sample rate from the decoder model
-            if hasattr(self.decoder_model, "spec_transform"):
-                sample_rate = self.decoder_model.spec_transform.sample_rate
-            else:
-                sample_rate = self.decoder_model.sample_rate
-
-            # If streaming, send the header
-            if req.streaming:
-                _mark("yield_header")
-                yield InferenceResult(
-                    code="header",
-                    audio=(
-                        sample_rate,
-                        np.array(wav_chunk_header(sample_rate=sample_rate)),
-                    ),
-                    error=None,
-                )
-
-            segments = []
-            seg_idx = 0
-
-            while True:
-                # Get the response from the LLAMA model
-                if stream_tokens:
-                    logger.info(
-                        "stream: waiting for next chunk from queue, req={}", req_tag
-                    )
-                wrapped_result = response_queue.get()
-                _mark("queue_get")
-                if stream_tokens:
-                    action = (
-                        getattr(wrapped_result.response, "action", None)
-                        if hasattr(wrapped_result.response, "action")
-                        else None
-                    )
-                    logger.info(
-                        "stream: queue_get status={} action={} req={}",
-                        wrapped_result.status,
-                        action,
-                        req_tag,
-                    )
-                if wrapped_result.status == "error":
-                    logger.error(
-                        "stream: got error from worker req={} err={}",
-                        req_tag,
-                        wrapped_result.response,
-                    )
-                    _mark("yield_error")
-                    yield InferenceResult(
-                        code="error",
-                        audio=None,
-                        error=(
-                            wrapped_result.response
-                            if isinstance(wrapped_result.response, Exception)
-                            else Exception("Unknown error")
-                        ),
-                    )
-                    break
-
-                if not isinstance(wrapped_result.response, GenerateResponse):
-                    raise TypeError(
-                        "Expected GenerateResponse, got {type(wrapped_result.response).__name__}"
-                    )
-
-                result = wrapped_result.response
-                if result.action != "next":
-                    if stream_tokens:
-                        logger.info(
-                            "stream: decoding segment seg_idx={} codes_shape={} req={}",
-                            seg_idx + 1,
-                            result.codes.shape if result.codes is not None else None,
-                            req_tag,
-                        )
-                    _mark(
-                        "decode_vq_start",
-                        segment_idx=seg_idx + 1,
-                        codes_frames=(
-                            result.codes.shape[1] if result.codes is not None else 0
-                        ),
-                    )
-                    try:
-                        if result.codes is not None and not result.codes.is_cuda:
-                            result = GenerateResponse(
-                                result.action,
-                                result.codes.to(self.decoder_model.device),
-                                getattr(result, "text", None),
-                            )
-                        segment = self.get_audio_segment(result)
-                    except Exception as seg_err:
-                        if stream_tokens:
-                            logger.exception(
-                                "stream: get_audio_segment FAILED seg_idx={} codes_shape={} req={}: {}",
-                                seg_idx + 1,
-                                (
-                                    result.codes.shape
-                                    if result.codes is not None
-                                    else None
-                                ),
-                                req_tag,
-                                seg_err,
-                            )
-                        raise
-                    seg_idx += 1
-                    _mark("segment_decoded", segment_idx=seg_idx, samples=len(segment))
-                    if stream_tokens:
-                        logger.info(
-                            "stream: segment_decoded seg_idx={} samples={} req={}",
-                            seg_idx,
-                            len(segment),
-                            req_tag,
-                        )
-
-                    if req.streaming:
-                        _mark("yield_segment", segment_idx=seg_idx)
-                        yield InferenceResult(
-                            code="segment",
-                            audio=(sample_rate, segment),
-                            error=None,
-                        )
-                    if ack_queue is not None:
-                        ack_queue.put(None)
-                    segments.append(segment)
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                else:
-                    if stream_tokens:
-                        logger.info(
-                            "stream: got_next (end of stream), total_segments={} req={}",
-                            seg_idx,
-                            req_tag,
-                        )
-                    if ack_queue is not None:
-                        ack_queue.put(None)
-                    _mark("got_next")
-                    break
-
-            # Clean up the memory so next request starts near baseline (~14 GB); otherwise second request OOMs on 32 GB.
-            if torch.cuda.is_available():
-                wrapped_result = None
-                result = None
-                gc.collect()
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-                gc.collect()
-                torch.cuda.empty_cache()
-
-            if len(segments) == 0:
-                _mark("yield_error_empty")
-                yield InferenceResult(
-                    code="error",
-                    audio=None,
-                    error=RuntimeError(
-                        "No audio generated, please check the input text."
-                    ),
-                )
-            else:
-                audio = np.concatenate(segments, axis=0)
-                _mark("yield_final", total_samples=len(audio), segments=len(segments))
-                yield InferenceResult(
-                    code="final",
-                    audio=(sample_rate, audio),
-                    error=None,
-                )
-
-            return None
-        finally:
-            # When generator is closed (client done), try to free VRAM again so next request does not OOM.
-            if torch.cuda.is_available():
-                gc.collect()
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-                gc.collect()
-                torch.cuda.empty_cache()
-
-    def send_Llama_request(
-        self,
-        req: ServeTTSRequest,
-        prompt_tokens: list,
-        prompt_texts: list,
-        req_tag: str,
-        ack_queue: queue.Queue | None = None,
-    ) -> queue.Queue:
-        """
-        Send a request to the LLAMA model to generate the symbolic tokens.
-        """
-
-        # Prepare the request
-        # When streaming API is used, enable token-level streaming for low TTFA
-        stream_tokens = getattr(req, "stream_tokens", False) or req.streaming
-        request = dict(
-            device=self.decoder_model.device,
-            req_tag=req_tag,
-            max_new_tokens=req.max_new_tokens,
-            text=req.text,
-            top_p=req.top_p,
-            repetition_penalty=req.repetition_penalty,
-            temperature=req.temperature,
-            compile=self.compile,
-            iterative_prompt=req.chunk_length > 0,
-            chunk_length=req.chunk_length,
-            prompt_tokens=prompt_tokens,
-            prompt_text=prompt_texts,
-            stream_tokens=stream_tokens,
-            stream_chunk_size=getattr(req, "stream_chunk_size", 8),
-            initial_stream_chunk_size=getattr(req, "initial_stream_chunk_size", 10),
-            ack_queue=ack_queue,
-        )
-
-        # Create a queue to get the response
-        response_queue = queue.Queue()
-
-        # Send the request to the LLAMA model
-        self.llama_queue.put(
-            GenerateRequest(
-                request=request,
-                response_queue=response_queue,
-            )
-        )
-
-        return response_queue
-
-    def get_audio_segment(self, result: GenerateResponse) -> np.ndarray:
-        """
-        Decode the VQ tokens to audio.
-        """
-
-        # Don't use autocast on MPS devices
-        with autocast_exclude_mps(
-            device_type=self.decoder_model.device.type, dtype=self.precision
-        ):
-            # Decode the symbolic tokens to audio
-            segment = self.decode_vq_tokens(codes=result.codes)
-
-        # Convert the audio to numpy (detach: inference path has no grad, but we no longer use inference_mode)
-        return segment.float().detach().cpu().numpy()
-
-
 path: /fish_speech/inference_engine/reference_loader.py
 ----------------------------------------
 # fish_speech/inference_engine/reference_loader.py
@@ -2432,365 +2156,6 @@ class ReferenceLoader:
             stems = {p.stem for p in audio_files} | {_stem_for_codes(p) for p in code_files}
 
             has_valid_pair = any((ref_dir / f"{stem}.lab").exists() for stem in stems)
-
-            if has_valid_pair:
-                valid_ids.append(ref_dir.name)
-
-        return sorted(valid_ids)
-
-    def add_reference_encoded(
-        self, id: str, codes_bytes: bytes, lab_text: str, stem: str | None = None
-    ) -> Literal["created", "updated", "unchanged"]:
-        """
-        Add or update a pre-encoded reference (e.g. from preencode_references.py).
-        Writes references/<id>/<stem>.codes.pt and <stem>.lab (stem defaults to id). Skips if hash matches.
-        """
-        import re
-
-        if not re.match(r"^[a-zA-Z0-9\-_ ]+$", id):
-            raise ValueError(
-                "Reference ID contains invalid characters. Only alphanumeric, hyphens, underscores, and spaces are allowed."
-            )
-        if len(id) > 255:
-            raise ValueError(
-                "Reference ID is too long. Maximum length is 255 characters."
-            )
-        stem = stem or id
-        if not re.match(r"^[a-zA-Z0-9\-_ ]+$", stem):
-            raise ValueError("Stem contains invalid characters.")
-
-        ref_dir = Path("references") / id
-        payload = codes_bytes + lab_text.encode("utf-8")
-        content_hash = sha256(payload).hexdigest()
-        hash_file = ref_dir / f".{stem}.hash"
-
-        if ref_dir.exists() and hash_file.exists():
-            if hash_file.read_text(encoding="utf-8").strip() == content_hash:
-                logger.info(
-                    "Reference %s/%s unchanged (hash match), skip write", id, stem
-                )
-                return "unchanged"
-
-        existed_before = ref_dir.exists() and (ref_dir / f"{stem}.codes.pt").exists()
-        ref_dir.mkdir(parents=True, exist_ok=True)
-        (ref_dir / f"{stem}.codes.pt").write_bytes(codes_bytes)
-        (ref_dir / f"{stem}.lab").write_text(lab_text, encoding="utf-8")
-        hash_file.write_text(content_hash, encoding="utf-8")
-        if id in self.ref_by_id:
-            del self.ref_by_id[id]
-        status = "updated" if existed_before else "created"
-        logger.info("Reference %s/%s %s", id, stem, status)
-        return status
-
-    def add_reference(self, id: str, wav_file_path: str, reference_text: str) -> None:
-        """
-        Add a new reference voice by creating a new directory and copying files.
-
-        Args:
-            id: Reference ID (directory name)
-            wav_file_path: Path to the audio file to copy
-            reference_text: Text content for the .lab file
-
-        Raises:
-            FileExistsError: If the reference ID already exists
-            FileNotFoundError: If the audio file doesn't exist
-            OSError: If file operations fail
-        """
-        # Validate ID format
-        import re
-
-        if not re.match(r"^[a-zA-Z0-9\-_ ]+$", id):
-            raise ValueError(
-                "Reference ID contains invalid characters. Only alphanumeric, hyphens, underscores, and spaces are allowed."
-            )
-
-        if len(id) > 255:
-            raise ValueError(
-                "Reference ID is too long. Maximum length is 255 characters."
-            )
-
-        # Check if reference already exists
-        ref_dir = Path("references") / id
-        if ref_dir.exists():
-            raise FileExistsError(f"Reference ID '{id}' already exists")
-
-        # Check if audio file exists
-        audio_path = Path(wav_file_path)
-        if not audio_path.exists():
-            raise FileNotFoundError(f"Audio file not found: {wav_file_path}")
-
-        # Validate audio file extension
-        if audio_path.suffix.lower() not in AUDIO_EXTENSIONS:
-            raise ValueError(
-                f"Unsupported audio format: {audio_path.suffix}. Supported formats: {', '.join(AUDIO_EXTENSIONS)}"
-            )
-
-        try:
-            # Create reference directory
-            ref_dir.mkdir(parents=True, exist_ok=False)
-
-            # Determine the target audio filename with original extension
-            target_audio_path = ref_dir / f"sample{audio_path.suffix}"
-
-            # Copy audio file
-            import shutil
-
-            shutil.copy2(audio_path, target_audio_path)
-
-            # Create .lab file
-            lab_path = ref_dir / "sample.lab"
-            with open(lab_path, "w", encoding="utf-8") as f:
-                f.write(reference_text)
-
-            # Clear cache for this ID if it exists
-            if id in self.ref_by_id:
-                del self.ref_by_id[id]
-
-            logger.info(f"Successfully added reference voice with ID: {id}")
-
-        except Exception as e:
-            # Clean up on failure
-            if ref_dir.exists():
-                import shutil
-
-                shutil.rmtree(ref_dir)
-            raise e
-
-    def delete_reference(self, id: str) -> None:
-        """
-        Delete a reference voice by removing its directory and files.
-
-        Args:
-            id: Reference ID (directory name) to delete
-
-        Raises:
-            FileNotFoundError: If the reference ID doesn't exist
-            OSError: If file operations fail
-        """
-        # Check if reference exists
-        ref_dir = Path("references") / id
-        if not ref_dir.exists():
-            raise FileNotFoundError(f"Reference ID '{id}' does not exist")
-
-        try:
-            # Remove the entire reference directory
-            import shutil
-
-            shutil.rmtree(ref_dir)
-
-            # Clear cache for this ID if it exists
-            if id in self.ref_by_id:
-                del self.ref_by_id[id]
-
-            logger.info(f"Successfully deleted reference voice with ID: {id}")
-
-        except Exception as e:
-            logger.error(f"Failed to delete reference '{id}': {e}")
-            raise OSError(f"Failed to delete reference '{id}': {e}")
-
-
-path: /fish_speech/inference_engine/reference_loader.py.bak_step1
-----------------------------------------
-# fish_speech/inference_engine/reference_loader.py
-import io
-from hashlib import sha256
-from pathlib import Path
-from typing import Callable, Literal, Tuple
-
-import torch
-import torchaudio
-from loguru import logger
-
-from fish_speech.models.dac.modded_dac import DAC
-from fish_speech.utils.file import (
-    AUDIO_EXTENSIONS,
-    audio_to_bytes,
-    list_files,
-    read_ref_text,
-)
-from fish_speech.utils.schema import ServeReferenceAudio
-
-
-class ReferenceLoader:
-    def __init__(self) -> None:
-        """
-        Component of the TTSInferenceEngine class.
-        Loads and manages the cache for the reference audio and text.
-        """
-        self.ref_by_id: dict = {}
-        self.ref_by_hash: dict = {}
-
-        # Make Pylance happy (attribut/method not defined...)
-        self.decoder_model: DAC
-        self.encode_reference: Callable
-
-        # Define the torchaudio backend
-        backends = torchaudio.list_audio_backends()
-        if "ffmpeg" in backends:
-            self.backend = "ffmpeg"
-        else:
-            self.backend = "soundfile"
-
-    def load_by_id(
-        self,
-        id: str,
-        use_cache: Literal["on", "off"],
-    ) -> Tuple:
-        # Load the references audio and text by id.
-        # Each reference can be: (a) .wav + .lab → encode at load, or (b) .codes.pt + .lab → load pre-encoded (no encoder run).
-        ref_folder = Path("references") / id
-        ref_folder.mkdir(parents=True, exist_ok=True)
-        ref_audios = list_files(
-            ref_folder, AUDIO_EXTENSIONS, recursive=True, sort=False
-        )
-        ref_codes = list(ref_folder.glob("*.codes.pt"))
-
-        # .codes.pt filename stem is "en.codes" (Path.stem); we want logical stem "en" for en.lab / en.codes.pt
-        def _stem_for_codes(p: Path) -> str:
-            s = p.stem
-            return s.removesuffix(".codes") if s.endswith(".codes") else s
-
-        stems = {p.stem for p in ref_audios} | {_stem_for_codes(p) for p in ref_codes}
-        stems = sorted(stems)
-
-        if use_cache == "off" or id not in self.ref_by_id:
-            prompt_tokens = []
-            prompt_texts = []
-            for stem in stems:
-                lab_path = ref_folder / f"{stem}.lab"
-                codes_path = ref_folder / f"{stem}.codes.pt"
-                audio_path = next(
-                    (
-                        ref_folder / f"{stem}{ext}"
-                        for ext in AUDIO_EXTENSIONS
-                        if (ref_folder / f"{stem}{ext}").exists()
-                    ),
-                    None,
-                )
-                if not lab_path.exists():
-                    logger.warning("Reference stem {} missing .lab, skipping", stem)
-                    continue
-                prompt_texts.append(read_ref_text(str(lab_path)))
-                if codes_path.exists():
-                    # Pre-encoded: load from disk (no encoder run). File must be tensor shape (num_codebooks, T) from DAC encode.
-                    # map_location="cpu" = put tensor in RAM (worker will .to(device) later). Loading to GPU here would save one tiny copy but is negligible for KB-sized tensors.
-                    loaded = torch.load(
-                        codes_path, map_location="cpu", weights_only=True
-                    )
-                    prompt_tokens.append(
-                        loaded if isinstance(loaded, torch.Tensor) else loaded[0]
-                    )
-                    logger.info(
-                        "Loaded pre-encoded reference {} from {}", stem, codes_path.name
-                    )
-                elif audio_path is not None:
-                    prompt_tokens.append(
-                        self.encode_reference(
-                            reference_audio=audio_to_bytes(str(audio_path)),
-                            enable_reference_audio=True,
-                        )
-                    )
-                else:
-                    logger.warning(
-                        "Reference stem {} has .lab but no .codes.pt or audio, skipping",
-                        stem,
-                    )
-                    prompt_texts.pop()
-            self.ref_by_id[id] = (prompt_tokens, prompt_texts)
-
-        else:
-            # Reuse already encoded references
-            logger.info("Use same references")
-            prompt_tokens, prompt_texts = self.ref_by_id[id]
-
-        return prompt_tokens, prompt_texts
-
-    def load_by_hash(
-        self,
-        references: list[ServeReferenceAudio],
-        use_cache: Literal["on", "off"],
-    ) -> Tuple:
-        # Load the references audio and text by hash
-        audio_hashes = [sha256(ref.audio).hexdigest() for ref in references]
-
-        cache_used = False
-        prompt_tokens, prompt_texts = [], []
-        for i, ref in enumerate(references):
-            if use_cache == "off" or audio_hashes[i] not in self.ref_by_hash:
-                # If the references are not already loaded, encode them
-                prompt_tokens.append(
-                    self.encode_reference(
-                        reference_audio=ref.audio,
-                        enable_reference_audio=True,
-                    )
-                )
-                prompt_texts.append(ref.text)
-                self.ref_by_hash[audio_hashes[i]] = (prompt_tokens[-1], ref.text)
-
-            else:
-                # Reuse already encoded references
-                cached_token, cached_text = self.ref_by_hash[audio_hashes[i]]
-                prompt_tokens.append(cached_token)
-                prompt_texts.append(cached_text)
-                cache_used = True
-
-        if cache_used:
-            logger.info("Use same references")
-
-        return prompt_tokens, prompt_texts
-
-    def load_audio(self, reference_audio: bytes | str, sr: int):
-        """
-        Load the audio data from a file or bytes.
-        """
-        if len(reference_audio) > 255 or not Path(reference_audio).exists():
-            audio_data = reference_audio
-            reference_audio = io.BytesIO(audio_data)
-
-        waveform, original_sr = torchaudio.load(reference_audio, backend=self.backend)
-
-        if waveform.shape[0] > 1:
-            waveform = torch.mean(waveform, dim=0, keepdim=True)
-
-        if original_sr != sr:
-            resampler = torchaudio.transforms.Resample(
-                orig_freq=original_sr, new_freq=sr
-            )
-            waveform = resampler(waveform)
-
-        audio = waveform.squeeze().numpy()
-        return audio
-
-    def list_reference_ids(self) -> list[str]:
-        """
-        List all valid reference IDs (subdirectory names containing valid audio and .lab files).
-
-        Returns:
-            list[str]: List of valid reference IDs
-        """
-        ref_base_path = Path("references")
-        if not ref_base_path.exists():
-            return []
-
-        valid_ids = []
-        for ref_dir in ref_base_path.iterdir():
-            if not ref_dir.is_dir():
-                continue
-
-            # Check if directory contains at least one audio file and corresponding .lab file
-            audio_files = list_files(
-                ref_dir, AUDIO_EXTENSIONS, recursive=False, sort=False
-            )
-            if not audio_files:
-                continue
-
-            # Check if corresponding .lab file exists for at least one audio file
-            has_valid_pair = False
-            for audio_file in audio_files:
-                lab_file = audio_file.with_suffix(".lab")
-                if lab_file.exists():
-                    has_valid_pair = True
-                    break
 
             if has_valid_pair:
                 valid_ids.append(ref_dir.name)
@@ -4673,6 +4038,7 @@ from fish_speech.content_sequence import (
     VQPart,
 )
 from fish_speech.conversation import Conversation, Message
+from fish_speech.runtime_config import load_runtime_config
 from fish_speech.tokenizer import IM_END_TOKEN
 
 
@@ -4691,30 +4057,14 @@ def _to_normal_tensor(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
 def _iter_no_grad(iterator: Iterator[torch.Tensor]) -> Iterator[torch.Tensor]:
     """
     Iterate a lazy generator under torch.no_grad().
-
-    Important: decorating the factory that *creates* a generator is not enough, because the
-    actual work happens later during iteration. Token streaming uses a lazy decode iterator,
-    so we must wrap the iteration itself to keep autograd disabled and avoid retaining graphs
-    and temporary dequantized weights on GPU.
     """
     with torch.no_grad():
         for item in iterator:
             yield item
 
 
-def _env_flag(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _use_sdpa_math() -> bool:
-    """
-    Do not implicitly force math attention just because torch.compile is enabled.
-    Enable it only explicitly via FISH_SDPA_MATH=1 when it is really needed as a fallback.
-    """
-    return _env_flag("FISH_SDPA_MATH", False)
+    return load_runtime_config().model.sdpa_math
 
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -4735,17 +4085,8 @@ from fish_speech.models.text2semantic.llama import (
 
 
 def _cache_max_seq_len(model: BaseTransformer) -> int:
-    """
-    Max sequence length used for KV cache and buffers. Tuned for streaming (short turns);
-    512 tokens ~= 41 s audio. Set FISH_CACHE_MAX_SEQ_LEN to override (e.g. 4096 for long form).
-    """
-    default = 512
-    raw = os.environ.get("FISH_CACHE_MAX_SEQ_LEN", str(default))
-    try:
-        n = int(raw)
-    except ValueError:
-        n = default
-    return min(max(1, n), model.config.max_seq_len)
+    configured = load_runtime_config().model.cache_max_seq_len
+    return min(max(1, configured), model.config.max_seq_len)
 
 
 def multinomial_sample_one_no_sync(probs_sort):
@@ -4754,7 +4095,7 @@ def multinomial_sample_one_no_sync(probs_sort):
     return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.int)
 
 
-RAS_WIN_SIZE = 10  # window for Repetition Aware Sampling
+RAS_WIN_SIZE = 10
 RAS_HIGH_TEMP = 1.0
 RAS_HIGH_TOP_P = 0.9
 
@@ -4899,9 +4240,6 @@ def decode_n_tokens(
     Generate tokens autoregressively.
     """
 
-    # ВАЖНО:
-    # normal/inference-tensor workaround нужен только для compile-path,
-    # а не для любого streaming.
     need_normal_state = bool(stream_chunk_size is not None and compile)
 
     if need_normal_state:
@@ -5269,9 +4607,6 @@ class GenerateResponse:
 
 
 def split_text_by_speaker(text: str) -> list[str]:
-    """
-    Split text into turns based on <|speaker:X|> tags.
-    """
     pattern = r"(<\|speaker:\d+\|>)"
     parts = re.split(pattern, text)
 
@@ -5294,10 +4629,6 @@ def split_text_by_speaker(text: str) -> list[str]:
 
 
 def split_text_by_bytes(text: str, max_bytes: int) -> list[str]:
-    """
-    Split text into chunks of at most max_bytes (UTF-8). Used when there are
-    no speaker turns so that chunk_length still controls batch size for streaming.
-    """
     if max_bytes <= 0 or len(text.encode("utf-8")) <= max_bytes:
         return [text] if text.strip() else []
     chunks = []
@@ -5318,9 +4649,6 @@ def split_text_by_bytes(text: str, max_bytes: int) -> list[str]:
 def group_turns_into_batches(
     turns: list[str], max_speakers: int = 3, max_bytes: int = 300
 ) -> list[str]:
-    """
-    Group turns into batches based on speaker count or byte limit.
-    """
     batches = []
     current_batch = []
     current_bytes = 0
@@ -5369,6 +4697,7 @@ def generate_long(
     assert 0 < top_p <= 1, "top_p must be in (0, 1]"
     assert 0 < temperature < 2, "temperature must be in (0, 2)"
 
+    runtime = load_runtime_config()
     use_prompt = bool(prompt_text) and bool(prompt_tokens)
     if use_prompt and isinstance(prompt_text, str):
         prompt_text = [prompt_text]
@@ -5494,7 +4823,7 @@ def generate_long(
             if prompt_len > max_length:
                 raise ValueError(
                     f"Prompt length {prompt_len} exceeds KV cache size {max_length}. "
-                    f"Increase FISH_CACHE_MAX_SEQ_LEN (e.g. 1024 or 2048) or use a shorter reference."
+                    f"Increase cache_max_seq_len in config/runtime.json or use a shorter reference."
                 )
             if prompt_len + max_new_tokens > max_length:
                 max_new_tokens = max_length - prompt_len
@@ -5504,18 +4833,14 @@ def generate_long(
                     prompt_len,
                     max_length,
                 )
-            cap_env = os.environ.get("FISH_MAX_NEW_TOKENS_CAP", "").strip()
-            if cap_env:
-                try:
-                    cap = int(cap_env)
-                    if cap >= 1 and max_new_tokens > cap:
-                        max_new_tokens = cap
-                        logger.info(
-                            "Capping max_new_tokens to {} (FISH_MAX_NEW_TOKENS_CAP) for VRAM safety",
-                            max_new_tokens,
-                        )
-                except ValueError:
-                    pass
+
+            cap = runtime.model.max_new_tokens_cap
+            if cap >= 1 and max_new_tokens > cap:
+                max_new_tokens = cap
+                logger.info(
+                    "Capping max_new_tokens to {} (runtime.model.max_new_tokens_cap) for VRAM safety",
+                    max_new_tokens,
+                )
 
             encoded = encoded.to(device=device)
             prompt_length = encoded.size(1)
@@ -5657,7 +4982,6 @@ class GenerateRequest:
 
 
 def _model_param_memory_gb(module: torch.nn.Module) -> tuple[float, int]:
-    """Return (param_memory_gb, param_count) for a module (weights only)."""
     total = 0
     count = 0
     for p in module.parameters():
@@ -5680,21 +5004,14 @@ def launch_thread_safe_queue(
     init_event = threading.Event()
 
     def worker():
-        profile_cadence = os.getenv("FISH_PROFILE_INFERENCE", "0") in {
-            "1",
-            "true",
-            "TRUE",
-            "yes",
-            "YES",
-        }
-        cleanup_after_request = _env_flag("FISH_CLEANUP_AFTER_REQUEST", False)
-        cleanup_every_n_requests = max(
-            0, int(os.getenv("FISH_CLEANUP_EVERY_N_REQUESTS", "0") or "0")
-        )
-        cleanup_on_error = _env_flag("FISH_CLEANUP_ON_ERROR", True)
-        empty_cache_per_stream_chunk = _env_flag(
-            "FISH_EMPTY_CACHE_PER_STREAM_CHUNK", False
-        )
+        runtime = load_runtime_config()
+        model_cfg = runtime.model
+
+        profile_cadence = model_cfg.profile_inference
+        cleanup_after_request = model_cfg.cleanup_after_request
+        cleanup_every_n_requests = model_cfg.cleanup_every_n_requests
+        cleanup_on_error = model_cfg.cleanup_on_error
+        empty_cache_per_stream_chunk = model_cfg.empty_cache_per_stream_chunk
         requests_since_cleanup = 0
 
         model, decode_one_token = init_model(
@@ -7391,6 +6708,294 @@ def get_merged_state_dict(model):
     return state_dict
 
 
+path: /fish_speech/runtime_config.py
+----------------------------------------
+from __future__ import annotations
+
+import json
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_RUNTIME_CONFIG_PATH = ROOT_DIR / "config" / "runtime.json"
+
+
+class PathsConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    llama_checkpoint_path: str = "checkpoints/s2-pro"
+    decoder_checkpoint_path: str = "checkpoints/s2-pro/codec.pth"
+    decoder_config_name: str = "modded_dac_vq"
+    references_dir: str = "references"
+
+
+class NetworkEndpointConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    host: str
+    port: int = Field(..., ge=1, le=65535)
+
+
+class NetworkConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    server: NetworkEndpointConfig
+    proxy: NetworkEndpointConfig
+    upstream_tts_url: str
+
+
+class ModelConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    device: str = "cuda"
+    precision: str = "bfloat16"
+    compile: bool = True
+    cache_max_seq_len: int = Field(768, ge=1)
+    max_new_tokens_cap: int = Field(128, ge=1)
+    sdpa_math: bool = False
+
+    cleanup_after_request: bool = False
+    cleanup_every_n_requests: int = Field(0, ge=0)
+    cleanup_on_error: bool = True
+    cleanup_on_abort: bool = True
+    empty_cache_per_stream_chunk: bool = False
+    empty_cache_per_segment: bool = False
+
+    profile_inference: bool = False
+    record_memory_history: bool = False
+    memory_history_max_entries: int = Field(100000, ge=1)
+
+    @field_validator("precision")
+    @classmethod
+    def validate_precision(cls, value: str) -> str:
+        value = value.strip().lower()
+        if value not in {"bfloat16", "float16", "float32"}:
+            raise ValueError("precision must be one of: bfloat16, float16, float32")
+        return value
+
+
+class WarmupConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    reference_id: str | None = "voice"
+    text: str = "Привет. Это дополнительный прогрев стримингового режима для Fish Speech."
+    streaming: bool = True
+    stream_tokens: bool = True
+    max_new_tokens: int = Field(96, ge=1)
+    chunk_length: int = Field(180, ge=100, le=300)
+    initial_stream_chunk_size: int = Field(8, ge=1, le=200)
+    stream_chunk_size: int = Field(8, ge=1, le=200)
+
+    @model_validator(mode="after")
+    def validate_chunk_sizes(self) -> "WarmupConfig":
+        if self.initial_stream_chunk_size < self.stream_chunk_size:
+            raise ValueError("initial_stream_chunk_size must be >= stream_chunk_size")
+        return self
+
+
+class CommitStageConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    min_chars: int = Field(..., ge=1)
+    target_chars: int = Field(..., ge=1)
+    max_chars: int = Field(..., ge=1)
+    max_wait_ms: int = Field(..., ge=1)
+    allow_partial_after_ms: int = Field(..., ge=1)
+
+    @model_validator(mode="after")
+    def validate_lengths(self) -> "CommitStageConfig":
+        if self.min_chars > self.target_chars:
+            raise ValueError("min_chars must be <= target_chars")
+        if self.target_chars > self.max_chars:
+            raise ValueError("target_chars must be <= max_chars")
+        if self.max_wait_ms > self.allow_partial_after_ms:
+            raise ValueError("max_wait_ms must be <= allow_partial_after_ms")
+        return self
+
+
+class CommitPolicyConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    first: CommitStageConfig
+    next: CommitStageConfig
+    flush_on_sentence_punctuation: bool = True
+    flush_on_clause_punctuation: bool = True
+    flush_on_newline: bool = True
+    carry_incomplete_tail: bool = True
+
+
+class ProxyTTSConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reference_id: str = "voice"
+    format: str = "wav"
+    normalize: bool = True
+    use_memory_cache: str = "on"
+    seed: int | None = None
+    max_new_tokens: int = Field(128, ge=1, le=512)
+    chunk_length: int = Field(180, ge=100, le=300)
+    top_p: float = Field(0.8, ge=0.1, le=1.0)
+    repetition_penalty: float = Field(1.08, ge=0.9, le=2.0)
+    temperature: float = Field(0.75, ge=0.1, le=1.0)
+    stream_tokens: bool = True
+    initial_stream_chunk_size: int = Field(8, ge=1, le=200)
+    stream_chunk_size: int = Field(8, ge=1, le=200)
+
+    @field_validator("format")
+    @classmethod
+    def validate_format(cls, value: str) -> str:
+        value = value.strip().lower()
+        if value != "wav":
+            raise ValueError("only format='wav' is supported in proxy runtime config")
+        return value
+
+    @field_validator("use_memory_cache")
+    @classmethod
+    def validate_use_memory_cache(cls, value: str) -> str:
+        value = value.strip().lower()
+        if value not in {"on", "off"}:
+            raise ValueError("use_memory_cache must be 'on' or 'off'")
+        return value
+
+    @model_validator(mode="after")
+    def validate_chunk_sizes(self) -> "ProxyTTSConfig":
+        if self.initial_stream_chunk_size < self.stream_chunk_size:
+            raise ValueError("initial_stream_chunk_size must be >= stream_chunk_size")
+        return self
+
+
+class PlaybackConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_emit_bytes: int = Field(4096, ge=512, le=32768)
+    start_buffer_ms: int = Field(90, ge=0, le=5000)
+    stop_grace_ms: int = Field(40, ge=0, le=5000)
+
+    @field_validator("target_emit_bytes")
+    @classmethod
+    def validate_even_bytes(cls, value: int) -> int:
+        if value % 2 != 0:
+            raise ValueError("target_emit_bytes must be even for PCM16")
+        return value
+
+
+class SessionRuntimeConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_buffer_chars: int = Field(4000, ge=256, le=100_000)
+    auto_close_on_finish: bool = False
+
+
+class ProxyConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    default_reference_id: str = "voice"
+    session_ttl_sec: int = Field(1800, ge=1)
+    session_max_count: int = Field(128, ge=1)
+
+    version: int = 1
+    commit: CommitPolicyConfig
+    tts: ProxyTTSConfig
+    playback: PlaybackConfig
+    session: SessionRuntimeConfig
+
+    @model_validator(mode="after")
+    def normalize_reference_id(self) -> "ProxyConfig":
+        if not self.tts.reference_id.strip():
+            self.tts.reference_id = self.default_reference_id
+        return self
+
+
+class FrontendOverridesConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    allowed_paths: list[str] = Field(default_factory=list)
+
+
+class AppConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = 1
+    paths: PathsConfig
+    network: NetworkConfig
+    model: ModelConfig
+    warmup: WarmupConfig
+    proxy: ProxyConfig
+    frontend_overrides: FrontendOverridesConfig
+
+
+def deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    out = json.loads(json.dumps(base))
+    for key, value in patch.items():
+        if key in out and isinstance(out[key], dict) and isinstance(value, dict):
+            out[key] = deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _iter_leaf_paths(value: Any, prefix: str = "") -> list[str]:
+    if isinstance(value, dict):
+        paths: list[str] = []
+        for key, child in value.items():
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            paths.extend(_iter_leaf_paths(child, child_prefix))
+        return paths
+    return [prefix] if prefix else []
+
+
+def _normalize_allowed_path(path: str) -> str:
+    path = path.strip().strip(".")
+    if path.startswith("proxy."):
+        path = path[len("proxy.") :]
+    if path.startswith("session."):
+        path = path[len("session.") :]
+    return path
+
+
+def merge_frontend_proxy_override(
+    override_patch: dict[str, Any],
+    runtime: AppConfig | None = None,
+) -> ProxyConfig:
+    runtime = runtime or load_runtime_config()
+
+    if not isinstance(override_patch, dict):
+        raise ValueError("frontend override must be a JSON object")
+
+    if runtime.frontend_overrides.enabled:
+        requested = {
+            _normalize_allowed_path(path)
+            for path in _iter_leaf_paths(override_patch)
+            if path.strip()
+        }
+        allowed = {
+            _normalize_allowed_path(path)
+            for path in runtime.frontend_overrides.allowed_paths
+            if path.strip()
+        }
+        disallowed = sorted(path for path in requested if path not in allowed)
+        if disallowed:
+            raise ValueError(
+                "frontend override contains disallowed paths: " + ", ".join(disallowed)
+            )
+
+    merged = deep_merge(runtime.proxy.model_dump(mode="python"), override_patch)
+    return ProxyConfig.model_validate(merged)
+
+
+@lru_cache(maxsize=4)
+def load_runtime_config(path: str | Path | None = None) -> AppConfig:
+    config_path = Path(path) if path is not None else DEFAULT_RUNTIME_CONFIG_PATH
+    with config_path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    return AppConfig.model_validate(payload)
+
+
 path: /fish_speech/tokenizer.py
 ----------------------------------------
 # fish_speech/tokenizer.py
@@ -8496,134 +8101,6 @@ echo "  Memory:  curl -s http://127.0.0.1:$PORT/v1/debug/memory"
 echo "  Logs:    docker logs -f $CONTAINER"
 
 
-path: /scripts/test_step1_stream_ref.py
-----------------------------------------
-#!/usr/bin/env python3
-import argparse
-import json
-import os
-import time
-from pathlib import Path
-
-import requests
-
-
-def get_memory(base_url: str):
-    try:
-        r = requests.get(f"{base_url}/v1/debug/memory", timeout=10)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--base-url", default="http://127.0.0.1:8080")
-    ap.add_argument("--reference-id", required=True)
-    ap.add_argument("--text", required=True)
-    ap.add_argument("--runs", type=int, default=3)
-    ap.add_argument("--warmup", action="store_true")
-    ap.add_argument("--out-dir", default="logs/step1_stream_ref")
-    args = ap.parse_args()
-
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    payload = {
-        "text": args.text,
-        "reference_id": args.reference_id,
-        "references": [],
-        "streaming": True,
-        "stream_tokens": False,
-        "format": "wav",
-        "max_new_tokens": 128,
-        "chunk_length": 200,
-        "top_p": 0.8,
-        "repetition_penalty": 1.1,
-        "temperature": 0.8,
-        "use_memory_cache": "on",
-        "seed": 1234,
-    }
-
-    def one_run(run_idx: int, counted: bool):
-        before_mem = get_memory(args.base_url)
-        started = time.perf_counter()
-
-        with requests.post(
-            f"{args.base_url}/v1/tts",
-            json=payload,
-            stream=True,
-            timeout=(10, 300),
-        ) as r:
-            r.raise_for_status()
-
-            out_path = out_dir / f"run_{run_idx:02d}.wav"
-            total = 0
-            first_chunk_ms = None
-            first_audio_ms = None
-
-            with open(out_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=4096):
-                    if not chunk:
-                        continue
-
-                    now_ms = (time.perf_counter() - started) * 1000.0
-
-                    if first_chunk_ms is None:
-                        first_chunk_ms = now_ms
-
-                    prev_total = total
-                    total += len(chunk)
-                    f.write(chunk)
-
-                    # WAV header usually 44 bytes; нас интересует момент прихода первого аудио байта
-                    if first_audio_ms is None and total > 44:
-                        if prev_total <= 44:
-                            first_audio_ms = now_ms
-
-        total_ms = (time.perf_counter() - started) * 1000.0
-        after_mem = get_memory(args.base_url)
-
-        result = {
-            "counted": counted,
-            "run_idx": run_idx,
-            "first_chunk_ms": round(first_chunk_ms or -1, 1),
-            "first_audio_ms": round(first_audio_ms or -1, 1),
-            "total_ms": round(total_ms, 1),
-            "bytes_written": total,
-            "before_allocated_gb": before_mem.get("allocated_gb"),
-            "after_allocated_gb": after_mem.get("allocated_gb"),
-            "before_reserved_gb": before_mem.get("reserved_gb"),
-            "after_reserved_gb": after_mem.get("reserved_gb"),
-            "before_max_allocated_gb": before_mem.get("max_allocated_gb"),
-            "after_max_allocated_gb": after_mem.get("max_allocated_gb"),
-            "out_path": str(out_path),
-        }
-
-        print(json.dumps(result, ensure_ascii=False))
-        return result
-
-    if args.warmup:
-        print("=== warmup ===")
-        one_run(0, counted=False)
-
-    print("=== measured runs ===")
-    results = []
-    for i in range(1, args.runs + 1):
-        results.append(one_run(i, counted=True))
-
-    summary_path = out_dir / "summary.json"
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
-
-    print(f"saved summary: {summary_path}")
-
-
-if __name__ == "__main__":
-    main()
-
-
 path: /scripts/up_5090.sh
 ----------------------------------------
 #!/usr/bin/env bash
@@ -8862,58 +8339,6 @@ echo "Using warmup reference: $WARMUP_REFERENCE_ID"
 curl -sf -X POST "$BASE_URL/v1/tts" \
   -H 'Content-Type: application/json' \
   -d "{\"text\":\"${WARMUP_TEXT}\",\"streaming\":true,\"stream_tokens\":true,\"reference_id\":\"${WARMUP_REFERENCE_ID}\",\"max_new_tokens\":96,\"chunk_length\":200,\"initial_stream_chunk_size\":18,\"stream_chunk_size\":8}" \
-  --output "$OUT_FILE" \
-  --max-time 180 >/dev/null
-
-echo "Warmup completed"
-echo "Current memory:"
-curl -sf "$BASE_URL/v1/debug/memory" || true
-echo
-
-
-path: /scripts/warmup_5090.sh.bak_step2
-----------------------------------------
-# scripts/warmup_5090.sh
-#!/usr/bin/env bash
-set -euo pipefail
-
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$REPO_ROOT"
-
-PORT="${PORT:-8080}"
-BASE_URL="${BASE_URL:-http://127.0.0.1:${PORT}}"
-WARMUP_TIMEOUT="${WARMUP_TIMEOUT:-1800}"
-WARMUP_TEXT="${WARMUP_TEXT:-Привет. Это дополнительный прогрев стримингового режима для Fish Speech.}"
-OUT_FILE="${OUT_FILE:-$REPO_ROOT/logs/warmup_stream.wav}"
-
-mkdir -p "$REPO_ROOT/logs"
-
-echo "Waiting for model health: $BASE_URL/v1/health"
-
-START_TS="$(date +%s)"
-while true; do
-  if curl -sf "$BASE_URL/v1/health" >/dev/null 2>&1; then
-    break
-  fi
-
-  NOW_TS="$(date +%s)"
-  ELAPSED="$((NOW_TS - START_TS))"
-  echo "Still warming up... ${ELAPSED}s"
-
-  if [[ "$ELAPSED" -ge "$WARMUP_TIMEOUT" ]]; then
-    echo "ERROR: model did not become healthy within ${WARMUP_TIMEOUT}s" >&2
-    exit 1
-  fi
-
-  sleep 10
-done
-
-echo "Model is healthy after $(( $(date +%s) - START_TS ))s"
-echo "Sending one extra warmup streaming request..."
-
-curl -sf -X POST "$BASE_URL/v1/tts" \
-  -H 'Content-Type: application/json' \
-  -d "{\"text\":\"${WARMUP_TEXT}\",\"streaming\":true}" \
   --output "$OUT_FILE" \
   --max-time 180 >/dev/null
 
@@ -10171,10 +9596,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import copy
 import json
 import logging
-import os
 import re
 import struct
 import time
@@ -10186,18 +9609,26 @@ import httpx
 from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
-UPSTREAM_TTS_URL = os.environ.get("UPSTREAM_TTS_URL", "http://127.0.0.1:8080/v1/tts")
+from fish_speech.runtime_config import (
+    CommitPolicyConfig,
+    ProxyConfig,
+    load_runtime_config,
+    merge_frontend_proxy_override,
+)
+
+_RUNTIME = load_runtime_config()
+UPSTREAM_TTS_URL = _RUNTIME.network.upstream_tts_url
 UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=None)
-DEFAULT_REFERENCE_ID = os.environ.get("DEFAULT_REFERENCE_ID", "voice")
-SESSION_TTL_SEC = int(os.environ.get("SESSION_TTL_SEC", "1800"))
-SESSION_MAX_COUNT = int(os.environ.get("SESSION_MAX_COUNT", "128"))
+DEFAULT_REFERENCE_ID = _RUNTIME.proxy.default_reference_id
+SESSION_TTL_SEC = _RUNTIME.proxy.session_ttl_sec
+SESSION_MAX_COUNT = _RUNTIME.proxy.session_max_count
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("fish-proxy")
 
-app = FastAPI(title="Fish Speech PCM Proxy", version="1.0.0")
+app = FastAPI(title="Fish Speech PCM Proxy", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -10210,103 +9641,7 @@ SENTENCE_BOUNDARY_RE = re.compile(r'.+?[.!?…](?:["»”)\]]+)?(?:\s+|$)', re.S
 CLAUSE_BOUNDARY_RE = re.compile(r'.+?[,:;—\-](?:\s+|$)', re.S)
 
 
-class CommitterConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    soft_min_chars: int = Field(140, ge=1, le=500)
-    target_chars: int = Field(220, ge=1, le=800)
-    hard_max_chars: int = Field(320, ge=1, le=1200)
-    flush_on_punctuation: bool = True
-    flush_on_clause_punctuation: bool = False
-    flush_on_newline: bool = True
-    max_wait_ms: int = Field(1800, ge=50, le=20_000)
-    allow_partial_after_ms: int = Field(3500, ge=50, le=60_000)
-    carry_incomplete_tail: bool = True
-
-    @model_validator(mode="after")
-    def validate_lengths(self) -> "CommitterConfig":
-        if self.soft_min_chars > self.target_chars:
-            raise ValueError("soft_min_chars must be <= target_chars")
-        if self.target_chars > self.hard_max_chars:
-            raise ValueError("target_chars must be <= hard_max_chars")
-        if self.max_wait_ms > self.allow_partial_after_ms:
-            raise ValueError("max_wait_ms must be <= allow_partial_after_ms")
-        return self
-
-
-class TTSConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    reference_id: str = Field(DEFAULT_REFERENCE_ID, min_length=1, max_length=255)
-    format: str = Field("wav")
-    normalize: bool = True
-    use_memory_cache: str = Field("on")
-    seed: int | None = None
-    max_new_tokens: int = Field(128, ge=1, le=512)
-    chunk_length: int = Field(200, ge=100, le=300)
-    top_p: float = Field(0.8, ge=0.1, le=1.0)
-    repetition_penalty: float = Field(1.1, ge=0.9, le=2.0)
-    temperature: float = Field(0.8, ge=0.1, le=1.0)
-    stream_tokens: bool = True
-    initial_stream_chunk_size: int = Field(18, ge=1, le=200)
-    stream_chunk_size: int = Field(8, ge=1, le=200)
-
-    @field_validator("format")
-    @classmethod
-    def validate_format(cls, value: str) -> str:
-        value = value.lower().strip()
-        if value != "wav":
-            raise ValueError("proxy currently supports only format='wav'")
-        return value
-
-    @field_validator("use_memory_cache")
-    @classmethod
-    def validate_cache(cls, value: str) -> str:
-        value = value.lower().strip()
-        if value not in {"on", "off"}:
-            raise ValueError("use_memory_cache must be 'on' or 'off'")
-        return value
-
-    @model_validator(mode="after")
-    def validate_chunk_sizes(self) -> "TTSConfig":
-        if self.initial_stream_chunk_size < self.stream_chunk_size:
-            raise ValueError("initial_stream_chunk_size must be >= stream_chunk_size")
-        return self
-
-
-class PlaybackConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    target_emit_bytes: int = Field(16384, ge=512, le=32768)
-    start_buffer_ms: int = Field(450, ge=0, le=5000)
-    stop_grace_ms: int = Field(250, ge=0, le=5000)
-
-    @field_validator("target_emit_bytes")
-    @classmethod
-    def validate_even_bytes(cls, value: int) -> int:
-        if value % 2 != 0:
-            raise ValueError("target_emit_bytes must be even for PCM16")
-        return value
-
-
-class SessionRuntimeConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    max_buffer_chars: int = Field(4000, ge=256, le=100_000)
-    auto_close_on_finish: bool = False
-
-
-class SessionConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    version: int = 1
-    committer: CommitterConfig = Field(default_factory=CommitterConfig)
-    tts: TTSConfig = Field(default_factory=TTSConfig)
-    playback: PlaybackConfig = Field(default_factory=PlaybackConfig)
-    session: SessionRuntimeConfig = Field(default_factory=SessionRuntimeConfig)
-
-
-DEFAULT_SESSION_CONFIG = SessionConfig().model_dump(mode="python")
+DEFAULT_SESSION_CONFIG = _RUNTIME.proxy.model_dump(mode="python")
 
 
 class SessionOpenRequest(BaseModel):
@@ -10447,16 +9782,6 @@ class SessionStore:
 session_store = SessionStore()
 
 
-def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
-    out = copy.deepcopy(base)
-    for key, value in patch.items():
-        if key in out and isinstance(out[key], dict) and isinstance(value, dict):
-            out[key] = _deep_merge(out[key], value)
-        else:
-            out[key] = value
-    return out
-
-
 def _parse_config_text(config_text: str) -> dict[str, Any]:
     try:
         payload = json.loads(config_text)
@@ -10467,24 +9792,24 @@ def _parse_config_text(config_text: str) -> dict[str, Any]:
     return payload
 
 
-def normalize_config(config_text: str) -> SessionConfig:
+def normalize_config(config_text: str) -> ProxyConfig:
     payload = _parse_config_text(config_text)
-    merged = _deep_merge(DEFAULT_SESSION_CONFIG, payload)
     try:
-        return SessionConfig.model_validate(merged)
-    except ValidationError as exc:
-        raise HTTPException(400, detail=json.loads(exc.json())) from exc
+        return merge_frontend_proxy_override(payload, runtime=load_runtime_config())
+    except Exception as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
 
 
-def build_upstream_payload(text: str, config: SessionConfig) -> dict[str, Any]:
+def build_upstream_payload(text: str, config: ProxyConfig) -> dict[str, Any]:
     tts = config.tts
+    reference_id = tts.reference_id.strip() or config.default_reference_id
     payload = {
         "text": text,
         "streaming": True,
         "stream_tokens": tts.stream_tokens,
         "initial_stream_chunk_size": tts.initial_stream_chunk_size,
         "stream_chunk_size": tts.stream_chunk_size,
-        "reference_id": tts.reference_id.strip(),
+        "reference_id": reference_id,
         "format": tts.format,
         "normalize": tts.normalize,
         "use_memory_cache": tts.use_memory_cache,
@@ -10564,7 +9889,13 @@ def _pcm_bytes_for_duration_ms(
     return raw
 
 
-def _last_boundary_before(text: str, limit: int, *, include_clause: bool, include_newline: bool) -> tuple[int, str] | None:
+def _last_boundary_before(
+    text: str,
+    limit: int,
+    *,
+    include_clause: bool,
+    include_newline: bool,
+) -> tuple[int, str] | None:
     candidates: list[tuple[int, str]] = []
 
     for match in SENTENCE_BOUNDARY_RE.finditer(text):
@@ -10597,8 +9928,9 @@ def _last_boundary_before(text: str, limit: int, *, include_clause: bool, includ
 
 def _extract_commits(
     buffer_text: str,
-    cfg: CommitterConfig,
+    cfg: CommitPolicyConfig,
     *,
+    next_commit_seq: int,
     force: bool = False,
 ) -> tuple[list[tuple[str, str]], str]:
     commits: list[tuple[str, str]] = []
@@ -10609,6 +9941,8 @@ def _extract_commits(
         if text_len == 0:
             break
 
+        stage = cfg.first if (next_commit_seq + len(commits)) == 1 else cfg.next
+
         if force:
             piece = _right_trim_committed(text)
             if piece:
@@ -10616,7 +9950,7 @@ def _extract_commits(
             text = ""
             break
 
-        if text_len < cfg.soft_min_chars:
+        if text_len < stage.min_chars:
             break
 
         reason = None
@@ -10624,34 +9958,34 @@ def _extract_commits(
 
         sentence_boundary = _last_boundary_before(
             text,
-            cfg.target_chars,
+            stage.target_chars,
             include_clause=False,
             include_newline=cfg.flush_on_newline,
         )
-        if sentence_boundary and cfg.flush_on_punctuation:
+        if sentence_boundary and cfg.flush_on_sentence_punctuation:
             end, reason = sentence_boundary
 
-        if end is None and text_len >= cfg.target_chars:
+        if end is None and text_len >= stage.target_chars:
             any_boundary = _last_boundary_before(
                 text,
-                cfg.hard_max_chars,
+                stage.max_chars,
                 include_clause=cfg.flush_on_clause_punctuation,
                 include_newline=cfg.flush_on_newline,
             )
             if any_boundary:
                 end, reason = any_boundary
 
-        if end is None and text_len >= cfg.hard_max_chars:
+        if end is None and text_len >= stage.max_chars:
             hard_boundary = _last_boundary_before(
                 text,
-                cfg.hard_max_chars,
+                stage.max_chars,
                 include_clause=cfg.flush_on_clause_punctuation,
                 include_newline=cfg.flush_on_newline,
             )
             if hard_boundary:
                 end, reason = hard_boundary
             else:
-                end, reason = cfg.hard_max_chars, "hard_limit"
+                end, reason = stage.max_chars, "hard_limit"
 
         if end is None:
             break
@@ -10762,7 +10096,7 @@ async def session_append(session_id: str, req: SessionAppendRequest) -> JSONResp
     if rec is None:
         raise HTTPException(404, detail="session not found")
 
-    config = SessionConfig.model_validate(rec.config)
+    config = ProxyConfig.model_validate(rec.config)
     if len(req.text) + len(rec.buffer_text) > config.session.max_buffer_chars:
         raise HTTPException(400, detail="session buffer limit exceeded")
 
@@ -10771,7 +10105,12 @@ async def session_append(session_id: str, req: SessionAppendRequest) -> JSONResp
             raise HTTPException(409, detail="session input already finished")
         rec.append_chars += len(req.text)
         rec.buffer_text += req.text
-        commits, remainder = _extract_commits(rec.buffer_text, config.committer, force=False)
+        commits, remainder = _extract_commits(
+            rec.buffer_text,
+            config.commit,
+            next_commit_seq=rec.next_commit_seq,
+            force=False,
+        )
         rec.buffer_text = remainder
         queued = await _queue_commits(rec, commits)
         await _touch_session(rec)
@@ -10820,7 +10159,7 @@ async def session_finish(session_id: str, req: SessionFinishRequest) -> JSONResp
     if rec is None:
         raise HTTPException(404, detail="session not found")
 
-    config = SessionConfig.model_validate(rec.config)
+    config = ProxyConfig.model_validate(rec.config)
     async with rec.lock:
         if rec.input_closed:
             return JSONResponse(
@@ -10869,7 +10208,7 @@ async def session_pcm_stream(session_id: str):
     if rec.stream_lock.locked():
         raise HTTPException(409, detail="session audio stream already opened")
 
-    config = SessionConfig.model_validate(rec.config)
+    config = ProxyConfig.model_validate(rec.config)
     target_emit_bytes = config.playback.target_emit_bytes
 
     async def emit(obj: dict[str, Any]) -> bytes:
@@ -11090,7 +10429,7 @@ async def session_pcm_stream(session_id: str):
 
 @app.get("/pcm-stream")
 async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
-    config = SessionConfig()
+    config = load_runtime_config().proxy
     req_id = uuid.uuid4().hex[:8]
     payload = build_upstream_payload(text=text, config=config)
     target_emit_bytes = config.playback.target_emit_bytes
@@ -12024,8 +11363,7 @@ async def stream_segments(
 
 path: /tools/server/api_utils.py
 ----------------------------------------
-# tools/server/api_utils.py
-from argparse import ArgumentParser
+from argparse import ArgumentParser, BooleanOptionalAction
 from http import HTTPStatus
 from typing import Annotated, Any
 
@@ -12041,29 +11379,48 @@ from loguru import logger
 from pydantic import BaseModel
 
 from fish_speech.inference_engine import TTSInferenceEngine
+from fish_speech.runtime_config import load_runtime_config
 from fish_speech.utils.schema import ServeTTSRequest
 from tools.server.inference import inference_wrapper as inference
 
 
 def parse_args():
+    cfg = load_runtime_config()
+
     parser = ArgumentParser()
     parser.add_argument("--mode", type=str, choices=["tts"], default="tts")
     parser.add_argument(
         "--llama-checkpoint-path",
         type=str,
-        default="checkpoints/fs-1.2-int8-s2-pro-int8",
+        default=cfg.paths.llama_checkpoint_path,
     )
     parser.add_argument(
         "--decoder-checkpoint-path",
         type=str,
-        default="checkpoints/s2-pro/codec.pth",
+        default=cfg.paths.decoder_checkpoint_path,
     )
-    parser.add_argument("--decoder-config-name", type=str, default="modded_dac_vq")
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--half", action="store_true")
-    parser.add_argument("--compile", action="store_true")
+    parser.add_argument(
+        "--decoder-config-name",
+        type=str,
+        default=cfg.paths.decoder_config_name,
+    )
+    parser.add_argument("--device", type=str, default=cfg.model.device)
+    parser.add_argument(
+        "--half",
+        action=BooleanOptionalAction,
+        default=cfg.model.precision == "float16",
+    )
+    parser.add_argument(
+        "--compile",
+        action=BooleanOptionalAction,
+        default=cfg.model.compile,
+    )
     parser.add_argument("--max-text-length", type=int, default=0)
-    parser.add_argument("--listen", type=str, default="127.0.0.1:8080")
+    parser.add_argument(
+        "--listen",
+        type=str,
+        default=f"{cfg.network.server.host}:{cfg.network.server.port}",
+    )
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--api-key", type=str, default=None)
 
@@ -12119,18 +11476,6 @@ def get_content_type(audio_format):
 
 
 def wants_json(req):
-    """Helper method to determine if the client wants a JSON response
-
-    Parameters
-    ----------
-    req : Request
-        The request object
-
-    Returns
-    -------
-    bool
-        True if the client wants a JSON response, False otherwise
-    """
     q = req.query_params.get("format", "").strip().lower()
     if q in {"json", "application/json", "msgpack", "application/msgpack"}:
         return q == "json"
@@ -12139,21 +11484,6 @@ def wants_json(req):
 
 
 def format_response(response: BaseModel, status_code=200):
-    """
-    Helper function to format responses consistently based on client preference.
-
-    Parameters
-    ----------
-    response : BaseModel
-        The response object to format
-    status_code : int
-        HTTP status code (default: 200)
-
-    Returns
-    -------
-    Response
-        Formatted response in the client's preferred format
-    """
     try:
         if wants_json(request):
             return JSONResponse(
@@ -12170,7 +11500,6 @@ def format_response(response: BaseModel, status_code=200):
         )
     except Exception as e:
         logger.error(f"Error formatting response: {e}", exc_info=True)
-        # Fallback to JSON response if formatting fails
         return JSONResponse(
             {"error": "Response formatting failed", "details": str(e)}, status_code=500
         )
@@ -12278,15 +11607,13 @@ def inference_wrapper(req: ServeTTSRequest, engine: TTSInferenceEngine):
 
 path: /tools/server/model_manager.py
 ----------------------------------------
-# tools/server/model_manager.py
-import os
-
 import torch
 from loguru import logger
 
 from fish_speech.inference_engine import TTSInferenceEngine
 from fish_speech.models.dac.inference import load_model as load_decoder_model
 from fish_speech.models.text2semantic.inference import launch_thread_safe_queue
+from fish_speech.runtime_config import load_runtime_config
 from fish_speech.utils.schema import ServeTTSRequest
 from tools.server.inference import inference_wrapper as inference
 
@@ -12307,10 +11634,10 @@ class ModelManager:
         self.device = device
         self.half = half
         self.compile = compile
+        self.runtime = load_runtime_config()
 
         self.precision = torch.half if half else torch.bfloat16
 
-        # Check if MPS or CUDA is available
         if torch.backends.mps.is_available():
             self.device = "mps"
             logger.info("mps is available, running on mps.")
@@ -12318,9 +11645,8 @@ class ModelManager:
             self.device = "cpu"
             logger.info("CUDA is not available, running on CPU.")
 
-        # Shared dict for worker to report LLM param memory (see /v1/debug/memory).
         self._worker_memory_info = {}
-        # Load the TTS models
+
         self.load_llama_model(
             llama_checkpoint_path, self.device, self.precision, self.compile, self.mode
         )
@@ -12334,26 +11660,21 @@ class ModelManager:
             compile=self.compile,
         )
 
-        # Optional: record CUDA alloc/free history for debugging (dump via GET /v1/debug/memory?dump=1).
-        if torch.cuda.is_available() and os.environ.get(
-            "FISH_RECORD_MEMORY_HISTORY", ""
-        ).strip() in ("1", "true", "True"):
+        if torch.cuda.is_available() and self.runtime.model.record_memory_history:
             try:
-                max_entries = int(
-                    os.environ.get("FISH_MEMORY_HISTORY_MAX_ENTRIES", "100000")
+                torch.cuda.memory._record_memory_history(
+                    max_entries=self.runtime.model.memory_history_max_entries
                 )
-                torch.cuda.memory._record_memory_history(max_entries=max_entries)
                 logger.info(
-                    "CUDA memory history recording enabled (max_entries=%s); use ?dump=1 on /v1/debug/memory to save snapshot",
-                    max_entries,
+                    "CUDA memory history recording enabled (max_entries=%s)",
+                    self.runtime.model.memory_history_max_entries,
                 )
             except Exception as e:
                 logger.warning("Could not enable CUDA memory history recording: %s", e)
 
-        # When --compile: run warmup before accepting requests so /v1/health "ready" = compiled.
-        if self.mode == "tts" and self.compile:
+        if self.mode == "tts" and self.compile and self.runtime.warmup.enabled:
             logger.warning(
-                "torch.compile enabled — running warmup now (Inductor compiles kernels; typically 2–10 min). "
+                "torch.compile enabled — running warmup now. "
                 "Server will accept connections after this."
             )
             self.warm_up(self.tts_inference_engine, compile=True)
@@ -12385,62 +11706,37 @@ class ModelManager:
         logger.info("Decoder model loaded.")
 
     def warm_up(self, tts_inference_engine, *, compile: bool = False) -> None:
-        # Compilation is per input shape: short prompt (warmup) compiles one graph; first
-        # request with long prompt (e.g. reference) compiles another → second delay.
-        # Use small max_new_tokens on warmup to reduce peak VRAM (fits ~32 GB with compile).
+        warmup = self.runtime.warmup
+        reference_id = (
+            warmup.reference_id
+            or self.runtime.proxy.tts.reference_id
+            or self.runtime.proxy.default_reference_id
+        )
+
         if compile:
-            logger.info(
-                "Warmup: first inference (triggers torch.compile/Inductor; "
-                "compiling kernels — can take 2–10+ min, then requests are fast)."
-            )
+            logger.info("Warmup: first inference (compile path).")
+
         request = ServeTTSRequest(
-            text="Hello world.",
+            text=warmup.text,
             references=[],
-            reference_id=None,
-            max_new_tokens=64,  # was 1024; lower = less VRAM during compile, still triggers graph
-            chunk_length=200,
-            top_p=0.7,
-            repetition_penalty=1.2,
-            temperature=0.7,
+            reference_id=reference_id if reference_id else None,
+            max_new_tokens=warmup.max_new_tokens,
+            chunk_length=warmup.chunk_length,
+            top_p=self.runtime.proxy.tts.top_p,
+            repetition_penalty=self.runtime.proxy.tts.repetition_penalty,
+            temperature=self.runtime.proxy.tts.temperature,
             format="wav",
+            streaming=warmup.streaming,
+            stream_tokens=warmup.stream_tokens,
+            initial_stream_chunk_size=warmup.initial_stream_chunk_size,
+            stream_chunk_size=warmup.stream_chunk_size,
+            use_memory_cache=self.runtime.proxy.tts.use_memory_cache,
+            seed=self.runtime.proxy.tts.seed,
         )
         list(inference(request, tts_inference_engine))
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()  # free cached VRAM so first request with reference fits in 32 GB
-        logger.info("Warmup: first inference done.")
-
-        # Optional: compile the long-prompt + streaming path so first real request is fast.
-        # Set FISH_WARMUP_REFERENCE_ID to a valid reference id (e.g. en) to run one
-        # streaming request with that reference at startup. Use ~50 word text so the
-        # compiled graph covers typical range (Hello world .. 50 words) and avoids
-        # recompile on first user request.
-        warmup_ref = os.environ.get("FISH_WARMUP_REFERENCE_ID", "").strip()
-        if compile and warmup_ref:
-            # Text ~50 words so prompt length is in "typical long" range; one compile covers short..long.
-            warmup_long_text = (
-                "Hello, this is a longer warmup so the compiled graph covers prompts from a few words "
-                "to about fifty. We run this once at startup to avoid recompiling on the first real request."
-            )
-            logger.info(
-                "Warmup: running streaming inference with reference_id=%s (long prompt compile, ~50 words)",
-                warmup_ref,
-            )
-            request_long = ServeTTSRequest(
-                text=warmup_long_text,
-                references=[],
-                reference_id=warmup_ref,
-                max_new_tokens=64,
-                chunk_length=200,
-                top_p=0.7,
-                repetition_penalty=1.2,
-                temperature=0.7,
-                format="wav",
-                streaming=True,
-            )
-            list(inference(request_long, tts_inference_engine))
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            logger.info("Warmup (long prompt + streaming) done.")
+            torch.cuda.empty_cache()
+        logger.info("Warmup done.")
 
 
 path: /tools/server/model_utils.py
@@ -13898,8 +13194,8 @@ async def update_reference(
 
 
 === SUMMARY ===
-included: 60
+included: 57
 skipped(binary): 3
 skipped(size): 0
 skipped(ext): 0
-totalBytes(approx): 461049
+totalBytes(approx): 432840

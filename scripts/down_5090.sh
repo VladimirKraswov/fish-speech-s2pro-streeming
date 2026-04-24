@@ -1,21 +1,14 @@
-# scripts/down_5090.sh
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/lib_5090.sh"
+
 cd "$REPO_ROOT"
 
-CONTAINER="${CONTAINER:-fish-speech}"
-RUN_DIR="$REPO_ROOT/run"
-PID_FILE="$RUN_DIR/proxy.pid"
-
-docker_cmd() {
-  if [[ "${DOCKER_USE_SUDO:-0}" == "1" ]]; then
-    sudo docker "$@"
-  else
-    docker "$@"
-  fi
-}
+CONTAINER="${CONTAINER:-fish-speech-5090}"
+PID_FILE="$(proxy_pid_file)"
 
 echo "[1/2] Stopping proxy"
 if [[ -f "$PID_FILE" ]]; then
@@ -29,6 +22,7 @@ if [[ -f "$PID_FILE" ]]; then
   fi
   rm -f "$PID_FILE"
 fi
+
 pkill -f 'uvicorn.*tools.proxy.fish_proxy_pcm:app' 2>/dev/null || true
 
 echo "[2/2] Stopping model container"

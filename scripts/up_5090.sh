@@ -16,7 +16,11 @@ EXTRA_WARMUP="${EXTRA_WARMUP:-1}"
 
 CUDA_VER="${CUDA_VER:-12.9.0}"
 UV_EXTRA="${UV_EXTRA:-cu129}"
-CHECKPOINTS_DIR="${CHECKPOINTS_DIR:-checkpoints/s2-pro}"
+
+# legacy support:
+# если передан CHECKPOINTS_DIR, используем его только как llama path
+LLAMA_CHECKPOINTS_DIR="${LLAMA_CHECKPOINTS_DIR:-${CHECKPOINTS_DIR:-checkpoints/s2-pro}}"
+DECODER_CHECKPOINT_PATH="${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}"
 
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 FISH_CACHE_MAX_SEQ_LEN="${FISH_CACHE_MAX_SEQ_LEN:-512}"
@@ -49,12 +53,19 @@ echo "  IMAGE=$IMAGE"
 echo "  CONTAINER=$CONTAINER"
 echo "  PORT=$PORT"
 echo "  PROXY_PORT=$PROXY_PORT"
+echo "  LLAMA_CHECKPOINTS_DIR=$LLAMA_CHECKPOINTS_DIR"
+echo "  DECODER_CHECKPOINT_PATH=$DECODER_CHECKPOINT_PATH"
 echo "  DEFAULT_REFERENCE_ID=$DEFAULT_REFERENCE_ID"
 echo "  SESSION_TTL_SEC=$SESSION_TTL_SEC"
 echo
 
-if [[ ! -d "$CHECKPOINTS_DIR" ]] || [[ -z "$(ls -A "$CHECKPOINTS_DIR" 2>/dev/null)" ]]; then
-  echo "ERROR: checkpoints not found in $CHECKPOINTS_DIR" >&2
+if [[ ! -d "$LLAMA_CHECKPOINTS_DIR" ]] || [[ -z "$(ls -A "$LLAMA_CHECKPOINTS_DIR" 2>/dev/null)" ]]; then
+  echo "ERROR: llama checkpoints not found in $LLAMA_CHECKPOINTS_DIR" >&2
+  exit 1
+fi
+
+if [[ ! -f "$DECODER_CHECKPOINT_PATH" ]]; then
+  echo "ERROR: decoder checkpoint not found: $DECODER_CHECKPOINT_PATH" >&2
   exit 1
 fi
 
@@ -104,8 +115,8 @@ CID="$({
     /workspace/tools/api_server.py \
     --listen 0.0.0.0:8080 \
     --device cuda \
-    --llama-checkpoint-path "/workspace/$CHECKPOINTS_DIR" \
-    --decoder-checkpoint-path "/workspace/$CHECKPOINTS_DIR/codec.pth" \
+    --llama-checkpoint-path "/workspace/$LLAMA_CHECKPOINTS_DIR" \
+    --decoder-checkpoint-path "/workspace/$DECODER_CHECKPOINT_PATH" \
     "${COMPILE_ARG[@]}"
 } )"
 
@@ -121,7 +132,7 @@ while true; do
 
   if ! docker_cmd ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
     echo "ERROR: container exited during startup" >&2
-    docker_cmd logs --tail 200 "$CONTAINER" 2>&1 || true
+    docker_cmd ps -a --format 'table {{.Names}}\t{{.Status}}' || true
     exit 1
   fi
 
@@ -133,7 +144,7 @@ while true; do
 
   if [[ "$ELAPSED" -ge "$HEALTH_TIMEOUT" ]]; then
     echo "ERROR: model did not become healthy within ${HEALTH_TIMEOUT}s" >&2
-    docker_cmd logs --tail 200 "$CONTAINER" 2>&1 || true
+    docker_cmd ps -a --format 'table {{.Names}}\t{{.Status}}' || true
     exit 1
   fi
 

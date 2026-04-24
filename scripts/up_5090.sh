@@ -23,8 +23,10 @@ LLAMA_CHECKPOINTS_DIR="${LLAMA_CHECKPOINTS_DIR:-${CHECKPOINTS_DIR:-checkpoints/s
 DECODER_CHECKPOINT_PATH="${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}"
 
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-FISH_CACHE_MAX_SEQ_LEN="${FISH_CACHE_MAX_SEQ_LEN:-512}"
-FISH_MAX_NEW_TOKENS_CAP="${FISH_MAX_NEW_TOKENS_CAP:-160}"
+# 512 токенов часто оказывается слишком тесным для длинного reference prompt.
+# Для 5090 безопаснее держать запас по KV cache побольше.
+FISH_CACHE_MAX_SEQ_LEN="${FISH_CACHE_MAX_SEQ_LEN:-768}"
+FISH_MAX_NEW_TOKENS_CAP="${FISH_MAX_NEW_TOKENS_CAP:-128}"
 FISH_CLEANUP_AFTER_REQUEST="${FISH_CLEANUP_AFTER_REQUEST:-0}"
 FISH_CLEANUP_EVERY_N_REQUESTS="${FISH_CLEANUP_EVERY_N_REQUESTS:-0}"
 FISH_CLEANUP_ON_ERROR="${FISH_CLEANUP_ON_ERROR:-1}"
@@ -71,14 +73,7 @@ fi
 
 if [[ "$BUILD_IMAGE" == "1" ]] || ! docker_cmd image inspect "$IMAGE" >/dev/null 2>&1; then
   echo "[1/5] Building Docker image..."
-  docker_cmd build \
-    --platform linux/amd64 \
-    -f docker/Dockerfile \
-    --build-arg BACKEND=cuda \
-    --build-arg CUDA_VER="$CUDA_VER" \
-    --build-arg UV_EXTRA="$UV_EXTRA" \
-    --target webui \
-    -t "$IMAGE" .
+  docker_cmd build     --platform linux/amd64     -f docker/Dockerfile     --build-arg BACKEND=cuda     --build-arg CUDA_VER="$CUDA_VER"     --build-arg UV_EXTRA="$UV_EXTRA"     --target webui     -t "$IMAGE" .
 else
   echo "[1/5] Using existing image: $IMAGE"
 fi
@@ -94,30 +89,7 @@ else
 fi
 
 CID="$({
-  docker_cmd run -d --rm \
-    --name "$CONTAINER" \
-    -p "$PORT:8080" \
-    --gpus all \
-    -e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF" \
-    -e FISH_CACHE_MAX_SEQ_LEN="$FISH_CACHE_MAX_SEQ_LEN" \
-    -e FISH_MAX_NEW_TOKENS_CAP="$FISH_MAX_NEW_TOKENS_CAP" \
-    -e FISH_CLEANUP_AFTER_REQUEST="$FISH_CLEANUP_AFTER_REQUEST" \
-    -e FISH_CLEANUP_EVERY_N_REQUESTS="$FISH_CLEANUP_EVERY_N_REQUESTS" \
-    -e FISH_CLEANUP_ON_ERROR="$FISH_CLEANUP_ON_ERROR" \
-    -e FISH_CLEANUP_ON_ABORT="$FISH_CLEANUP_ON_ABORT" \
-    -e FISH_EMPTY_CACHE_PER_STREAM_CHUNK="$FISH_EMPTY_CACHE_PER_STREAM_CHUNK" \
-    -e FISH_EMPTY_CACHE_PER_SEGMENT="$FISH_EMPTY_CACHE_PER_SEGMENT" \
-    -e PYTHONPATH=/workspace \
-    -v "$REPO_ROOT":/workspace \
-    -w /workspace \
-    --entrypoint /app/.venv/bin/python \
-    "$IMAGE" \
-    /workspace/tools/api_server.py \
-    --listen 0.0.0.0:8080 \
-    --device cuda \
-    --llama-checkpoint-path "/workspace/$LLAMA_CHECKPOINTS_DIR" \
-    --decoder-checkpoint-path "/workspace/$DECODER_CHECKPOINT_PATH" \
-    "${COMPILE_ARG[@]}"
+  docker_cmd run -d --rm     --name "$CONTAINER"     -p "$PORT:8080"     --gpus all     -e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF"     -e FISH_CACHE_MAX_SEQ_LEN="$FISH_CACHE_MAX_SEQ_LEN"     -e FISH_MAX_NEW_TOKENS_CAP="$FISH_MAX_NEW_TOKENS_CAP"     -e FISH_CLEANUP_AFTER_REQUEST="$FISH_CLEANUP_AFTER_REQUEST"     -e FISH_CLEANUP_EVERY_N_REQUESTS="$FISH_CLEANUP_EVERY_N_REQUESTS"     -e FISH_CLEANUP_ON_ERROR="$FISH_CLEANUP_ON_ERROR"     -e FISH_CLEANUP_ON_ABORT="$FISH_CLEANUP_ON_ABORT"     -e FISH_EMPTY_CACHE_PER_STREAM_CHUNK="$FISH_EMPTY_CACHE_PER_STREAM_CHUNK"     -e FISH_EMPTY_CACHE_PER_SEGMENT="$FISH_EMPTY_CACHE_PER_SEGMENT"     -e PYTHONPATH=/workspace     -v "$REPO_ROOT":/workspace     -w /workspace     --entrypoint /app/.venv/bin/python     "$IMAGE"     /workspace/tools/api_server.py     --listen 0.0.0.0:8080     --device cuda     --llama-checkpoint-path "/workspace/$LLAMA_CHECKPOINTS_DIR"     --decoder-checkpoint-path "/workspace/$DECODER_CHECKPOINT_PATH"     "${COMPILE_ARG[@]}"
 } )"
 
 echo "Container started: $CID"
@@ -155,9 +127,7 @@ echo "Model is healthy after $(( $(date +%s) - START_TS ))s"
 
 if [[ "$EXTRA_WARMUP" == "1" ]]; then
   echo "Sending one extra warmup streaming request..."
-  BASE_URL="http://127.0.0.1:${PORT}" \
-  WARMUP_REFERENCE_ID="$DEFAULT_REFERENCE_ID" \
-  bash "$REPO_ROOT/scripts/warmup_5090.sh"
+  BASE_URL="http://127.0.0.1:${PORT}"   WARMUP_REFERENCE_ID="$DEFAULT_REFERENCE_ID"   bash "$REPO_ROOT/scripts/warmup_5090.sh"
 fi
 
 echo "Current model memory:"
@@ -167,11 +137,7 @@ echo
 
 if [[ "$START_PROXY" == "1" ]]; then
   echo "[5/5] Starting proxy..."
-  PROXY_PORT="$PROXY_PORT" \
-  DEFAULT_REFERENCE_ID="$DEFAULT_REFERENCE_ID" \
-  SESSION_TTL_SEC="$SESSION_TTL_SEC" \
-  SESSION_MAX_COUNT="$SESSION_MAX_COUNT" \
-  bash "$REPO_ROOT/scripts/run_proxy.sh"
+  PROXY_PORT="$PROXY_PORT"   DEFAULT_REFERENCE_ID="$DEFAULT_REFERENCE_ID"   SESSION_TTL_SEC="$SESSION_TTL_SEC"   SESSION_MAX_COUNT="$SESSION_MAX_COUNT"   bash "$REPO_ROOT/scripts/run_proxy.sh"
 fi
 
 echo

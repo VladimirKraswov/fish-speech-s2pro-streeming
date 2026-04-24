@@ -40,11 +40,13 @@ def inference_wrapper(req: ServeTTSRequest, engine: TTSInferenceEngine):
                     yield (result.audio[1] * AMPLITUDE).astype(np.int16).tobytes()
 
             case "final":
-                # В streaming-режиме final уже содержит весь звук целиком,
-                # а segment уже были отправлены ранее.
-                # Если отдать final ещё раз, пользователь услышит дубль.
+                # В streaming-режиме final содержит полную собранную дорожку.
+                # Сегменты уже были отправлены ранее, поэтому финал нельзя
+                # отдавать повторно. Но и завершать генератор здесь тоже нельзя:
+                # иначе engine.inference() не успевает выставить finished_normally,
+                # и finally-ветка ошибочно запускает cleanup_on_abort.
                 if req.streaming:
-                    return None
+                    continue
 
                 count += 1
                 if isinstance(result.audio, tuple):

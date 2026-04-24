@@ -11,7 +11,7 @@
     "carry_incomplete_tail": true
   },
   "tts": {
-    "max_new_tokens": 128,
+    "max_new_tokens": 160,
     "chunk_length": 200,
     "stream_tokens": true,
     "initial_stream_chunk_size": 18,

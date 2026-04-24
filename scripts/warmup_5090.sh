@@ -9,7 +9,7 @@ PORT="${PORT:-8080}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:${PORT}}"
 WARMUP_TIMEOUT="${WARMUP_TIMEOUT:-1800}"
 WARMUP_TEXT="${WARMUP_TEXT:-Привет. Это дополнительный прогрев стримингового режима для Fish Speech.}"
-WARMUP_REFERENCE_ID="${WARMUP_REFERENCE_ID:-ref}"
+WARMUP_REFERENCE_ID="${WARMUP_REFERENCE_ID:-voice}"
 OUT_FILE="${OUT_FILE:-$REPO_ROOT/logs/warmup_stream.wav}"
 
 mkdir -p "$REPO_ROOT/logs"

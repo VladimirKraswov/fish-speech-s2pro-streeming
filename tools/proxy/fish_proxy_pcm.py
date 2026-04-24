@@ -16,7 +16,7 @@ from fastapi.responses import StreamingResponse
 
 UPSTREAM_TTS_URL = "http://127.0.0.1:8080/v1/tts"
 UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=None)
-DEFAULT_REFERENCE_ID = os.environ.get("DEFAULT_REFERENCE_ID", "ref")
+DEFAULT_REFERENCE_ID = os.environ.get("DEFAULT_REFERENCE_ID", "voice")
 
 logging.basicConfig(
     level=logging.INFO,

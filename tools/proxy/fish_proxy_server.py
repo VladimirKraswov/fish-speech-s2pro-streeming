@@ -18,7 +18,7 @@ CONNECT_TIMEOUT = float(os.environ.get("PROXY_CONNECT_TIMEOUT", "10"))
 WRITE_TIMEOUT = float(os.environ.get("PROXY_WRITE_TIMEOUT", "30"))
 # read=None because upstream is a stream
 REQUEST_TIMEOUT = httpx.Timeout(connect=CONNECT_TIMEOUT, read=None, write=WRITE_TIMEOUT, pool=None)
-DEFAULT_REFERENCE_ID = os.environ.get("DEFAULT_REFERENCE_ID", "ref")
+DEFAULT_REFERENCE_ID = os.environ.get("DEFAULT_REFERENCE_ID", "voice")
 
 
 @asynccontextmanager

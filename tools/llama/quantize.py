@@ -232,8 +232,43 @@ class WeightOnlyInt8Linear(torch.nn.Module):
         )
         self.register_buffer("scales", torch.ones(out_features, dtype=torch.bfloat16))
 
+        # Runtime caches for dequantized weights/scales.
+        # Without this, every forward does weight.to(dtype=input.dtype), which creates a
+        # fresh bf16/fp16 copy. In token streaming that can amplify peak VRAM badly.
+        self._runtime_weight: torch.Tensor | None = None
+        self._runtime_scales: torch.Tensor | None = None
+        self._runtime_key: tuple[torch.device, torch.dtype] | None = None
+
+    def _clear_runtime_cache(self) -> None:
+        self._runtime_weight = None
+        self._runtime_scales = None
+        self._runtime_key = None
+
+    def _apply(self, fn):
+        self._clear_runtime_cache()
+        return super()._apply(fn)
+
+    def _get_runtime_tensors(
+        self, input: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (input.device, input.dtype)
+        if (
+            self._runtime_weight is None
+            or self._runtime_scales is None
+            or self._runtime_key != key
+        ):
+            self._runtime_weight = self.weight.to(
+                device=input.device, dtype=input.dtype
+            ).detach()
+            self._runtime_scales = self.scales.to(
+                device=input.device, dtype=input.dtype
+            ).detach()
+            self._runtime_key = key
+        return self._runtime_weight, self._runtime_scales
+
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return F.linear(input, self.weight.to(dtype=input.dtype)) * self.scales
+        weight, scales = self._get_runtime_tensors(input)
+        return F.linear(input, weight) * scales
 
 
 ##### weight only int4 per channel groupwise quantized code ######

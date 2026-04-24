@@ -1,4 +1,3 @@
-# fish_speech/models/text2semantic/inference.py
 import gc
 import os
 import queue
@@ -36,6 +35,20 @@ def _to_normal_tensor(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         return None
     with torch.inference_mode(False):
         return t.detach().cpu().clone().to(t.device)
+
+
+def _iter_no_grad(iterator: Iterator[torch.Tensor]) -> Iterator[torch.Tensor]:
+    """
+    Iterate a lazy generator under torch.no_grad().
+
+    Important: decorating the factory that *creates* a generator is not enough, because the
+    actual work happens later during iteration. Token streaming uses a lazy decode iterator,
+    so we must wrap the iteration itself to keep autograd disabled and avoid retaining graphs
+    and temporary dequantized weights on GPU.
+    """
+    with torch.no_grad():
+        for item in iterator:
+            yield item
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -510,7 +523,7 @@ def generate(
         del first_token, x, prompt, empty, input_pos
         return seq
 
-    return decode_iter
+    return _iter_no_grad(decode_iter)
 
 
 def init_model(checkpoint_path, device, precision, compile=False):

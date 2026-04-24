@@ -1,4 +1,3 @@
-# scripts/run_proxy.sh
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -9,12 +8,14 @@ PROXY_PORT="${PROXY_PORT:-9000}"
 PROXY_HOST="${PROXY_HOST:-0.0.0.0}"
 PROXY_LOG_LEVEL="${PROXY_LOG_LEVEL:-info}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+PROXY_START_TIMEOUT="${PROXY_START_TIMEOUT:-60}"
 
 LOG_DIR="$REPO_ROOT/logs"
 RUN_DIR="$REPO_ROOT/run"
 LOG_FILE="$LOG_DIR/proxy.log"
 PID_FILE="$RUN_DIR/proxy.pid"
 VENV_PATH="$REPO_ROOT/.venv-proxy"
+VENV_PYTHON="$VENV_PATH/bin/python"
 
 mkdir -p "$LOG_DIR" "$RUN_DIR"
 touch "$LOG_FILE"
@@ -29,18 +30,14 @@ if [[ ! -d "$VENV_PATH" ]]; then
   "$PYTHON_BIN" -m venv "$VENV_PATH"
 fi
 
-set +u
-source "$VENV_PATH/bin/activate"
-set -u
-
-if ! python - <<'PY' >/dev/null 2>&1
+if ! "$VENV_PYTHON" - <<'PY' >/dev/null 2>&1
 import fastapi, uvicorn, httpx
 print("ok")
 PY
 then
   echo "Installing proxy dependencies into $VENV_PATH"
-  python -m pip install -U pip setuptools wheel
-  python -m pip install fastapi "uvicorn[standard]" httpx
+  "$VENV_PYTHON" -m pip install -U pip setuptools wheel
+  "$VENV_PYTHON" -m pip install fastapi "uvicorn[standard]" httpx
 fi
 
 if [[ -f "$PID_FILE" ]]; then
@@ -48,28 +45,54 @@ if [[ -f "$PID_FILE" ]]; then
   if [[ -n "${OLD_PID:-}" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
     kill "$OLD_PID" 2>/dev/null || true
     sleep 1
+    if kill -0 "$OLD_PID" 2>/dev/null; then
+      kill -9 "$OLD_PID" 2>/dev/null || true
+    fi
   fi
   rm -f "$PID_FILE"
 fi
 
 pkill -f 'uvicorn.*tools.proxy.fish_proxy_pcm:app' 2>/dev/null || true
 
-nohup python -m uvicorn tools.proxy.fish_proxy_pcm:app \
+export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
+
+nohup "$VENV_PYTHON" -m uvicorn tools.proxy.fish_proxy_pcm:app \
   --host "$PROXY_HOST" \
   --port "$PROXY_PORT" \
   --log-level "$PROXY_LOG_LEVEL" \
   >> "$LOG_FILE" 2>&1 &
 
-echo $! > "$PID_FILE"
+PROXY_PID=$!
+echo "$PROXY_PID" > "$PID_FILE"
 
-sleep 1
+echo "Waiting for proxy to become healthy..."
+START_TS="$(date +%s)"
 
-if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-  echo "ERROR: proxy failed to start. Check $LOG_FILE" >&2
-  exit 1
-fi
+while true; do
+  if curl -sf "http://127.0.0.1:${PROXY_PORT}/health" >/dev/null 2>&1; then
+    break
+  fi
+
+  if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    echo "ERROR: proxy failed to start. Last log lines:" >&2
+    tail -n 100 "$LOG_FILE" >&2 || true
+    rm -f "$PID_FILE"
+    exit 1
+  fi
+
+  NOW_TS="$(date +%s)"
+  ELAPSED="$((NOW_TS - START_TS))"
+
+  if [[ "$ELAPSED" -ge "$PROXY_START_TIMEOUT" ]]; then
+    echo "ERROR: proxy did not become healthy within ${PROXY_START_TIMEOUT}s" >&2
+    tail -n 100 "$LOG_FILE" >&2 || true
+    exit 1
+  fi
+
+  sleep 1
+done
 
 echo "Proxy started"
-echo "  pid: $(cat "$PID_FILE")"
+echo "  pid: $PROXY_PID"
 echo "  log: $LOG_FILE"
 echo "  url: http://127.0.0.1:${PROXY_PORT}/health"

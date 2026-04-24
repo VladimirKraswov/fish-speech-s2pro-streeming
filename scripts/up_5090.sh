@@ -1,4 +1,3 @@
-# scripts/up_5090.sh
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -17,12 +16,10 @@ EXTRA_WARMUP="${EXTRA_WARMUP:-1}"
 
 CUDA_VER="${CUDA_VER:-12.9.0}"
 UV_EXTRA="${UV_EXTRA:-cu129}"
-LLAMA_CHECKPOINTS_DIR="${LLAMA_CHECKPOINTS_DIR:-checkpoints/fs-1.2-int8-s2-pro-int8}"
-DECODER_CHECKPOINT_PATH="${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}"
-DEFAULT_REFERENCE_ID="${DEFAULT_REFERENCE_ID:-ref}"
+CHECKPOINTS_DIR="${CHECKPOINTS_DIR:-checkpoints/s2-pro}"
 
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-FISH_CACHE_MAX_SEQ_LEN="${FISH_CACHE_MAX_SEQ_LEN:-320}"
+FISH_CACHE_MAX_SEQ_LEN="${FISH_CACHE_MAX_SEQ_LEN:-512}"
 FISH_MAX_NEW_TOKENS_CAP="${FISH_MAX_NEW_TOKENS_CAP:-64}"
 
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-1800}"
@@ -44,18 +41,12 @@ echo "  CONTAINER=$CONTAINER"
 echo "  PORT=$PORT"
 echo "  PROXY_PORT=$PROXY_PORT"
 echo "  COMPILE=$COMPILE"
-echo "  LLAMA_CHECKPOINTS_DIR=$LLAMA_CHECKPOINTS_DIR"
-echo "  DECODER_CHECKPOINT_PATH=$DECODER_CHECKPOINT_PATH"
-echo "  DEFAULT_REFERENCE_ID=$DEFAULT_REFERENCE_ID"
+echo "  CHECKPOINTS_DIR=$CHECKPOINTS_DIR"
+echo "  FISH_CACHE_MAX_SEQ_LEN=$FISH_CACHE_MAX_SEQ_LEN"
 echo
 
-if [[ ! -d "$LLAMA_CHECKPOINTS_DIR" ]] || [[ -z "$(ls -A "$LLAMA_CHECKPOINTS_DIR" 2>/dev/null)" ]]; then
-  echo "ERROR: llama checkpoints not found in $LLAMA_CHECKPOINTS_DIR" >&2
-  exit 1
-fi
-
-if [[ ! -f "$DECODER_CHECKPOINT_PATH" ]]; then
-  echo "ERROR: decoder checkpoint not found at $DECODER_CHECKPOINT_PATH" >&2
+if [[ ! -d "$CHECKPOINTS_DIR" ]] || [[ -z "$(ls -A "$CHECKPOINTS_DIR" 2>/dev/null)" ]]; then
+  echo "ERROR: checkpoints not found in $CHECKPOINTS_DIR" >&2
   exit 1
 fi
 
@@ -93,8 +84,8 @@ CID="$(
     /workspace/tools/api_server.py \
     --listen 0.0.0.0:8080 \
     --device cuda \
-    --llama-checkpoint-path "/workspace/$LLAMA_CHECKPOINTS_DIR" \
-    --decoder-checkpoint-path "/workspace/$DECODER_CHECKPOINT_PATH" \
+    --llama-checkpoint-path "/workspace/$CHECKPOINTS_DIR" \
+    --decoder-checkpoint-path "/workspace/$CHECKPOINTS_DIR/codec.pth" \
     $([[ "$COMPILE" == "1" ]] && echo --compile || true)
 )"
 
@@ -140,7 +131,6 @@ echo "Model is healthy after $(( $(date +%s) - START_TS ))s"
 if [[ "$EXTRA_WARMUP" == "1" ]]; then
   echo "Sending one extra warmup streaming request..."
   BASE_URL="http://127.0.0.1:${PORT}" \
-  WARMUP_REFERENCE_ID="$DEFAULT_REFERENCE_ID" \
     bash "$REPO_ROOT/scripts/warmup_5090.sh"
 fi
 
@@ -151,12 +141,7 @@ echo
 
 if [[ "$START_PROXY" == "1" ]]; then
   echo "[5/5] Starting proxy..."
-  PROXY_PORT="$PROXY_PORT" DEFAULT_REFERENCE_ID="$DEFAULT_REFERENCE_ID" bash "$REPO_ROOT/scripts/run_proxy.sh"
-
-  echo "Checking proxy health..."
-  sleep 1
-  curl -sf "http://127.0.0.1:${PROXY_PORT}/health" >/dev/null
-  echo "Proxy is healthy"
+  PROXY_PORT="$PROXY_PORT" bash "$REPO_ROOT/scripts/run_proxy.sh"
 fi
 
 echo
@@ -164,7 +149,7 @@ echo "=== READY ==="
 echo "Model health:  http://127.0.0.1:${PORT}/v1/health"
 echo "Model memory:  http://127.0.0.1:${PORT}/v1/debug/memory"
 echo "Proxy health:  http://127.0.0.1:${PROXY_PORT}/health"
-echo "Proxy stream:  http://127.0.0.1:${PROXY_PORT}/pcm-stream?text=Привет&reference_id=${DEFAULT_REFERENCE_ID}"
+echo "Proxy stream:  http://127.0.0.1:${PROXY_PORT}/pcm-stream?text=Привет"
 echo
 echo "Live logs:"
 echo "  DOCKER_USE_SUDO=${DOCKER_USE_SUDO:-0} bash scripts/logs_5090.sh"

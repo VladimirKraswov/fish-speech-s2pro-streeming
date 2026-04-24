@@ -111,7 +111,14 @@ async def pcm_stream(
 ):
     req_id = uuid.uuid4().hex[:8]
     effective_reference_id = (reference_id or DEFAULT_REFERENCE_ID).strip()
-    payload = {"text": text, "streaming": True, "reference_id": effective_reference_id}
+    payload = {
+        "text": text,
+        "streaming": True,
+        "stream_tokens": True,
+        "initial_stream_chunk_size": 18,
+        "stream_chunk_size": 8,
+        "reference_id": effective_reference_id,
+    }
 
     logger.info(
         "REQ %s start text_len=%s reference_id=%s (query=%s default=%s)",

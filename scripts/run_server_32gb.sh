@@ -1,4 +1,3 @@
-# scripts/run_server_32gb.sh
 #!/usr/bin/env bash
 # Minimal repro: run API server in Docker for 32GB VRAM (e.g. RTX 5090).
 # From repo root: ./scripts/run_server_32gb.sh
@@ -14,7 +13,7 @@ COMPILE="${COMPILE:-0}"
 CHECKPOINTS_DIR="${CHECKPOINTS_DIR:-checkpoints/s2-pro}"
 
 # When running from a parent repo: mount parent as /workspace so checkpoints and repo are both visible
-if [[ -n "$WORKSPACE_DIR" ]]; then
+if [[ -n "${WORKSPACE_DIR:-}" ]]; then
   WORKSPACE_DIR="$(cd "$WORKSPACE_DIR" && pwd)"
   REPO_REL="$(python3 -c "import os; print(os.path.relpath('$REPO_ROOT', '$WORKSPACE_DIR'))")"
   MOUNT_ROOT="$WORKSPACE_DIR"
@@ -45,7 +44,7 @@ else
 fi
 
 # 2) Download checkpoints if missing (only when checkpoints live under repo)
-if [[ -z "$WORKSPACE_DIR" ]]; then
+if [[ -z "${WORKSPACE_DIR:-}" ]]; then
   if [[ ! -d "$REPO_ROOT/$CHECKPOINTS_DIR" ]] || [[ -z "$(ls -A "$REPO_ROOT/$CHECKPOINTS_DIR" 2>/dev/null)" ]]; then
     echo "Downloading s2-pro checkpoints to $CHECKPOINTS_DIR ..."
     mkdir -p "$REPO_ROOT/$CHECKPOINTS_DIR"
@@ -69,13 +68,13 @@ fi
 # 3) Stop existing container if any
 docker rm -f "$CONTAINER" 2>/dev/null || true
 
-# 4) Run server (tuned for 32GB: cache=384, max_new_tokens cap=80; warmup when COMPILE=1)
+# 4) Run server
 echo "Starting server on port $PORT ..."
 docker run -d --rm --name "$CONTAINER" \
   -p "$PORT:8080" \
   --gpus all \
   -e PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
-  -e FISH_CACHE_MAX_SEQ_LEN="${FISH_CACHE_MAX_SEQ_LEN:-320}" \
+  -e FISH_CACHE_MAX_SEQ_LEN="${FISH_CACHE_MAX_SEQ_LEN:-512}" \
   -e FISH_MAX_NEW_TOKENS_CAP="${FISH_MAX_NEW_TOKENS_CAP:-64}" \
   -e PYTHONPATH=/workspace/"$REPO_REL" \
   -v "$MOUNT_ROOT":/workspace -w /workspace \
@@ -89,8 +88,8 @@ docker run -d --rm --name "$CONTAINER" \
   $([ "$COMPILE" = "1" ] && echo --compile || true)
 
 echo ""
-echo "Server starting. With COMPILE=1, warmup runs at startup (2–10 min); then /v1/health returns 200."
+echo "Server starting. With COMPILE=1, warmup runs at startup; then /v1/health returns 200."
 echo "  Health:  curl -s http://127.0.0.1:$PORT/v1/health"
-echo "  TTS:    curl -X POST http://127.0.0.1:$PORT/v1/tts -H 'Content-Type: application/json' -d '{\"text\":\"Hello\",\"streaming\":true}' --output out.wav"
-echo "  Memory: curl -s http://127.0.0.1:$PORT/v1/debug/memory"
-echo "  Logs:   docker logs -f $CONTAINER"
+echo "  TTS:     curl -X POST http://127.0.0.1:$PORT/v1/tts -H 'Content-Type: application/json' -d '{\"text\":\"Hello\",\"streaming\":true}' --output out.wav"
+echo "  Memory:  curl -s http://127.0.0.1:$PORT/v1/debug/memory"
+echo "  Logs:    docker logs -f $CONTAINER"

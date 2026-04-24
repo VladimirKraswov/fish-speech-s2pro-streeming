@@ -1,7 +1,7 @@
 === CODE BUNDLE ===
 root: /Volumes/Extend/work/fish-speech-s2pro-streeming
 ignore: .codebundleignore
-generated: 2026-04-23T22:41:29.376Z
+generated: 2026-04-24T09:40:12.764Z
 
 
 
@@ -1077,7 +1077,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
 ARG GRADIO_SERVER_NAME="0.0.0.0"
 ARG GRADIO_SERVER_PORT=7860
-ARG LLAMA_CHECKPOINT_PATH="checkpoints/s2-pro"
+ARG LLAMA_CHECKPOINT_PATH="checkpoints/fs-1.2-int8-s2-pro-int8"
 ARG DECODER_CHECKPOINT_PATH="checkpoints/s2-pro/codec.pth"
 ARG DECODER_CONFIG_NAME="modded_dac_vq"
 
@@ -1126,7 +1126,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
 ARG API_SERVER_NAME="0.0.0.0"
 ARG API_SERVER_PORT=8080
-ARG LLAMA_CHECKPOINT_PATH="checkpoints/s2-pro"
+ARG LLAMA_CHECKPOINT_PATH="checkpoints/fs-1.2-int8-s2-pro-int8"
 ARG DECODER_CHECKPOINT_PATH="checkpoints/s2-pro/codec.pth"
 ARG DECODER_CONFIG_NAME="modded_dac_vq"
 
@@ -1946,6 +1946,365 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                 logger.warning(f"set seed: {req.seed}")
 
             # Get the symbolic tokens from the LLAMA model
+            stream_tokens = bool(getattr(req, "stream_tokens", False))
+            # Back-pressure: worker waits for ack after each chunk so DAC decode and LLM don't run on GPU concurrently (avoids OOM on 32 GB).
+            ack_queue = queue.Queue() if stream_tokens else None
+            response_queue = self.send_Llama_request(
+                req, prompt_tokens, prompt_texts, req_tag=req_tag, ack_queue=ack_queue
+            )
+            _mark("llama_queued")
+            if stream_tokens:
+                logger.info(
+                    "stream: inference started (token streaming), req={}", req_tag
+                )
+
+            # Get the sample rate from the decoder model
+            if hasattr(self.decoder_model, "spec_transform"):
+                sample_rate = self.decoder_model.spec_transform.sample_rate
+            else:
+                sample_rate = self.decoder_model.sample_rate
+
+            # If streaming, send the header
+            if req.streaming:
+                _mark("yield_header")
+                yield InferenceResult(
+                    code="header",
+                    audio=(
+                        sample_rate,
+                        np.array(wav_chunk_header(sample_rate=sample_rate)),
+                    ),
+                    error=None,
+                )
+
+            segments = []
+            seg_idx = 0
+
+            while True:
+                # Get the response from the LLAMA model
+                if stream_tokens:
+                    logger.info(
+                        "stream: waiting for next chunk from queue, req={}", req_tag
+                    )
+                wrapped_result = response_queue.get()
+                _mark("queue_get")
+                if stream_tokens:
+                    action = (
+                        getattr(wrapped_result.response, "action", None)
+                        if hasattr(wrapped_result.response, "action")
+                        else None
+                    )
+                    logger.info(
+                        "stream: queue_get status={} action={} req={}",
+                        wrapped_result.status,
+                        action,
+                        req_tag,
+                    )
+                if wrapped_result.status == "error":
+                    logger.error(
+                        "stream: got error from worker req={} err={}",
+                        req_tag,
+                        wrapped_result.response,
+                    )
+                    _mark("yield_error")
+                    yield InferenceResult(
+                        code="error",
+                        audio=None,
+                        error=(
+                            wrapped_result.response
+                            if isinstance(wrapped_result.response, Exception)
+                            else Exception("Unknown error")
+                        ),
+                    )
+                    break
+
+                if not isinstance(wrapped_result.response, GenerateResponse):
+                    raise TypeError(
+                        "Expected GenerateResponse, got {type(wrapped_result.response).__name__}"
+                    )
+
+                result = wrapped_result.response
+                if result.action != "next":
+                    if stream_tokens:
+                        logger.info(
+                            "stream: decoding segment seg_idx={} codes_shape={} req={}",
+                            seg_idx + 1,
+                            result.codes.shape if result.codes is not None else None,
+                            req_tag,
+                        )
+                    _mark(
+                        "decode_vq_start",
+                        segment_idx=seg_idx + 1,
+                        codes_frames=(
+                            result.codes.shape[1] if result.codes is not None else 0
+                        ),
+                    )
+                    try:
+                        if result.codes is not None and not result.codes.is_cuda:
+                            result = GenerateResponse(
+                                result.action,
+                                result.codes.to(self.decoder_model.device),
+                                getattr(result, "text", None),
+                            )
+                        segment = self.get_audio_segment(result)
+                    except Exception as seg_err:
+                        if stream_tokens:
+                            logger.exception(
+                                "stream: get_audio_segment FAILED seg_idx={} codes_shape={} req={}: {}",
+                                seg_idx + 1,
+                                (
+                                    result.codes.shape
+                                    if result.codes is not None
+                                    else None
+                                ),
+                                req_tag,
+                                seg_err,
+                            )
+                        raise
+                    seg_idx += 1
+                    _mark("segment_decoded", segment_idx=seg_idx, samples=len(segment))
+                    if stream_tokens:
+                        logger.info(
+                            "stream: segment_decoded seg_idx={} samples={} req={}",
+                            seg_idx,
+                            len(segment),
+                            req_tag,
+                        )
+
+                    if req.streaming:
+                        _mark("yield_segment", segment_idx=seg_idx)
+                        yield InferenceResult(
+                            code="segment",
+                            audio=(sample_rate, segment),
+                            error=None,
+                        )
+                    if ack_queue is not None:
+                        ack_queue.put(None)
+                    segments.append(segment)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                else:
+                    if stream_tokens:
+                        logger.info(
+                            "stream: got_next (end of stream), total_segments={} req={}",
+                            seg_idx,
+                            req_tag,
+                        )
+                    if ack_queue is not None:
+                        ack_queue.put(None)
+                    _mark("got_next")
+                    break
+
+            # Clean up the memory so next request starts near baseline (~14 GB); otherwise second request OOMs on 32 GB.
+            if torch.cuda.is_available():
+                wrapped_result = None
+                result = None
+                gc.collect()
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            if len(segments) == 0:
+                _mark("yield_error_empty")
+                yield InferenceResult(
+                    code="error",
+                    audio=None,
+                    error=RuntimeError(
+                        "No audio generated, please check the input text."
+                    ),
+                )
+            else:
+                audio = np.concatenate(segments, axis=0)
+                _mark("yield_final", total_samples=len(audio), segments=len(segments))
+                yield InferenceResult(
+                    code="final",
+                    audio=(sample_rate, audio),
+                    error=None,
+                )
+
+            return None
+        finally:
+            # When generator is closed (client done), try to free VRAM again so next request does not OOM.
+            if torch.cuda.is_available():
+                gc.collect()
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                gc.collect()
+                torch.cuda.empty_cache()
+
+    def send_Llama_request(
+        self,
+        req: ServeTTSRequest,
+        prompt_tokens: list,
+        prompt_texts: list,
+        req_tag: str,
+        ack_queue: queue.Queue | None = None,
+    ) -> queue.Queue:
+        """
+        Send a request to the LLAMA model to generate the symbolic tokens.
+        """
+
+        # Prepare the request
+        # When streaming API is used, enable token-level streaming for low TTFA
+        stream_tokens = bool(getattr(req, "stream_tokens", False))
+        request = dict(
+            device=self.decoder_model.device,
+            req_tag=req_tag,
+            max_new_tokens=req.max_new_tokens,
+            text=req.text,
+            top_p=req.top_p,
+            repetition_penalty=req.repetition_penalty,
+            temperature=req.temperature,
+            compile=self.compile,
+            iterative_prompt=req.chunk_length > 0,
+            chunk_length=req.chunk_length,
+            prompt_tokens=prompt_tokens,
+            prompt_text=prompt_texts,
+            stream_tokens=stream_tokens,
+            stream_chunk_size=getattr(req, "stream_chunk_size", 8),
+            initial_stream_chunk_size=getattr(req, "initial_stream_chunk_size", 10),
+            ack_queue=ack_queue,
+        )
+
+        # Create a queue to get the response
+        response_queue = queue.Queue()
+
+        # Send the request to the LLAMA model
+        self.llama_queue.put(
+            GenerateRequest(
+                request=request,
+                response_queue=response_queue,
+            )
+        )
+
+        return response_queue
+
+    def get_audio_segment(self, result: GenerateResponse) -> np.ndarray:
+        """
+        Decode the VQ tokens to audio.
+        """
+
+        # Don't use autocast on MPS devices
+        with autocast_exclude_mps(
+            device_type=self.decoder_model.device.type, dtype=self.precision
+        ):
+            # Decode the symbolic tokens to audio
+            segment = self.decode_vq_tokens(codes=result.codes)
+
+        # Convert the audio to numpy (detach: inference path has no grad, but we no longer use inference_mode)
+        return segment.float().detach().cpu().numpy()
+
+
+path: /fish_speech/inference_engine/__init__.py.bak_step1
+----------------------------------------
+# fish_speech/inference_engine/__init__.py
+import gc
+import os
+import queue
+import time
+from typing import Generator
+
+import numpy as np
+import torch
+from loguru import logger
+
+from fish_speech.inference_engine.reference_loader import ReferenceLoader
+from fish_speech.inference_engine.utils import InferenceResult, wav_chunk_header
+from fish_speech.inference_engine.vq_manager import VQManager
+from fish_speech.models.dac.modded_dac import DAC
+from fish_speech.models.text2semantic.inference import (
+    GenerateRequest,
+    GenerateResponse,
+    WrappedGenerateResponse,
+)
+from fish_speech.utils import autocast_exclude_mps, set_seed
+from fish_speech.utils.schema import ServeTTSRequest
+
+
+class TTSInferenceEngine(ReferenceLoader, VQManager):
+    def __init__(
+        self,
+        llama_queue: queue.Queue,
+        decoder_model: DAC,
+        precision: torch.dtype,
+        compile: bool,
+    ) -> None:
+        super().__init__()
+
+        self.llama_queue = llama_queue
+        self.decoder_model = decoder_model
+        self.precision = precision
+        self.compile = compile
+
+    def inference(self, req: ServeTTSRequest) -> Generator[InferenceResult, None, None]:
+        """
+        Main inference function:
+        - Loads the reference audio and text.
+        - Calls the LLAMA model for inference.
+        - Decodes the VQ tokens to audio.
+        """
+
+        profile = os.getenv("FISH_PROFILE_INFERENCE", "0") in {
+            "1",
+            "true",
+            "TRUE",
+            "yes",
+            "YES",
+        }
+        req_tag = hex(id(req))[-6:]
+        t_start = time.perf_counter()
+        t_prev = t_start
+
+        def _vram_gb() -> dict:
+            if not torch.cuda.is_available():
+                return {}
+            return {
+                "vram_alloc_gb": round(torch.cuda.memory_allocated() / (1024**3), 2),
+                "vram_reserved_gb": round(torch.cuda.memory_reserved() / (1024**3), 2),
+                "vram_max_alloc_gb": round(
+                    torch.cuda.max_memory_allocated() / (1024**3), 2
+                ),
+            }
+
+        def _mark(event: str, **extra) -> None:
+            nonlocal t_prev
+            if not profile:
+                return
+            now = time.perf_counter()
+            delta_ms = (now - t_prev) * 1000.0
+            total_ms = (now - t_start) * 1000.0
+            t_prev = now
+            vram = _vram_gb()
+            details = " ".join(f"{k}={v}" for k, v in (*vram.items(), *extra.items()))
+            logger.info(
+                "inference_timing req={} event={} delta_ms={:.1f} total_ms={:.1f} {}",
+                req_tag,
+                event,
+                delta_ms,
+                total_ms,
+                details,
+            )
+
+        try:
+            ref_id = req.reference_id
+            prompt_tokens, prompt_texts = [], []
+            if ref_id is not None:
+                prompt_tokens, prompt_texts = self.load_by_id(
+                    ref_id, req.use_memory_cache
+                )
+                _mark("ref_loaded", mode="id")
+            elif req.references:
+                prompt_tokens, prompt_texts = self.load_by_hash(
+                    req.references, req.use_memory_cache
+                )
+                _mark("ref_loaded", mode="hash", refs=len(req.references))
+
+            # Set the random seed if provided
+            if req.seed is not None:
+                set_seed(req.seed)
+                logger.warning(f"set seed: {req.seed}")
+
+            # Get the symbolic tokens from the LLAMA model
             stream_tokens = getattr(req, "stream_tokens", False) or req.streaming
             # Back-pressure: worker waits for ack after each chunk so DAC decode and LLM don't run on GPU concurrently (avoids OOM on 32 GB).
             ack_queue = queue.Queue() if stream_tokens else None
@@ -2196,6 +2555,371 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
 
 path: /fish_speech/inference_engine/reference_loader.py
+----------------------------------------
+# fish_speech/inference_engine/reference_loader.py
+import io
+from hashlib import sha256
+from pathlib import Path
+from typing import Callable, Literal, Tuple
+
+import torch
+import torchaudio
+from loguru import logger
+
+from fish_speech.models.dac.modded_dac import DAC
+from fish_speech.utils.file import (
+    AUDIO_EXTENSIONS,
+    audio_to_bytes,
+    list_files,
+    read_ref_text,
+)
+from fish_speech.utils.schema import ServeReferenceAudio
+
+
+class ReferenceLoader:
+    def __init__(self) -> None:
+        """
+        Component of the TTSInferenceEngine class.
+        Loads and manages the cache for the reference audio and text.
+        """
+        self.ref_by_id: dict = {}
+        self.ref_by_hash: dict = {}
+
+        # Make Pylance happy (attribut/method not defined...)
+        self.decoder_model: DAC
+        self.encode_reference: Callable
+
+        # Define the torchaudio backend
+        backends = torchaudio.list_audio_backends()
+        if "ffmpeg" in backends:
+            self.backend = "ffmpeg"
+        else:
+            self.backend = "soundfile"
+
+    def load_by_id(
+        self,
+        id: str,
+        use_cache: Literal["on", "off"],
+    ) -> Tuple:
+        # Load the references audio and text by id.
+        # Each reference can be: (a) .wav + .lab → encode at load, or (b) .codes.pt + .lab → load pre-encoded (no encoder run).
+        ref_folder = Path("references") / id
+        ref_folder.mkdir(parents=True, exist_ok=True)
+        ref_audios = list_files(
+            ref_folder, AUDIO_EXTENSIONS, recursive=True, sort=False
+        )
+        ref_codes = list(ref_folder.glob("*.codes.pt"))
+
+        # .codes.pt filename stem is "en.codes" (Path.stem); we want logical stem "en" for en.lab / en.codes.pt
+        def _stem_for_codes(p: Path) -> str:
+            s = p.stem
+            return s.removesuffix(".codes") if s.endswith(".codes") else s
+
+        stems = {p.stem for p in ref_audios} | {_stem_for_codes(p) for p in ref_codes}
+        stems = sorted(stems)
+
+        if use_cache == "off" or id not in self.ref_by_id:
+            prompt_tokens = []
+            prompt_texts = []
+            for stem in stems:
+                lab_path = ref_folder / f"{stem}.lab"
+                codes_path = ref_folder / f"{stem}.codes.pt"
+                audio_path = next(
+                    (
+                        ref_folder / f"{stem}{ext}"
+                        for ext in AUDIO_EXTENSIONS
+                        if (ref_folder / f"{stem}{ext}").exists()
+                    ),
+                    None,
+                )
+                if not lab_path.exists():
+                    logger.warning("Reference stem {} missing .lab, skipping", stem)
+                    continue
+                prompt_texts.append(read_ref_text(str(lab_path)))
+                if codes_path.exists():
+                    # Pre-encoded: load from disk (no encoder run). File must be tensor shape (num_codebooks, T) from DAC encode.
+                    # map_location="cpu" = put tensor in RAM (worker will .to(device) later). Loading to GPU here would save one tiny copy but is negligible for KB-sized tensors.
+                    loaded = torch.load(
+                        codes_path, map_location="cpu", weights_only=True
+                    )
+                    prompt_tokens.append(
+                        loaded if isinstance(loaded, torch.Tensor) else loaded[0]
+                    )
+                    logger.info(
+                        "Loaded pre-encoded reference {} from {}", stem, codes_path.name
+                    )
+                elif audio_path is not None:
+                    prompt_tokens.append(
+                        self.encode_reference(
+                            reference_audio=audio_to_bytes(str(audio_path)),
+                            enable_reference_audio=True,
+                        )
+                    )
+                else:
+                    logger.warning(
+                        "Reference stem {} has .lab but no .codes.pt or audio, skipping",
+                        stem,
+                    )
+                    prompt_texts.pop()
+            if not prompt_tokens:
+                raise ValueError(
+                    f"Reference ID '{id}' has no valid (audio/.codes.pt + .lab) pairs"
+                )
+
+            self.ref_by_id[id] = (prompt_tokens, prompt_texts)
+
+        else:
+            # Reuse already encoded references
+            logger.info("Use same references")
+            prompt_tokens, prompt_texts = self.ref_by_id[id]
+
+        return prompt_tokens, prompt_texts
+
+    def load_by_hash(
+        self,
+        references: list[ServeReferenceAudio],
+        use_cache: Literal["on", "off"],
+    ) -> Tuple:
+        # Load the references audio and text by hash
+        audio_hashes = [sha256(ref.audio).hexdigest() for ref in references]
+
+        cache_used = False
+        prompt_tokens, prompt_texts = [], []
+        for i, ref in enumerate(references):
+            if use_cache == "off" or audio_hashes[i] not in self.ref_by_hash:
+                # If the references are not already loaded, encode them
+                prompt_tokens.append(
+                    self.encode_reference(
+                        reference_audio=ref.audio,
+                        enable_reference_audio=True,
+                    )
+                )
+                prompt_texts.append(ref.text)
+                self.ref_by_hash[audio_hashes[i]] = (prompt_tokens[-1], ref.text)
+
+            else:
+                # Reuse already encoded references
+                cached_token, cached_text = self.ref_by_hash[audio_hashes[i]]
+                prompt_tokens.append(cached_token)
+                prompt_texts.append(cached_text)
+                cache_used = True
+
+        if cache_used:
+            logger.info("Use same references")
+
+        return prompt_tokens, prompt_texts
+
+    def load_audio(self, reference_audio: bytes | str, sr: int):
+        """
+        Load the audio data from a file or bytes.
+        """
+        if len(reference_audio) > 255 or not Path(reference_audio).exists():
+            audio_data = reference_audio
+            reference_audio = io.BytesIO(audio_data)
+
+        waveform, original_sr = torchaudio.load(reference_audio, backend=self.backend)
+
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+        if original_sr != sr:
+            resampler = torchaudio.transforms.Resample(
+                orig_freq=original_sr, new_freq=sr
+            )
+            waveform = resampler(waveform)
+
+        audio = waveform.squeeze().numpy()
+        return audio
+    def list_reference_ids(self) -> list[str]:
+        """
+        List all valid reference IDs.
+        Valid reference:
+          - audio + .lab
+          - or .codes.pt + .lab
+        """
+        ref_base_path = Path("references")
+        if not ref_base_path.exists():
+            return []
+
+        valid_ids = []
+
+        for ref_dir in ref_base_path.iterdir():
+            if not ref_dir.is_dir():
+                continue
+
+            audio_files = list_files(
+                ref_dir, AUDIO_EXTENSIONS, recursive=False, sort=False
+            )
+            code_files = list(ref_dir.glob("*.codes.pt"))
+
+            if not audio_files and not code_files:
+                continue
+
+            def _stem_for_codes(p: Path) -> str:
+                s = p.stem
+                return s.removesuffix(".codes") if s.endswith(".codes") else s
+
+            stems = {p.stem for p in audio_files} | {_stem_for_codes(p) for p in code_files}
+
+            has_valid_pair = any((ref_dir / f"{stem}.lab").exists() for stem in stems)
+
+            if has_valid_pair:
+                valid_ids.append(ref_dir.name)
+
+        return sorted(valid_ids)
+
+    def add_reference_encoded(
+        self, id: str, codes_bytes: bytes, lab_text: str, stem: str | None = None
+    ) -> Literal["created", "updated", "unchanged"]:
+        """
+        Add or update a pre-encoded reference (e.g. from preencode_references.py).
+        Writes references/<id>/<stem>.codes.pt and <stem>.lab (stem defaults to id). Skips if hash matches.
+        """
+        import re
+
+        if not re.match(r"^[a-zA-Z0-9\-_ ]+$", id):
+            raise ValueError(
+                "Reference ID contains invalid characters. Only alphanumeric, hyphens, underscores, and spaces are allowed."
+            )
+        if len(id) > 255:
+            raise ValueError(
+                "Reference ID is too long. Maximum length is 255 characters."
+            )
+        stem = stem or id
+        if not re.match(r"^[a-zA-Z0-9\-_ ]+$", stem):
+            raise ValueError("Stem contains invalid characters.")
+
+        ref_dir = Path("references") / id
+        payload = codes_bytes + lab_text.encode("utf-8")
+        content_hash = sha256(payload).hexdigest()
+        hash_file = ref_dir / f".{stem}.hash"
+
+        if ref_dir.exists() and hash_file.exists():
+            if hash_file.read_text(encoding="utf-8").strip() == content_hash:
+                logger.info(
+                    "Reference %s/%s unchanged (hash match), skip write", id, stem
+                )
+                return "unchanged"
+
+        existed_before = ref_dir.exists() and (ref_dir / f"{stem}.codes.pt").exists()
+        ref_dir.mkdir(parents=True, exist_ok=True)
+        (ref_dir / f"{stem}.codes.pt").write_bytes(codes_bytes)
+        (ref_dir / f"{stem}.lab").write_text(lab_text, encoding="utf-8")
+        hash_file.write_text(content_hash, encoding="utf-8")
+        if id in self.ref_by_id:
+            del self.ref_by_id[id]
+        status = "updated" if existed_before else "created"
+        logger.info("Reference %s/%s %s", id, stem, status)
+        return status
+
+    def add_reference(self, id: str, wav_file_path: str, reference_text: str) -> None:
+        """
+        Add a new reference voice by creating a new directory and copying files.
+
+        Args:
+            id: Reference ID (directory name)
+            wav_file_path: Path to the audio file to copy
+            reference_text: Text content for the .lab file
+
+        Raises:
+            FileExistsError: If the reference ID already exists
+            FileNotFoundError: If the audio file doesn't exist
+            OSError: If file operations fail
+        """
+        # Validate ID format
+        import re
+
+        if not re.match(r"^[a-zA-Z0-9\-_ ]+$", id):
+            raise ValueError(
+                "Reference ID contains invalid characters. Only alphanumeric, hyphens, underscores, and spaces are allowed."
+            )
+
+        if len(id) > 255:
+            raise ValueError(
+                "Reference ID is too long. Maximum length is 255 characters."
+            )
+
+        # Check if reference already exists
+        ref_dir = Path("references") / id
+        if ref_dir.exists():
+            raise FileExistsError(f"Reference ID '{id}' already exists")
+
+        # Check if audio file exists
+        audio_path = Path(wav_file_path)
+        if not audio_path.exists():
+            raise FileNotFoundError(f"Audio file not found: {wav_file_path}")
+
+        # Validate audio file extension
+        if audio_path.suffix.lower() not in AUDIO_EXTENSIONS:
+            raise ValueError(
+                f"Unsupported audio format: {audio_path.suffix}. Supported formats: {', '.join(AUDIO_EXTENSIONS)}"
+            )
+
+        try:
+            # Create reference directory
+            ref_dir.mkdir(parents=True, exist_ok=False)
+
+            # Determine the target audio filename with original extension
+            target_audio_path = ref_dir / f"sample{audio_path.suffix}"
+
+            # Copy audio file
+            import shutil
+
+            shutil.copy2(audio_path, target_audio_path)
+
+            # Create .lab file
+            lab_path = ref_dir / "sample.lab"
+            with open(lab_path, "w", encoding="utf-8") as f:
+                f.write(reference_text)
+
+            # Clear cache for this ID if it exists
+            if id in self.ref_by_id:
+                del self.ref_by_id[id]
+
+            logger.info(f"Successfully added reference voice with ID: {id}")
+
+        except Exception as e:
+            # Clean up on failure
+            if ref_dir.exists():
+                import shutil
+
+                shutil.rmtree(ref_dir)
+            raise e
+
+    def delete_reference(self, id: str) -> None:
+        """
+        Delete a reference voice by removing its directory and files.
+
+        Args:
+            id: Reference ID (directory name) to delete
+
+        Raises:
+            FileNotFoundError: If the reference ID doesn't exist
+            OSError: If file operations fail
+        """
+        # Check if reference exists
+        ref_dir = Path("references") / id
+        if not ref_dir.exists():
+            raise FileNotFoundError(f"Reference ID '{id}' does not exist")
+
+        try:
+            # Remove the entire reference directory
+            import shutil
+
+            shutil.rmtree(ref_dir)
+
+            # Clear cache for this ID if it exists
+            if id in self.ref_by_id:
+                del self.ref_by_id[id]
+
+            logger.info(f"Successfully deleted reference voice with ID: {id}")
+
+        except Exception as e:
+            logger.error(f"Failed to delete reference '{id}': {e}")
+            raise OSError(f"Failed to delete reference '{id}': {e}")
+
+
+path: /fish_speech/inference_engine/reference_loader.py.bak_step1
 ----------------------------------------
 # fish_speech/inference_engine/reference_loader.py
 import io
@@ -7701,6 +8425,11 @@ def print_config_tree(cfg, resolve=False, save_to_file=False):
     pass
 
 
+path: /input_ref/voice.lab
+----------------------------------------
+В очередной раз захожу в кабинет ректора, готовая уже отчислиться из аспирантуры. Мнусь у двери, а Андрей Викторович что-то пишет в своём блокноте, не обращая на меня внимания.
+
+
 path: /LICENSE
 ----------------------------------------
 # FISH AUDIO RESEARCH LICENSE AGREEMENT
@@ -7886,29 +8615,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["fish_speech", "tools"]
-
-
-path: /ref.lab
-----------------------------------------
-В очередной раз захожу в кабинет ректора, готовая уже отчислиться из аспирантуры. Мнусь у двери, а Андрей Викторович что-то пишет в своём блокноте, не обращая на меня внимания. Чувствую, что вновь скажет, что я сделала не то и не так.  
-Он будто издевается надо мной. Отвергает все мои идеи и предложения, ссылаясь на то, что они недостаточно продуманы и обоснованы. 
-Орлов даже представить не может, как важно для меня одобрение с его стороны. Ведь я… буквально со дня нашей первой встречи не могу выкинуть его из головы.  
-Влюбилась в своего преподавателя практически с первого взгляда.  
-Это было на первом курсе. 
-Помню, стояла у кофейного автомата и пыталась оплатить напиток, но купюроприемник никак не хотел принимать мою единственную сотню. Андрей Викторович остановился и с интересом наблюдал за мной, а потом оплатил напиток сам. Я хотела отдать ему деньги, но он широко улыбнулся и пожелал мне хорошего дня.  
-Потом я узнала, что с нового семестра он будет преподавать у нас “Методику профессионального обучения”, предмет, который до этого вела у нас женщина. А ещё, узнала, что он и есть тот самый Орлов Андрей Викторович. Ректор нашего университета. Холодный руководитель, известный своей строгостью и жесткостью. 
-Он всегда был серьёзен, и никто никогда не видел его улыбки... 
-Кроме меня.  
-Почему мне повезло больше других? Почему именно мне достался этот просвет в его вечно угрюмом и сосредоточенном настроении? 
-Не знаю. Но до сих пор слепо верю, что однажды снова увижу такую же искреннюю улыбку на его лице, и она вновь будет адресована мне.  
-— Что бы вы там мне ни принесли, Лера, это не подходит, — кидает, не глядя, мне ректор. — Простите, у меня нет времени. 
-Пренебрежительный сухой тон ранит похлеще ножа. Чувствую, как к горлу подступает ком обиды. 
-— Зачем вы тогда вообще дали мне это задание? Если всё отвергаете, даже не посмотрев. 
-— Лерочка, — выдыхает Андрей Викторович, кладёт ручку и поднимается из-за стола, направляясь в мою сторону. — Иногда лучше просто держать свой язык за зубами, не думали об этом? Вы сказали, что мы неправильно распределяем ресурсы. Подвергли сомнению мою тактику управления университетом... Вы должны были осознать всю глубину своей ошибки... 
-Тишину рассекает стук набоек на его ботинках, ректор делает несколько шагов в мою сторону и останавливается довольно близко. Рядом с этим статным, высоким мужчиной я всегда чувствовала себя маленькой девочкой, а сейчас его властный и циничный взгляд и вовсе сдавливает меня до размера муравья. 
-Нет, конечно, он прав. Я молода и наивна. А он прошёл долгий путь до самой высокой должности в этом университете. У него определённо больше опыта, чем у меня. 
-— Андрей Викторович... Просто посмотрите мою работу... Я ведь правда старалась и хотела помочь... — почти шепчу, потому как его присутствие и близость не дают мне говорить в полный голос. 
-Да, помимо властности, Орлов обладает ещё и необычайным мужским обаянием. Вся женская часть универа строит ему глазки и ахает, когда в коридоре остаётся шлейф от его парфюма.
 
 
 path: /scripts/down_5090.sh
@@ -8098,7 +8804,6 @@ echo "  url: http://127.0.0.1:${PROXY_PORT}/health"
 
 path: /scripts/run_server_32gb.sh
 ----------------------------------------
-# scripts/run_server_32gb.sh
 #!/usr/bin/env bash
 # Minimal repro: run API server in Docker for 32GB VRAM (e.g. RTX 5090).
 # From repo root: ./scripts/run_server_32gb.sh
@@ -8114,7 +8819,7 @@ COMPILE="${COMPILE:-0}"
 CHECKPOINTS_DIR="${CHECKPOINTS_DIR:-checkpoints/s2-pro}"
 
 # When running from a parent repo: mount parent as /workspace so checkpoints and repo are both visible
-if [[ -n "$WORKSPACE_DIR" ]]; then
+if [[ -n "${WORKSPACE_DIR:-}" ]]; then
   WORKSPACE_DIR="$(cd "$WORKSPACE_DIR" && pwd)"
   REPO_REL="$(python3 -c "import os; print(os.path.relpath('$REPO_ROOT', '$WORKSPACE_DIR'))")"
   MOUNT_ROOT="$WORKSPACE_DIR"
@@ -8145,7 +8850,7 @@ else
 fi
 
 # 2) Download checkpoints if missing (only when checkpoints live under repo)
-if [[ -z "$WORKSPACE_DIR" ]]; then
+if [[ -z "${WORKSPACE_DIR:-}" ]]; then
   if [[ ! -d "$REPO_ROOT/$CHECKPOINTS_DIR" ]] || [[ -z "$(ls -A "$REPO_ROOT/$CHECKPOINTS_DIR" 2>/dev/null)" ]]; then
     echo "Downloading s2-pro checkpoints to $CHECKPOINTS_DIR ..."
     mkdir -p "$REPO_ROOT/$CHECKPOINTS_DIR"
@@ -8169,13 +8874,13 @@ fi
 # 3) Stop existing container if any
 docker rm -f "$CONTAINER" 2>/dev/null || true
 
-# 4) Run server (tuned for 32GB: cache=384, max_new_tokens cap=80; warmup when COMPILE=1)
+# 4) Run server
 echo "Starting server on port $PORT ..."
 docker run -d --rm --name "$CONTAINER" \
   -p "$PORT:8080" \
   --gpus all \
   -e PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
-  -e FISH_CACHE_MAX_SEQ_LEN="${FISH_CACHE_MAX_SEQ_LEN:-320}" \
+  -e FISH_CACHE_MAX_SEQ_LEN="${FISH_CACHE_MAX_SEQ_LEN:-512}" \
   -e FISH_MAX_NEW_TOKENS_CAP="${FISH_MAX_NEW_TOKENS_CAP:-64}" \
   -e PYTHONPATH=/workspace/"$REPO_REL" \
   -v "$MOUNT_ROOT":/workspace -w /workspace \
@@ -8189,14 +8894,312 @@ docker run -d --rm --name "$CONTAINER" \
   $([ "$COMPILE" = "1" ] && echo --compile || true)
 
 echo ""
-echo "Server starting. With COMPILE=1, warmup runs at startup (2–10 min); then /v1/health returns 200."
+echo "Server starting. With COMPILE=1, warmup runs at startup; then /v1/health returns 200."
 echo "  Health:  curl -s http://127.0.0.1:$PORT/v1/health"
-echo "  TTS:    curl -X POST http://127.0.0.1:$PORT/v1/tts -H 'Content-Type: application/json' -d '{\"text\":\"Hello\",\"streaming\":true}' --output out.wav"
-echo "  Memory: curl -s http://127.0.0.1:$PORT/v1/debug/memory"
-echo "  Logs:   docker logs -f $CONTAINER"
+echo "  TTS:     curl -X POST http://127.0.0.1:$PORT/v1/tts -H 'Content-Type: application/json' -d '{\"text\":\"Hello\",\"streaming\":true}' --output out.wav"
+echo "  Memory:  curl -s http://127.0.0.1:$PORT/v1/debug/memory"
+echo "  Logs:    docker logs -f $CONTAINER"
+
+
+path: /scripts/test_step1_stream_ref.py
+----------------------------------------
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import time
+from pathlib import Path
+
+import requests
+
+
+def get_memory(base_url: str):
+    try:
+        r = requests.get(f"{base_url}/v1/debug/memory", timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--base-url", default="http://127.0.0.1:8080")
+    ap.add_argument("--reference-id", required=True)
+    ap.add_argument("--text", required=True)
+    ap.add_argument("--runs", type=int, default=3)
+    ap.add_argument("--warmup", action="store_true")
+    ap.add_argument("--out-dir", default="logs/step1_stream_ref")
+    args = ap.parse_args()
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "text": args.text,
+        "reference_id": args.reference_id,
+        "references": [],
+        "streaming": True,
+        "stream_tokens": False,
+        "format": "wav",
+        "max_new_tokens": 128,
+        "chunk_length": 200,
+        "top_p": 0.8,
+        "repetition_penalty": 1.1,
+        "temperature": 0.8,
+        "use_memory_cache": "on",
+        "seed": 1234,
+    }
+
+    def one_run(run_idx: int, counted: bool):
+        before_mem = get_memory(args.base_url)
+        started = time.perf_counter()
+
+        with requests.post(
+            f"{args.base_url}/v1/tts",
+            json=payload,
+            stream=True,
+            timeout=(10, 300),
+        ) as r:
+            r.raise_for_status()
+
+            out_path = out_dir / f"run_{run_idx:02d}.wav"
+            total = 0
+            first_chunk_ms = None
+            first_audio_ms = None
+
+            with open(out_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=4096):
+                    if not chunk:
+                        continue
+
+                    now_ms = (time.perf_counter() - started) * 1000.0
+
+                    if first_chunk_ms is None:
+                        first_chunk_ms = now_ms
+
+                    prev_total = total
+                    total += len(chunk)
+                    f.write(chunk)
+
+                    # WAV header usually 44 bytes; нас интересует момент прихода первого аудио байта
+                    if first_audio_ms is None and total > 44:
+                        if prev_total <= 44:
+                            first_audio_ms = now_ms
+
+        total_ms = (time.perf_counter() - started) * 1000.0
+        after_mem = get_memory(args.base_url)
+
+        result = {
+            "counted": counted,
+            "run_idx": run_idx,
+            "first_chunk_ms": round(first_chunk_ms or -1, 1),
+            "first_audio_ms": round(first_audio_ms or -1, 1),
+            "total_ms": round(total_ms, 1),
+            "bytes_written": total,
+            "before_allocated_gb": before_mem.get("allocated_gb"),
+            "after_allocated_gb": after_mem.get("allocated_gb"),
+            "before_reserved_gb": before_mem.get("reserved_gb"),
+            "after_reserved_gb": after_mem.get("reserved_gb"),
+            "before_max_allocated_gb": before_mem.get("max_allocated_gb"),
+            "after_max_allocated_gb": after_mem.get("max_allocated_gb"),
+            "out_path": str(out_path),
+        }
+
+        print(json.dumps(result, ensure_ascii=False))
+        return result
+
+    if args.warmup:
+        print("=== warmup ===")
+        one_run(0, counted=False)
+
+    print("=== measured runs ===")
+    results = []
+    for i in range(1, args.runs + 1):
+        results.append(one_run(i, counted=True))
+
+    summary_path = out_dir / "summary.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+
+    print(f"saved summary: {summary_path}")
+
+
+if __name__ == "__main__":
+    main()
 
 
 path: /scripts/up_5090.sh
+----------------------------------------
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+IMAGE="${IMAGE:-fish-speech-webui:cu129}"
+CONTAINER="${CONTAINER:-fish-speech}"
+PORT="${PORT:-8080}"
+PROXY_PORT="${PROXY_PORT:-9000}"
+
+COMPILE="${COMPILE:-1}"
+BUILD_IMAGE="${BUILD_IMAGE:-0}"
+START_PROXY="${START_PROXY:-1}"
+EXTRA_WARMUP="${EXTRA_WARMUP:-1}"
+
+CUDA_VER="${CUDA_VER:-12.9.0}"
+UV_EXTRA="${UV_EXTRA:-cu129}"
+CHECKPOINTS_DIR="${CHECKPOINTS_DIR:-checkpoints/s2-pro}"
+
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+FISH_CACHE_MAX_SEQ_LEN="${FISH_CACHE_MAX_SEQ_LEN:-512}"
+FISH_MAX_NEW_TOKENS_CAP="${FISH_MAX_NEW_TOKENS_CAP:-64}"
+
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-1800}"
+LOG_DIR="$REPO_ROOT/logs"
+mkdir -p "$LOG_DIR"
+
+docker_cmd() {
+  if [[ "${DOCKER_USE_SUDO:-0}" == "1" ]]; then
+    sudo docker "$@"
+  else
+    docker "$@"
+  fi
+}
+
+echo "=== Fish Speech full startup (RTX 5090) ==="
+echo "  REPO_ROOT=$REPO_ROOT"
+echo "  IMAGE=$IMAGE"
+echo "  CONTAINER=$CONTAINER"
+echo "  PORT=$PORT"
+echo "  PROXY_PORT=$PROXY_PORT"
+echo "  COMPILE=$COMPILE"
+echo "  CHECKPOINTS_DIR=$CHECKPOINTS_DIR"
+echo "  FISH_CACHE_MAX_SEQ_LEN=$FISH_CACHE_MAX_SEQ_LEN"
+echo
+
+if [[ ! -d "$CHECKPOINTS_DIR" ]] || [[ -z "$(ls -A "$CHECKPOINTS_DIR" 2>/dev/null)" ]]; then
+  echo "ERROR: checkpoints not found in $CHECKPOINTS_DIR" >&2
+  exit 1
+fi
+
+if [[ "$BUILD_IMAGE" == "1" ]] || ! docker_cmd image inspect "$IMAGE" >/dev/null 2>&1; then
+  echo "[1/5] Building Docker image..."
+  docker_cmd build \
+    --platform linux/amd64 \
+    -f docker/Dockerfile \
+    --build-arg BACKEND=cuda \
+    --build-arg CUDA_VER="$CUDA_VER" \
+    --build-arg UV_EXTRA="$UV_EXTRA" \
+    --target webui \
+    -t "$IMAGE" .
+else
+  echo "[1/5] Using existing image: $IMAGE"
+fi
+
+echo "[2/5] Stopping previous processes..."
+DOCKER_USE_SUDO="${DOCKER_USE_SUDO:-0}" bash "$REPO_ROOT/scripts/down_5090.sh"
+
+echo "[3/5] Starting model container..."
+CID="$(
+  docker_cmd run -d --rm \
+    --name "$CONTAINER" \
+    -p "$PORT:8080" \
+    --gpus all \
+    -e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF" \
+    -e FISH_CACHE_MAX_SEQ_LEN="$FISH_CACHE_MAX_SEQ_LEN" \
+    -e FISH_MAX_NEW_TOKENS_CAP="$FISH_MAX_NEW_TOKENS_CAP" \
+    -e PYTHONPATH=/workspace \
+    -v "$REPO_ROOT":/workspace \
+    -w /workspace \
+    --entrypoint /app/.venv/bin/python \
+    "$IMAGE" \
+    /workspace/tools/api_server.py \
+    --listen 0.0.0.0:8080 \
+    --device cuda \
+    --llama-checkpoint-path "/workspace/$CHECKPOINTS_DIR" \
+    --decoder-checkpoint-path "/workspace/$CHECKPOINTS_DIR/codec.pth" \
+    $([[ "$COMPILE" == "1" ]] && echo --compile || true)
+)"
+
+echo "Container started: $CID"
+echo
+
+echo "[4/5] Waiting for model health..."
+START_TS="$(date +%s)"
+
+while true; do
+  if curl -sf "http://127.0.0.1:${PORT}/v1/health" >/dev/null 2>&1; then
+    break
+  fi
+
+  if ! docker_cmd ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+    echo "ERROR: container exited during startup" >&2
+    echo
+    echo "Last model logs:"
+    docker_cmd logs --tail 200 "$CONTAINER" 2>&1 || true
+    exit 1
+  fi
+
+  NOW_TS="$(date +%s)"
+  ELAPSED="$((NOW_TS - START_TS))"
+
+  if (( ELAPSED % 30 == 0 )); then
+    echo "Still warming up... ${ELAPSED}s"
+  fi
+
+  if [[ "$ELAPSED" -ge "$HEALTH_TIMEOUT" ]]; then
+    echo "ERROR: model did not become healthy within ${HEALTH_TIMEOUT}s" >&2
+    echo
+    echo "Last model logs:"
+    docker_cmd logs --tail 200 "$CONTAINER" 2>&1 || true
+    exit 1
+  fi
+
+  sleep 5
+done
+
+echo "Model is healthy after $(( $(date +%s) - START_TS ))s"
+
+if [[ "$EXTRA_WARMUP" == "1" ]]; then
+  echo "Sending one extra warmup streaming request..."
+  BASE_URL="http://127.0.0.1:${PORT}" \
+    bash "$REPO_ROOT/scripts/warmup_5090.sh"
+fi
+
+echo "Current model memory:"
+curl -sf "http://127.0.0.1:${PORT}/v1/debug/memory" || true
+echo
+echo
+
+if [[ "$START_PROXY" == "1" ]]; then
+  echo "[5/5] Starting proxy..."
+  PROXY_PORT="$PROXY_PORT" bash "$REPO_ROOT/scripts/run_proxy.sh"
+
+  echo "Checking proxy health..."
+  sleep 1
+  curl -sf "http://127.0.0.1:${PROXY_PORT}/health" >/dev/null
+  echo "Proxy is healthy"
+fi
+
+echo
+echo "=== READY ==="
+echo "Model health:  http://127.0.0.1:${PORT}/v1/health"
+echo "Model memory:  http://127.0.0.1:${PORT}/v1/debug/memory"
+echo "Proxy health:  http://127.0.0.1:${PROXY_PORT}/health"
+echo "Proxy stream:  http://127.0.0.1:${PROXY_PORT}/pcm-stream?text=Привет"
+echo
+echo "Live logs:"
+echo "  DOCKER_USE_SUDO=${DOCKER_USE_SUDO:-0} bash scripts/logs_5090.sh"
+echo
+echo "Stop all:"
+echo "  DOCKER_USE_SUDO=${DOCKER_USE_SUDO:-0} bash scripts/down_5090.sh"
+echo
+echo "Restart all:"
+echo "  DOCKER_USE_SUDO=${DOCKER_USE_SUDO:-0} bash scripts/restart_5090.sh"
+
+
+path: /scripts/up_5090.sh.bak_step2
 ----------------------------------------
 # scripts/up_5090.sh
 #!/usr/bin/env bash
@@ -8367,6 +9370,60 @@ echo "  DOCKER_USE_SUDO=${DOCKER_USE_SUDO:-0} bash scripts/restart_5090.sh"
 
 
 path: /scripts/warmup_5090.sh
+----------------------------------------
+# scripts/warmup_5090.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+PORT="${PORT:-8080}"
+BASE_URL="${BASE_URL:-http://127.0.0.1:${PORT}}"
+WARMUP_TIMEOUT="${WARMUP_TIMEOUT:-1800}"
+WARMUP_TEXT="${WARMUP_TEXT:-Привет. Это дополнительный прогрев стримингового режима для Fish Speech.}"
+WARMUP_REFERENCE_ID="${WARMUP_REFERENCE_ID:-ref}"
+OUT_FILE="${OUT_FILE:-$REPO_ROOT/logs/warmup_stream.wav}"
+
+mkdir -p "$REPO_ROOT/logs"
+
+echo "Waiting for model health: $BASE_URL/v1/health"
+
+START_TS="$(date +%s)"
+while true; do
+  if curl -sf "$BASE_URL/v1/health" >/dev/null 2>&1; then
+    break
+  fi
+
+  NOW_TS="$(date +%s)"
+  ELAPSED="$((NOW_TS - START_TS))"
+  echo "Still warming up... ${ELAPSED}s"
+
+  if [[ "$ELAPSED" -ge "$WARMUP_TIMEOUT" ]]; then
+    echo "ERROR: model did not become healthy within ${WARMUP_TIMEOUT}s" >&2
+    exit 1
+  fi
+
+  sleep 10
+done
+
+echo "Model is healthy after $(( $(date +%s) - START_TS ))s"
+echo "Sending one extra warmup streaming request..."
+echo "Using warmup reference: $WARMUP_REFERENCE_ID"
+
+curl -sf -X POST "$BASE_URL/v1/tts" \
+  -H 'Content-Type: application/json' \
+  -d "{\"text\":\"${WARMUP_TEXT}\",\"streaming\":true,\"reference_id\":\"${WARMUP_REFERENCE_ID}\"}" \
+  --output "$OUT_FILE" \
+  --max-time 180 >/dev/null
+
+echo "Warmup completed"
+echo "Current memory:"
+curl -sf "$BASE_URL/v1/debug/memory" || true
+echo
+
+
+path: /scripts/warmup_5090.sh.bak_step2
 ----------------------------------------
 # scripts/warmup_5090.sh
 #!/usr/bin/env bash
@@ -9631,6 +10688,338 @@ path: /tools/proxy/fish_proxy_pcm.py
 import asyncio
 import base64
 import json
+import os
+import logging
+import struct
+import time
+import uuid
+from typing import AsyncGenerator, Optional, Tuple
+
+import httpx
+from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+
+UPSTREAM_TTS_URL = "http://127.0.0.1:8080/v1/tts"
+UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=None)
+DEFAULT_REFERENCE_ID = os.environ.get("DEFAULT_REFERENCE_ID", "ref")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger("fish-proxy")
+
+app = FastAPI(title="Fish Speech PCM Proxy", version="0.4.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def _parse_wav_header(buf: bytes) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Parse enough of a RIFF/WAVE header to find:
+      - sample_rate
+      - channels
+      - bits_per_sample
+      - data_offset (start of PCM payload)
+
+    For streaming WAV, return as soon as the `data` chunk header is present.
+    """
+    if len(buf) < 12:
+        return None
+
+    if buf[0:4] != b"RIFF" or buf[8:12] != b"WAVE":
+        raise ValueError("Upstream did not return a RIFF/WAVE stream")
+
+    pos = 12
+    channels = None
+    sample_rate = None
+    bits_per_sample = None
+
+    while True:
+        if len(buf) < pos + 8:
+            return None
+
+        chunk_id = buf[pos : pos + 4]
+        chunk_size = struct.unpack_from("<I", buf, pos + 4)[0]
+        chunk_data_start = pos + 8
+
+        if chunk_id == b"fmt ":
+            needed = chunk_data_start + chunk_size + (chunk_size % 2)
+            if len(buf) < needed:
+                return None
+
+            if chunk_size < 16:
+                raise ValueError("Invalid WAV fmt chunk")
+
+            audio_format, channels, sample_rate = struct.unpack_from(
+                "<HHI", buf, chunk_data_start
+            )
+            bits_per_sample = struct.unpack_from("<H", buf, chunk_data_start + 14)[0]
+
+            if audio_format != 1:
+                raise ValueError(f"Only PCM WAV is supported, got format={audio_format}")
+
+            pos = needed
+
+        elif chunk_id == b"data":
+            if channels is None or sample_rate is None or bits_per_sample is None:
+                raise ValueError("WAV data chunk arrived before fmt chunk")
+
+            return sample_rate, channels, bits_per_sample, chunk_data_start
+
+        else:
+            needed = chunk_data_start + chunk_size + (chunk_size % 2)
+            if len(buf) < needed:
+                return None
+            pos = needed
+
+
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "fish-pcm-proxy"}
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
+
+
+@app.get("/pcm-stream")
+async def pcm_stream(
+    text: str = Query(..., min_length=1, max_length=500),
+    reference_id: str | None = Query(default=None),
+):
+    req_id = uuid.uuid4().hex[:8]
+    effective_reference_id = (reference_id or DEFAULT_REFERENCE_ID).strip()
+    payload = {"text": text, "streaming": True, "reference_id": effective_reference_id}
+
+    logger.info(
+        "REQ %s start text_len=%s reference_id=%s (query=%s default=%s)",
+        req_id,
+        len(text),
+        effective_reference_id,
+        reference_id,
+        DEFAULT_REFERENCE_ID,
+    )
+
+    async def emit(obj: dict) -> bytes:
+        return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+
+    async def body_iter() -> AsyncGenerator[bytes, None]:
+        started_at = time.perf_counter()
+
+        # До парсинга WAV header копим тут.
+        header_buffer = bytearray()
+
+        # После парсинга header складываем PCM сюда и шлём батчами.
+        pending_pcm = bytearray()
+
+        header_sent = False
+        sample_rate = None
+        channels = None
+        sample_width = None
+
+        upstream_bytes = 0
+        pcm_bytes_sent = 0
+        pcm_chunks_sent = 0
+
+        # 4096 байт = ~46 мс при 44.1kHz mono s16
+        # Достаточно мало для низкой задержки и достаточно крупно,
+        # чтобы не убивать playback сотнями микрочанков.
+        TARGET_EMIT_BYTES = 4096
+
+        async def flush_pending(force: bool = False) -> AsyncGenerator[bytes, None]:
+            nonlocal pcm_chunks_sent, pcm_bytes_sent
+
+            while len(pending_pcm) >= TARGET_EMIT_BYTES or (force and pending_pcm):
+                if len(pending_pcm) >= TARGET_EMIT_BYTES:
+                    out = bytes(pending_pcm[:TARGET_EMIT_BYTES])
+                    del pending_pcm[:TARGET_EMIT_BYTES]
+                else:
+                    out = bytes(pending_pcm)
+                    pending_pcm.clear()
+
+                pcm_chunks_sent += 1
+                pcm_bytes_sent += len(out)
+
+                yield await emit(
+                    {
+                        "type": "pcm",
+                        "req_id": req_id,
+                        "seq": pcm_chunks_sent,
+                        "data": base64.b64encode(out).decode("ascii"),
+                    }
+                )
+                await asyncio.sleep(0)
+
+        # Сразу даём понять клиенту, что прокси жив.
+        yield await emit({"type": "proxy_start", "req_id": req_id})
+        await asyncio.sleep(0)
+
+        try:
+            async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
+                logger.info("REQ %s connecting upstream %s", req_id, UPSTREAM_TTS_URL)
+
+                async with client.stream("POST", UPSTREAM_TTS_URL, json=payload) as upstream:
+                    logger.info(
+                        "REQ %s upstream connected status=%s content_type=%s",
+                        req_id,
+                        upstream.status_code,
+                        upstream.headers.get("content-type"),
+                    )
+
+                    if upstream.status_code != 200:
+                        text_body = await upstream.aread()
+                        msg = text_body.decode("utf-8", errors="replace")
+                        logger.error("REQ %s upstream status=%s body=%s", req_id, upstream.status_code, msg)
+                        yield await emit(
+                            {
+                                "type": "error",
+                                "req_id": req_id,
+                                "status_code": upstream.status_code,
+                                "message": msg,
+                            }
+                        )
+                        return
+
+                    async for chunk in upstream.aiter_raw(1024):
+                        if not chunk:
+                            continue
+
+                        upstream_bytes += len(chunk)
+
+                        if not header_sent:
+                            header_buffer.extend(chunk)
+
+                            try:
+                                parsed = _parse_wav_header(header_buffer)
+                            except Exception as exc:
+                                logger.exception("REQ %s wav parse failed: %s", req_id, exc)
+                                yield await emit(
+                                    {
+                                        "type": "error",
+                                        "req_id": req_id,
+                                        "message": f"wav parse failed: {exc}",
+                                    }
+                                )
+                                return
+
+                            if parsed is None:
+                                continue
+
+                            sample_rate, channels, bits_per_sample, data_offset = parsed
+                            if bits_per_sample != 16:
+                                logger.error("REQ %s unsupported bits_per_sample=%s", req_id, bits_per_sample)
+                                yield await emit(
+                                    {
+                                        "type": "error",
+                                        "req_id": req_id,
+                                        "message": f"unsupported bits_per_sample={bits_per_sample}",
+                                    }
+                                )
+                                return
+
+                            sample_width = bits_per_sample // 8
+                            header_sent = True
+
+                            logger.info(
+                                "REQ %s meta sr=%s ch=%s sw=%s data_offset=%s",
+                                req_id,
+                                sample_rate,
+                                channels,
+                                sample_width,
+                                data_offset,
+                            )
+
+                            yield await emit(
+                                {
+                                    "type": "meta",
+                                    "req_id": req_id,
+                                    "sample_rate": sample_rate,
+                                    "channels": channels,
+                                    "sample_width": sample_width,
+                                }
+                            )
+                            await asyncio.sleep(0)
+
+                            # Всё, что уже пришло после WAV header, это PCM.
+                            pcm = bytes(header_buffer[data_offset:])
+                            header_buffer.clear()
+
+                            if pcm:
+                                pending_pcm.extend(pcm)
+                                async for out_event in flush_pending(force=False):
+                                    yield out_event
+
+                        else:
+                            pending_pcm.extend(chunk)
+                            async for out_event in flush_pending(force=False):
+                                yield out_event
+
+        except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
+            logger.warning("REQ %s upstream ended imperfectly: %s", req_id, exc)
+            if not header_sent:
+                yield await emit(
+                    {
+                        "type": "error",
+                        "req_id": req_id,
+                        "message": "upstream closed before WAV header completed",
+                    }
+                )
+                return
+
+        except asyncio.CancelledError:
+            logger.warning("REQ %s cancelled by client", req_id)
+            raise
+
+        except Exception as exc:
+            logger.exception("REQ %s stream failed: %s", req_id, exc)
+            yield await emit(
+                {
+                    "type": "error",
+                    "req_id": req_id,
+                    "message": f"stream failed: {exc}",
+                }
+            )
+            return
+
+        # Досылаем хвост.
+        async for out_event in flush_pending(force=True):
+            yield out_event
+
+        elapsed = time.perf_counter() - started_at
+        logger.info(
+            "REQ %s done elapsed=%.3fs upstream_bytes=%s pcm_bytes_sent=%s pcm_chunks_sent=%s",
+            req_id,
+            elapsed,
+            upstream_bytes,
+            pcm_bytes_sent,
+            pcm_chunks_sent,
+        )
+        yield await emit({"type": "done", "req_id": req_id})
+
+    return StreamingResponse(
+        body_iter(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+path: /tools/proxy/fish_proxy_pcm.py.bak_step2
+----------------------------------------
+# tools/proxy/fish_proxy_pcm.py
+import asyncio
+import base64
+import json
 import logging
 import struct
 import time
@@ -9971,6 +11360,260 @@ CONNECT_TIMEOUT = float(os.environ.get("PROXY_CONNECT_TIMEOUT", "10"))
 WRITE_TIMEOUT = float(os.environ.get("PROXY_WRITE_TIMEOUT", "30"))
 # read=None because upstream is a stream
 REQUEST_TIMEOUT = httpx.Timeout(connect=CONNECT_TIMEOUT, read=None, write=WRITE_TIMEOUT, pool=None)
+DEFAULT_REFERENCE_ID = os.environ.get("DEFAULT_REFERENCE_ID", "ref")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
+    try:
+        yield
+    finally:
+        await app.state.client.aclose()
+
+
+app = FastAPI(title="Fish Speech Streaming Proxy", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def _auth_headers() -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if FISH_API_KEY:
+        headers["Authorization"] = f"Bearer {FISH_API_KEY}"
+    return headers
+
+
+@app.get("/")
+async def root() -> PlainTextResponse:
+    return PlainTextResponse(
+        "Fish Speech proxy is running. Use /health or /stream?text=..."
+    )
+
+
+@app.get("/health")
+async def health() -> JSONResponse:
+    try:
+        response = await app.state.client.get(FISH_HEALTH_URL, headers=_auth_headers())
+        ok = response.status_code == 200
+        payload = {
+            "proxy": "ok",
+            "upstream_ok": ok,
+            "upstream_status": response.status_code,
+            "upstream_url": FISH_HEALTH_URL,
+        }
+        return JSONResponse(payload, status_code=200 if ok else 502)
+    except Exception as exc:
+        return JSONResponse(
+            {
+                "proxy": "ok",
+                "upstream_ok": False,
+                "upstream_url": FISH_HEALTH_URL,
+                "error": str(exc),
+            },
+            status_code=502,
+        )
+
+
+@app.get("/stream")
+async def stream(
+    text: str = Query(..., min_length=1, max_length=500),
+    reference_id: str | None = Query(None),
+) -> StreamingResponse:
+    effective_reference_id = (reference_id or DEFAULT_REFERENCE_ID).strip()
+    payload: dict[str, object] = {
+        "text": text,
+        "streaming": True,
+        "format": "wav",
+        "reference_id": effective_reference_id,
+    }
+
+    request = app.state.client.build_request(
+        "POST",
+        FISH_TTS_URL,
+        json=payload,
+        headers=_auth_headers(),
+    )
+    upstream = await app.state.client.send(request, stream=True)
+
+    if upstream.status_code != 200:
+        body = await upstream.aread()
+        await upstream.aclose()
+        detail = body.decode("utf-8", errors="replace") or upstream.reason_phrase
+        raise HTTPException(status_code=upstream.status_code, detail=detail)
+
+    async def body_iter() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in upstream.aiter_bytes():
+                if chunk:
+                    yield chunk
+        except (httpx.RemoteProtocolError, httpx.ReadError):
+            # Upstream sometimes closes a chunked response without a terminating chunk.
+            # Browsers already received the bytes; treat this as normal end-of-stream.
+            return
+        finally:
+            await upstream.aclose()
+
+    headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(body_iter(), media_type="audio/wav", headers=headers)
+
+
+@app.get("/stream-segments")
+async def stream_segments(
+    text: str = Query(..., min_length=1, max_length=500),
+    reference_id: str | None = Query(None),
+) -> StreamingResponse:
+    """
+    Convert the upstream chunked WAV response into NDJSON where each line contains
+    one complete WAV segment as base64.
+    This avoids the browser waiting on a long chunked WAV and lets JS play each
+    segment immediately via AudioContext.decodeAudioData.
+    """
+    import base64
+
+    effective_reference_id = (reference_id or DEFAULT_REFERENCE_ID).strip()
+    payload: dict[str, object] = {
+        "text": text,
+        "streaming": True,
+        "format": "wav",
+        "reference_id": effective_reference_id,
+    }
+
+    request = app.state.client.build_request(
+        "POST",
+        FISH_TTS_URL,
+        json=payload,
+        headers=_auth_headers(),
+    )
+    upstream = await app.state.client.send(request, stream=True)
+
+    if upstream.status_code != 200:
+        body = await upstream.aread()
+        await upstream.aclose()
+        detail = body.decode("utf-8", errors="replace") or upstream.reason_phrase
+        raise HTTPException(status_code=upstream.status_code, detail=detail)
+
+    async def iter_ndjson() -> AsyncIterator[bytes]:
+        buffer = bytearray()
+        try:
+            async for chunk in upstream.aiter_bytes():
+                if not chunk:
+                    continue
+                buffer.extend(chunk)
+
+                while True:
+                    # Need at least RIFF header + chunk size.
+                    if len(buffer) < 12:
+                        break
+
+                    # Find the next RIFF header.
+                    start = buffer.find(b"RIFF")
+                    if start == -1:
+                        # Keep only a tiny tail in case the marker is split.
+                        if len(buffer) > 8:
+                            del buffer[:-8]
+                        break
+                    if start > 0:
+                        del buffer[:start]
+                        if len(buffer) < 12:
+                            break
+
+                    if buffer[8:12] != b"WAVE":
+                        # False positive; skip one byte and resync.
+                        del buffer[:1]
+                        continue
+
+                    total_size = int.from_bytes(buffer[4:8], "little") + 8
+                    if total_size <= 0 or total_size > 100_000_000:
+                        del buffer[:1]
+                        continue
+
+                    if len(buffer) < total_size:
+                        break
+
+                    wav_bytes = bytes(buffer[:total_size])
+                    del buffer[:total_size]
+                    line = json.dumps(
+                        {
+                            "type": "wav",
+                            "b64": base64.b64encode(wav_bytes).decode("ascii"),
+                        },
+                        ensure_ascii=False,
+                    ).encode("utf-8") + b"\n"
+                    yield line
+        except (httpx.RemoteProtocolError, httpx.ReadError):
+            # Same rationale as in /stream: use everything already received.
+            pass
+        finally:
+            if buffer:
+                # Best-effort: if the tail contains a full WAV, emit it.
+                while len(buffer) >= 12:
+                    start = buffer.find(b"RIFF")
+                    if start == -1:
+                        break
+                    if start > 0:
+                        del buffer[:start]
+                        continue
+                    if buffer[8:12] != b"WAVE":
+                        del buffer[:1]
+                        continue
+                    total_size = int.from_bytes(buffer[4:8], "little") + 8
+                    if len(buffer) < total_size:
+                        break
+                    wav_bytes = bytes(buffer[:total_size])
+                    del buffer[:total_size]
+                    line = json.dumps(
+                        {
+                            "type": "wav",
+                            "b64": base64.b64encode(wav_bytes).decode("ascii"),
+                        },
+                        ensure_ascii=False,
+                    ).encode("utf-8") + b"\n"
+                    yield line
+            await upstream.aclose()
+            yield b'{"type":"end"}\n'
+
+    headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(iter_ndjson(), media_type="application/x-ndjson", headers=headers)
+
+
+path: /tools/proxy/fish_proxy_server.py.bak_step2
+----------------------------------------
+# tools/proxy/fish_proxy_server.py
+from __future__ import annotations
+
+import json
+import os
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
+
+import httpx
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+
+FISH_TTS_URL = os.environ.get("FISH_TTS_URL", "http://127.0.0.1:8080/v1/tts")
+FISH_HEALTH_URL = os.environ.get("FISH_HEALTH_URL", "http://127.0.0.1:8080/v1/health")
+FISH_API_KEY = os.environ.get("FISH_API_KEY", "").strip()
+CONNECT_TIMEOUT = float(os.environ.get("PROXY_CONNECT_TIMEOUT", "10"))
+WRITE_TIMEOUT = float(os.environ.get("PROXY_WRITE_TIMEOUT", "30"))
+# read=None because upstream is a stream
+REQUEST_TIMEOUT = httpx.Timeout(connect=CONNECT_TIMEOUT, read=None, write=WRITE_TIMEOUT, pool=None)
 
 
 @asynccontextmanager
@@ -10231,7 +11874,7 @@ def parse_args():
     parser.add_argument(
         "--llama-checkpoint-path",
         type=str,
-        default="checkpoints/s2-pro",
+        default="checkpoints/fs-1.2-int8-s2-pro-int8",
     )
     parser.add_argument(
         "--decoder-checkpoint-path",
@@ -10985,6 +12628,689 @@ async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
     """
     Generate speech from text using TTS model.
     """
+    try:
+        # Get the model from the app
+        app_state = request.app.state
+        model_manager: ModelManager = app_state.model_manager
+        engine = model_manager.tts_inference_engine
+
+        if not req.reference_id and not req.references:
+            raise HTTPException(
+                HTTPStatus.BAD_REQUEST,
+                content="Reference is required for this test mode: provide reference_id or references",
+            )
+
+        sample_rate = engine.decoder_model.sample_rate
+
+        # Check if the text is too long
+        if app_state.max_text_length > 0 and len(req.text) > app_state.max_text_length:
+            raise HTTPException(
+                HTTPStatus.BAD_REQUEST,
+                content=f"Text is too long, max length is {app_state.max_text_length}",
+            )
+
+        # Check if streaming is enabled
+        if req.streaming and req.format != "wav":
+            raise HTTPException(
+                HTTPStatus.BAD_REQUEST,
+                content="Streaming only supports WAV format",
+            )
+
+        # Perform TTS
+        if req.streaming:
+            return StreamResponse(
+                iterable=inference_async(req, engine),
+                headers={
+                    "Content-Disposition": f"attachment; filename=audio.{req.format}",
+                },
+                content_type=get_content_type(req.format),
+            )
+        else:
+            chunks = []
+            for result in engine.inference(req):
+                if result.code == "error" and result.error:
+                    raise RuntimeError(str(result.error))
+                if result.code in ("segment", "final") and isinstance(
+                    result.audio, tuple
+                ):
+                    chunks.append(result.audio[1])
+            if not chunks:
+                raise HTTPException(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    content="No audio generated, please check the input text.",
+                )
+            fake_audios = np.concatenate(chunks, axis=0)
+            buffer = io.BytesIO()
+            sf.write(
+                buffer,
+                fake_audios,
+                sample_rate,
+                format=req.format,
+            )
+
+            return StreamResponse(
+                iterable=buffer_to_async_generator(buffer.getvalue()),
+                headers={
+                    "Content-Disposition": f"attachment; filename=audio.{req.format}",
+                },
+                content_type=get_content_type(req.format),
+            )
+    except HTTPException:
+        # Re-raise HTTP exceptions as they are already properly formatted
+        raise
+    except Exception as e:
+        logger.error(f"Error in TTS generation: {e}", exc_info=True)
+        raise HTTPException(
+            HTTPStatus.INTERNAL_SERVER_ERROR, content="Failed to generate speech"
+        )
+
+
+@routes.http.post("/v1/references/add")
+async def add_reference(
+    id: str = Body(...), audio: UploadFile = Body(...), text: str = Body(...)
+):
+    """
+    Add a new reference voice with audio file and text.
+    """
+    temp_file_path = None
+
+    try:
+        # Validate input parameters
+        if not id or not id.strip():
+            raise ValueError("Reference ID cannot be empty")
+
+        if not text or not text.strip():
+            raise ValueError("Reference text cannot be empty")
+
+        # Get the model manager to access the reference loader
+        app_state = request.app.state
+        model_manager: ModelManager = app_state.model_manager
+        engine = model_manager.tts_inference_engine
+
+        # Read the uploaded audio file
+        audio_content = audio.read()
+        if not audio_content:
+            raise ValueError("Audio file is empty or could not be read")
+
+        # Create a temporary file for the audio data
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
+            temp_file.write(audio_content)
+            temp_file_path = temp_file.name
+
+        # Add the reference using the engine's reference loader
+        engine.add_reference(id, temp_file_path, text)
+
+        response = AddReferenceResponse(
+            success=True,
+            message=f"Reference voice '{id}' added successfully",
+            reference_id=id,
+        )
+        return format_response(response)
+
+    except FileExistsError as e:
+        logger.warning(f"Reference ID '{id}' already exists: {e}")
+        response = AddReferenceResponse(
+            success=False,
+            message=f"Reference ID '{id}' already exists",
+            reference_id=id,
+        )
+        return format_response(response, status_code=409)  # Conflict
+
+    except ValueError as e:
+        logger.warning(f"Invalid input for reference '{id}': {e}")
+        response = AddReferenceResponse(success=False, message=str(e), reference_id=id)
+        return format_response(response, status_code=400)
+
+    except (FileNotFoundError, OSError) as e:
+        logger.error(f"File system error for reference '{id}': {e}")
+        response = AddReferenceResponse(
+            success=False, message="File system error occurred", reference_id=id
+        )
+        return format_response(response, status_code=500)
+
+    except Exception as e:
+        logger.error(f"Unexpected error adding reference '{id}': {e}", exc_info=True)
+        response = AddReferenceResponse(
+            success=False, message="Internal server error occurred", reference_id=id
+        )
+        return format_response(response, status_code=500)
+
+    finally:
+        # Clean up temporary file
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.unlink(temp_file_path)
+            except OSError as e:
+                logger.warning(
+                    "Failed to clean up temporary file %s: %s", temp_file_path, e
+                )
+
+
+@routes.http.post("/v1/references/add_encoded")
+async def add_reference_encoded(
+    id: str = Body(...),
+    codes: UploadFile = Body(...),
+    lab: UploadFile = Body(...),
+    stem: str | None = Body(None),
+):
+    """
+    Add or update a pre-encoded reference (.codes.pt + .lab). Skips write if content hash matches.
+    Optional stem: file names under references/<id>/ (default id). Use for multi-stem references.
+    """
+    try:
+        if not id or not id.strip():
+            raise ValueError("Reference ID cannot be empty")
+        codes_bytes = await codes.read()
+        lab_bytes = await lab.read()
+        if not codes_bytes:
+            raise ValueError("Codes file is empty")
+        lab_text = lab_bytes.decode("utf-8", errors="replace").strip()
+        if not lab_text:
+            raise ValueError("Lab content is empty")
+        stem_val = stem.strip() if stem and stem.strip() else None
+
+        app_state = request.app.state
+        model_manager: ModelManager = app_state.model_manager
+        engine = model_manager.tts_inference_engine
+
+        status = engine.add_reference_encoded(id, codes_bytes, lab_text, stem=stem_val)
+
+        response = AddEncodedReferenceResponse(
+            success=True,
+            status=status,
+            message=f"Reference '{id}' {status}",
+            reference_id=id,
+        )
+        return format_response(response)
+
+    except ValueError as e:
+        logger.warning("add_encoded invalid input: %s", e)
+        return format_response(
+            AddEncodedReferenceResponse(
+                success=False, status="error", message=str(e), reference_id=id or ""
+            ),
+            status_code=400,
+        )
+    except Exception as e:
+        logger.error("add_encoded error: %s", e, exc_info=True)
+        return format_response(
+            AddEncodedReferenceResponse(
+                success=False,
+                status="error",
+                message="Internal server error",
+                reference_id=id,
+            ),
+            status_code=500,
+        )
+
+
+@routes.http.get("/v1/references/list")
+async def list_references():
+    """
+    Get a list of all available reference voice IDs.
+    """
+    try:
+        # Get the model manager to access the reference loader
+        app_state = request.app.state
+        model_manager: ModelManager = app_state.model_manager
+        engine = model_manager.tts_inference_engine
+
+        # Get the list of reference IDs
+        reference_ids = engine.list_reference_ids()
+
+        response = ListReferencesResponse(
+            success=True,
+            reference_ids=reference_ids,
+            message=f"Found {len(reference_ids)} reference voices",
+        )
+        return format_response(response)
+
+    except Exception as e:
+        logger.error(f"Unexpected error listing references: {e}", exc_info=True)
+        response = ListReferencesResponse(
+            success=False, reference_ids=[], message="Internal server error occurred"
+        )
+        return format_response(response, status_code=500)
+
+
+@routes.http.delete("/v1/references/delete")
+async def delete_reference(reference_id: str = Body(...)):
+    """
+    Delete a reference voice by ID.
+    """
+    try:
+        # Validate input parameters
+        if not reference_id or not reference_id.strip():
+            raise ValueError("Reference ID cannot be empty")
+
+        # Get the model manager to access the reference loader
+        app_state = request.app.state
+        model_manager: ModelManager = app_state.model_manager
+        engine = model_manager.tts_inference_engine
+
+        # Delete the reference using the engine's reference loader
+        engine.delete_reference(reference_id)
+
+        response = DeleteReferenceResponse(
+            success=True,
+            message=f"Reference voice '{reference_id}' deleted successfully",
+            reference_id=reference_id,
+        )
+        return format_response(response)
+
+    except FileNotFoundError as e:
+        logger.warning(f"Reference ID '{reference_id}' not found: {e}")
+        response = DeleteReferenceResponse(
+            success=False,
+            message=f"Reference ID '{reference_id}' not found",
+            reference_id=reference_id,
+        )
+        return format_response(response, status_code=404)  # Not Found
+
+    except ValueError as e:
+        logger.warning(f"Invalid input for reference '{reference_id}': {e}")
+        response = DeleteReferenceResponse(
+            success=False, message=str(e), reference_id=reference_id
+        )
+        return format_response(response, status_code=400)
+
+    except OSError as e:
+        logger.error(f"File system error deleting reference '{reference_id}': {e}")
+        response = DeleteReferenceResponse(
+            success=False,
+            message="File system error occurred",
+            reference_id=reference_id,
+        )
+        return format_response(response, status_code=500)
+
+    except Exception as e:
+        logger.error(
+            f"Unexpected error deleting reference '{reference_id}': {e}", exc_info=True
+        )
+        response = DeleteReferenceResponse(
+            success=False,
+            message="Internal server error occurred",
+            reference_id=reference_id,
+        )
+        return format_response(response, status_code=500)
+
+
+@routes.http.post("/v1/references/update")
+async def update_reference(
+    old_reference_id: str = Body(...), new_reference_id: str = Body(...)
+):
+    """
+    Rename a reference voice directory from old_reference_id to new_reference_id.
+    """
+    try:
+        # Validate input parameters
+        if not old_reference_id or not old_reference_id.strip():
+            raise ValueError("Old reference ID cannot be empty")
+        if not new_reference_id or not new_reference_id.strip():
+            raise ValueError("New reference ID cannot be empty")
+        if old_reference_id == new_reference_id:
+            raise ValueError("New reference ID must be different from old reference ID")
+
+        # Validate ID format per ReferenceLoader rules
+        id_pattern = r"^[a-zA-Z0-9\-_ ]+$"
+        if not re.match(id_pattern, new_reference_id) or len(new_reference_id) > 255:
+            raise ValueError(
+                "New reference ID contains invalid characters or is too long"
+            )
+
+        # Access engine to update caches after renaming
+        app_state = request.app.state
+        model_manager: ModelManager = app_state.model_manager
+        engine = model_manager.tts_inference_engine
+
+        refs_base = Path("references")
+        old_dir = refs_base / old_reference_id
+        new_dir = refs_base / new_reference_id
+
+        # Existence checks
+        if not old_dir.exists() or not old_dir.is_dir():
+            raise FileNotFoundError(f"Reference ID '{old_reference_id}' not found")
+        if new_dir.exists():
+            # Conflict: destination already exists
+            response = UpdateReferenceResponse(
+                success=False,
+                message=f"Reference ID '{new_reference_id}' already exists",
+                old_reference_id=old_reference_id,
+                new_reference_id=new_reference_id,
+            )
+            return format_response(response, status_code=409)
+
+        # Perform rename
+        old_dir.rename(new_dir)
+
+        # Update in-memory cache key if present
+        if old_reference_id in engine.ref_by_id:
+            engine.ref_by_id[new_reference_id] = engine.ref_by_id.pop(old_reference_id)
+
+        response = UpdateReferenceResponse(
+            success=True,
+            message=(
+                f"Reference voice renamed from '{old_reference_id}' to '{new_reference_id}' successfully"
+            ),
+            old_reference_id=old_reference_id,
+            new_reference_id=new_reference_id,
+        )
+        return format_response(response)
+
+    except FileNotFoundError as e:
+        logger.warning(str(e))
+        response = UpdateReferenceResponse(
+            success=False,
+            message=str(e),
+            old_reference_id=old_reference_id,
+            new_reference_id=new_reference_id,
+        )
+        return format_response(response, status_code=404)
+
+    except ValueError as e:
+        logger.warning(f"Invalid input for update reference: {e}")
+        response = UpdateReferenceResponse(
+            success=False,
+            message=str(e),
+            old_reference_id=old_reference_id if "old_reference_id" in locals() else "",
+            new_reference_id=new_reference_id if "new_reference_id" in locals() else "",
+        )
+        return format_response(response, status_code=400)
+
+    except OSError as e:
+        logger.error(f"File system error renaming reference: {e}")
+        response = UpdateReferenceResponse(
+            success=False,
+            message="File system error occurred",
+            old_reference_id=old_reference_id,
+            new_reference_id=new_reference_id,
+        )
+        return format_response(response, status_code=500)
+
+    except Exception as e:
+        logger.error(f"Unexpected error updating reference: {e}", exc_info=True)
+        response = UpdateReferenceResponse(
+            success=False,
+            message="Internal server error occurred",
+            old_reference_id=old_reference_id if "old_reference_id" in locals() else "",
+            new_reference_id=new_reference_id if "new_reference_id" in locals() else "",
+        )
+        return format_response(response, status_code=500)
+
+
+path: /tools/server/views.py.bak_step1
+----------------------------------------
+# tools/server/views.py
+import io
+import os
+import re
+import shutil
+import tempfile
+import time
+from http import HTTPStatus
+from pathlib import Path
+
+import numpy as np
+import ormsgpack
+import soundfile as sf
+import torch
+from kui.asgi import (
+    Body,
+    HTTPException,
+    HttpView,
+    JSONResponse,
+    Routes,
+    StreamResponse,
+    UploadFile,
+    request,
+)
+from loguru import logger
+from starlette.responses import Response
+from typing_extensions import Annotated
+
+from fish_speech.utils.schema import (
+    AddEncodedReferenceResponse,
+    AddReferenceRequest,
+    AddReferenceResponse,
+    DeleteReferenceResponse,
+    ListReferencesResponse,
+    ServeTTSRequest,
+    ServeVQGANDecodeRequest,
+    ServeVQGANDecodeResponse,
+    ServeVQGANEncodeRequest,
+    ServeVQGANEncodeResponse,
+    UpdateReferenceResponse,
+)
+from tools.server.api_utils import (
+    buffer_to_async_generator,
+    format_response,
+    get_content_type,
+    inference_async,
+)
+from tools.server.inference import inference_wrapper as inference
+from tools.server.model_manager import ModelManager
+from tools.server.model_utils import (
+    batch_vqgan_decode,
+    cached_vqgan_batch_encode,
+)
+
+MAX_NUM_SAMPLES = int(os.getenv("NUM_SAMPLES", 1))
+
+routes = Routes()
+
+
+@routes.http("/v1/health")
+class Health(HttpView):
+    @classmethod
+    async def get(cls):
+        return JSONResponse({"status": "ok"})
+
+    @classmethod
+    async def post(cls):
+        return JSONResponse({"status": "ok"})
+
+
+def _model_param_memory_gb(module: torch.nn.Module) -> tuple[float, int]:
+    """Weights-only memory (GB) and param count for a module."""
+    total_bytes = sum(p.numel() * p.element_size() for p in module.parameters())
+    count = sum(p.numel() for p in module.parameters())
+    return (round(total_bytes / (1024**3), 3), count)
+
+
+def _gpu_memory_info(model_manager: ModelManager | None = None):
+    """Current GPU memory usage (read-only, safe to call anytime)."""
+    if not torch.cuda.is_available():
+        return {"cuda_available": False}
+    gb = 1024**3
+    out = {
+        "cuda_available": True,
+        "allocated_gb": round(torch.cuda.memory_allocated() / gb, 3),
+        "reserved_gb": round(torch.cuda.memory_reserved() / gb, 3),
+        "max_allocated_gb": round(torch.cuda.max_memory_allocated() / gb, 3),
+        "device_count": torch.cuda.device_count(),
+    }
+    if model_manager is not None:
+        models = {}
+        if (
+            hasattr(model_manager, "decoder_model")
+            and model_manager.decoder_model is not None
+        ):
+            dac_gb, dac_count = _model_param_memory_gb(model_manager.decoder_model)
+            models["dac"] = {"param_gb": dac_gb, "param_count": dac_count}
+        if getattr(model_manager, "_worker_memory_info", None):
+            wi = model_manager._worker_memory_info
+            if "llama_param_gb" in wi:
+                models["llama"] = {
+                    "param_gb": wi["llama_param_gb"],
+                    "param_count": wi.get("llama_param_count"),
+                }
+        if models:
+            out["models"] = models
+    if torch.cuda.device_count() > 1:
+        out["devices"] = []
+        for i in range(torch.cuda.device_count()):
+            with torch.cuda.device(i):
+                out["devices"].append(
+                    {
+                        "device": i,
+                        "name": torch.cuda.get_device_name(i),
+                        "allocated_gb": round(torch.cuda.memory_allocated() / gb, 3),
+                        "reserved_gb": round(torch.cuda.memory_reserved() / gb, 3),
+                        "max_allocated_gb": round(
+                            torch.cuda.max_memory_allocated() / gb, 3
+                        ),
+                    }
+                )
+    try:
+        out["memory_summary"] = torch.cuda.memory_summary(abbreviated=True)
+    except Exception:
+        pass
+    return out
+
+
+def _gpu_memory_text(info: dict) -> str:
+    """Format GPU memory info as plain text (readable table)."""
+    if not info.get("cuda_available"):
+        return "CUDA not available.\n"
+    lines = [
+        "GPU memory (current)",
+        f"  allocated_gb:    {info['allocated_gb']}",
+        f"  reserved_gb:     {info['reserved_gb']}",
+        f"  max_allocated_gb: {info['max_allocated_gb']}",
+        f"  device_count:    {info['device_count']}",
+        "",
+    ]
+    if "models" in info:
+        lines.append("Model weights (params only)")
+        for name, m in info["models"].items():
+            lines.append(
+                f"  {name}: param_gb={m.get('param_gb')} param_count={m.get('param_count', 'N/A')}"
+            )
+        lines.append("")
+    if "devices" in info:
+        for d in info["devices"]:
+            lines.append(f"  device {d['device']} ({d['name']})")
+            lines.append(
+                f"    allocated_gb: {d['allocated_gb']}  reserved_gb: {d['reserved_gb']}  max_allocated_gb: {d['max_allocated_gb']}"
+            )
+        lines.append("")
+    if "memory_summary" in info:
+        lines.append(info["memory_summary"])
+    return "\n".join(lines)
+
+
+def _dump_memory_snapshot(out_dir: str = "/workspace") -> tuple[str | None, str | None]:
+    """Dump current CUDA memory snapshot to a pickle file. Returns (path, None) or (None, error_message)."""
+    if not torch.cuda.is_available():
+        return None, "CUDA not available"
+    dump_fn = getattr(torch.cuda.memory, "_dump_snapshot", None)
+    if dump_fn is None:
+        return None, "_dump_snapshot not found (PyTorch too old?)"
+    try:
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        path = os.path.join(out_dir, f"memory_snapshot_{int(time.time())}.pickle")
+        dump_fn(path)
+        return path, None
+    except Exception as e:
+        return (
+            None,
+            f"Dump failed: {e!r} (need PyTorch built with CUDA memory snapshot support?)",
+        )
+
+
+@routes.http.get("/v1/debug/memory")
+async def debug_memory():
+    """
+    Return current GPU memory usage (allocated, reserved, max).
+    If model_manager is available, includes models.dac and models.llama param memory (weights only).
+    Query: ?format=text for plain text (table aligned), default JSON.
+    Query: ?dump=1 to also write torch.cuda.memory._dump_snapshot() to /workspace (requires FISH_RECORD_MEMORY_HISTORY=1 at startup).
+    """
+    model_manager = getattr(request.app.state, "model_manager", None)
+    info = _gpu_memory_info(model_manager)
+    if request.query_params.get("dump", "").strip() in ("1", "true", "True"):
+        out_dir = request.query_params.get("dump_dir", "").strip() or "/workspace"
+        snapshot_path, snapshot_err = _dump_memory_snapshot(out_dir=out_dir)
+        if snapshot_path:
+            info["snapshot_path"] = snapshot_path
+            info["snapshot_note"] = (
+                "Open at https://pytorch.org/memory_viz or: python -m torch.cuda._memory_viz trace_plot <path> -o out.html"
+            )
+        else:
+            info["snapshot_error"] = (
+                snapshot_err
+                or "Set FISH_RECORD_MEMORY_HISTORY=1 at startup for alloc history in snapshot."
+            )
+    if request.query_params.get("format", "").strip().lower() == "text":
+        return Response(_gpu_memory_text(info), media_type="text/plain; charset=utf-8")
+    return JSONResponse(info)
+
+
+@routes.http.post("/v1/vqgan/encode")
+async def vqgan_encode(req: Annotated[ServeVQGANEncodeRequest, Body(exclusive=True)]):
+    """
+    Encode audio using VQGAN model.
+    """
+    try:
+        # Get the model from the app
+        model_manager: ModelManager = request.app.state.model_manager
+        decoder_model = model_manager.decoder_model
+
+        # Encode the audio
+        start_time = time.time()
+        tokens = cached_vqgan_batch_encode(decoder_model, req.audios)
+        logger.info(
+            f"[EXEC] VQGAN encode time: {(time.time() - start_time) * 1000:.2f}ms"
+        )
+
+        # Return the response
+        return ormsgpack.packb(
+            ServeVQGANEncodeResponse(tokens=[i.tolist() for i in tokens]),
+            option=ormsgpack.OPT_SERIALIZE_PYDANTIC,
+        )
+    except Exception as e:
+        logger.error(f"Error in VQGAN encode: {e}", exc_info=True)
+        raise HTTPException(
+            HTTPStatus.INTERNAL_SERVER_ERROR, content="Failed to encode audio"
+        )
+
+
+@routes.http.post("/v1/vqgan/decode")
+async def vqgan_decode(req: Annotated[ServeVQGANDecodeRequest, Body(exclusive=True)]):
+    """
+    Decode tokens to audio using VQGAN model.
+    """
+    try:
+        # Get the model from the app
+        model_manager: ModelManager = request.app.state.model_manager
+        decoder_model = model_manager.decoder_model
+
+        # Decode the audio
+        tokens = [torch.tensor(token, dtype=torch.int) for token in req.tokens]
+        start_time = time.time()
+        audios = batch_vqgan_decode(decoder_model, tokens)
+        logger.info(
+            f"[EXEC] VQGAN decode time: {(time.time() - start_time) * 1000:.2f}ms"
+        )
+        audios = [audio.astype(np.float16).tobytes() for audio in audios]
+
+        # Return the response
+        return ormsgpack.packb(
+            ServeVQGANDecodeResponse(audios=audios),
+            option=ormsgpack.OPT_SERIALIZE_PYDANTIC,
+        )
+    except Exception as e:
+        logger.error(f"Error in VQGAN decode: {e}", exc_info=True)
+        raise HTTPException(
+            HTTPStatus.INTERNAL_SERVER_ERROR, content="Failed to decode tokens to audio"
+        )
+
+
+@routes.http.post("/v1/tts")
+async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
+    """
+    Generate speech from text using TTS model.
+    """
     # Подстановка референса по умолчанию
     if req.reference_id is None:
         req.reference_id = "ref"
@@ -11393,8 +13719,8 @@ async def update_reference(
 
 
 === SUMMARY ===
-included: 54
+included: 62
 skipped(binary): 2
 skipped(size): 0
 skipped(ext): 0
-totalBytes(approx): 387799
+totalBytes(approx): 464753

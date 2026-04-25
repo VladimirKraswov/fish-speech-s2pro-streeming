@@ -18,7 +18,8 @@ fish_speech/i18n/
 logs/
 ish_speech_web_ui/static
 fish_speech_web_ui/ui/public
-
+fish_speech_server/
+fish_speech_web_ui/
 
 package-lock.json
 yarn.lock

@@ -7,58 +7,8 @@
 #       --platform linux/amd64 \
 #       -f docker/Dockerfile \
 #       --build-arg BACKEND=[cuda, cpu] \
-#       --target [webui, server] \
-#       -t fish-speech-[webui, server]:[cuda, cpu] .
-
-# e.g. for building the webui:
-#   docker build \
-#       --platform linux/amd64 \
-#       -f docker/Dockerfile \
-#       --build-arg BACKEND=cuda \
-#       --target webui \
-#       -t fish-speech-webui:cuda .
-
-# e.g. for building the server:
-#   docker build \
-#       --platform linux/amd64 \
-#       -f docker/Dockerfile \
-#       --build-arg BACKEND=cuda \
-#       --target server \
-#       -t fish-speech-server:cuda .
-
-
-
-# Multi-platform build:
-#   docker buildx build \
-#       --platform linux/amd64,linux/arm64 \
-#       -f docker/Dockerfile \
-#       --build-arg BACKEND=cpu \
-#       --target webui \
-#       -t fish-speech-webui:cpu .
-
-
-# Running the image interactively:
-#   docker run \
-#       --gpus all \
-#       -v /path/to/fish-speech/checkpoints:/app/checkpoints \
-#       -e COMPILE=1 \ ... or -e COMPILE=0 \
-#       -it fish-speech-[webui, server]:[cuda, cpu]
-
-# E.g. running the webui:
-#   docker run \
-#       --gpus all \
-#       -v ./checkpoints:/app/checkpoints \
-#       -e COMPILE=1 \
-#       -p 7860:7860 \
-#       fish-speech-webui:cuda
-
-# E.g. running the server:
-#   docker run \
-#       --gpus all \
-#       -v ./checkpoints:/app/checkpoints \
-#       -p 8080:8080 \
-#       -it fish-speech-server:cuda
-
+#       --target [webui, server, proxy, webui-preact] \
+#       -t fish-speech-[webui, server, proxy, webui-preact]:[cuda, cpu] .
 
 # Select the specific cuda version (see https://hub.docker.com/r/nvidia/cuda/)
 ARG CUDA_VER=12.6.0
@@ -169,11 +119,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 # Install specific uv version
 COPY --from=uv-bin /uv /uvx /bin/
 
-# RUN groupadd --gid ${USER_GID} ${USERNAME} \
-#     && useradd --uid ${USER_UID} --gid ${USER_GID} -m ${USERNAME} \
-#     && mkdir -p /app /home/${USERNAME}/.cache \
-#     && chown -R ${USERNAME}:${USERNAME} /app /home/${USERNAME}/.cache
-
 # Create non-root user (or use existing user)
 RUN set -eux; \
     if getent group ${USER_GID} >/dev/null 2>&1; then \
@@ -207,7 +152,6 @@ COPY --chown=${USER_UID}:${USER_GID} pyproject.toml uv.lock README.md ./
 USER ${USER_UID}:${USER_GID}
 
 # Install Python dependencies (cacheable by lockfiles)
-# Use a generic cache path that works regardless of username
 RUN --mount=type=cache,target=/tmp/uv-cache,uid=${USER_UID},gid=${USER_GID} \
     uv python pin ${PY_VER} \
     && uv sync --extra ${UV_EXTRA} --frozen --no-install-project
@@ -228,7 +172,7 @@ RUN printf '%s\n' \
     'USER_GID='${USER_GID} \
     '' \
     '# Logging function' \
-    'log() { echo "[$(date +"%Y-%m-%d %H:%M:%S")] $*" >&2; }' \
+    'log() { echo "[$(date +"%Y-%m-%d %H:%M:%S")] \$*" >&2; }' \
     '' \
     '# Validate environment' \
     'validate_env() {' \
@@ -238,10 +182,8 @@ RUN printf '%s\n' \
     '    if [ ! -d "/app/references" ]; then' \
     '        log "WARNING: /app/references directory not found. Please mount your references."' \
     '    else' \
-    '        # Check if we can write to references directory' \
     '        if [ ! -w "/app/references" ]; then' \
-    '            log "ERROR: Cannot write to /app/references directory. Please ensure the mounted directory has proper permissions for user with UID ${USER_UID}."' \
-    '            log "You can fix this by running: sudo chown -R ${USER_UID}:${USER_GID} /path/to/your/references"' \
+    '            log "ERROR: Cannot write to /app/references directory. Please ensure UID \${USER_UID} has permissions."' \
     '            exit 1' \
     '        fi' \
     '    fi' \
@@ -249,25 +191,18 @@ RUN printf '%s\n' \
     '' \
     '# Build device arguments' \
     'build_device_args() {' \
-    '    if [ "${BACKEND:-}" = "cpu" ]; then' \
+    '    if [ "\${BACKEND:-}" = "cpu" ]; then' \
     '        echo "--device cpu"' \
     '    fi' \
     '}' \
     '' \
     '# Build compile arguments' \
     'build_compile_args() {' \
-    '    if [ "${1:-}" = "compile" ] || [ "${COMPILE:-}" = "1" ] || [ "${COMPILE:-}" = "true" ]; then' \
+    '    if [ "\${1:-}" = "compile" ] || [ "\${COMPILE:-}" = "1" ] || [ "\${COMPILE:-}" = "true" ]; then' \
     '        echo "--compile"' \
     '        shift' \
     '    fi' \
-    '    echo "$@"' \
-    '}' \
-    '' \
-    '# Health check function' \
-    'health_check() {' \
-    '    local port=${1:-7860}' \
-    '    local endpoint=${2:-/health}' \
-    '    curl -f http://localhost:${port}${endpoint} 2>/dev/null || exit 1' \
+    '    echo "\$@"' \
     '}' \
     > /app/common.sh && chmod +x /app/common.sh
 
@@ -278,177 +213,85 @@ RUN printf '%s\n' \
 # Gradio WebUI
 FROM app-base AS webui
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-
 ARG GRADIO_SERVER_NAME="0.0.0.0"
 ARG GRADIO_SERVER_PORT=7860
-ARG LLAMA_CHECKPOINT_PATH="checkpoints/fs-1.2-int8-s2-pro-int8"
-ARG DECODER_CHECKPOINT_PATH="checkpoints/s2-pro/codec.pth"
-ARG DECODER_CONFIG_NAME="modded_dac_vq"
-
-
-# Expose port
 EXPOSE ${GRADIO_SERVER_PORT}
-
-# Set environment variables
 ENV GRADIO_SERVER_NAME=${GRADIO_SERVER_NAME}
 ENV GRADIO_SERVER_PORT=${GRADIO_SERVER_PORT}
-ENV LLAMA_CHECKPOINT_PATH=${LLAMA_CHECKPOINT_PATH}
-ENV DECODER_CHECKPOINT_PATH=${DECODER_CHECKPOINT_PATH}
-ENV DECODER_CONFIG_NAME=${DECODER_CONFIG_NAME}
 
-# Create webui entrypoint
 RUN printf '%s\n' \
     '#!/bin/bash' \
     'source /app/common.sh' \
-    '' \
-    'log "Starting Fish Speech WebUI..."' \
+    'log "Starting Gradio WebUI..."' \
     'validate_env' \
-    '' \
-    'DEVICE_ARGS=$(build_device_args)' \
-    'COMPILE_ARGS=$(build_compile_args "$@")' \
-    '' \
-    'log "Device args: ${DEVICE_ARGS:-none}"' \
-    'log "Compile args: ${COMPILE_ARGS}"' \
-    'log "Server: ${GRADIO_SERVER_NAME}:${GRADIO_SERVER_PORT}"' \
-    '' \
-    'exec uv run tools/run_webui.py \' \
-    '  --llama-checkpoint-path "${LLAMA_CHECKPOINT_PATH}" \' \
-    '  --decoder-checkpoint-path "${DECODER_CHECKPOINT_PATH}" \' \
-    '  --decoder-config-name "${DECODER_CONFIG_NAME}" \' \
-    '  ${DEVICE_ARGS} ${COMPILE_ARGS}' \
+    'DEVICE_ARGS=\$(build_device_args)' \
+    'COMPILE_ARGS=\$(build_compile_args "\$@")' \
+    'exec uv run tools/run_webui.py --llama-checkpoint-path "\${LLAMA_CHECKPOINT_PATH:-checkpoints/fs-1.2-int8-s2-pro-int8}" --decoder-checkpoint-path "\${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}" --decoder-config-name "\${DECODER_CONFIG_NAME:-modded_dac_vq}" \${DEVICE_ARGS} \${COMPILE_ARGS}' \
     > /app/start_webui.sh && chmod +x /app/start_webui.sh
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:${GRADIO_SERVER_PORT}/health || exit 1
 
 ENTRYPOINT ["/app/start_webui.sh"]
 
 # API Server
 FROM app-base AS server
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-
 ARG API_SERVER_NAME="0.0.0.0"
 ARG API_SERVER_PORT=8080
-ARG LLAMA_CHECKPOINT_PATH="checkpoints/fs-1.2-int8-s2-pro-int8"
-ARG DECODER_CHECKPOINT_PATH="checkpoints/s2-pro/codec.pth"
-ARG DECODER_CONFIG_NAME="modded_dac_vq"
-
-# Expose port
 EXPOSE ${API_SERVER_PORT}
-
-# Set environment variables
 ENV API_SERVER_NAME=${API_SERVER_NAME}
 ENV API_SERVER_PORT=${API_SERVER_PORT}
-ENV LLAMA_CHECKPOINT_PATH=${LLAMA_CHECKPOINT_PATH}
-ENV DECODER_CHECKPOINT_PATH=${DECODER_CHECKPOINT_PATH}
-ENV DECODER_CONFIG_NAME=${DECODER_CONFIG_NAME}
 
-# Create server entrypoint
 RUN printf '%s\n' \
     '#!/bin/bash' \
     'source /app/common.sh' \
-    '' \
-    'log "Starting Fish Speech API Server..."' \
+    'log "Starting API Server..."' \
     'validate_env' \
-    '' \
-    'DEVICE_ARGS=$(build_device_args)' \
-    'COMPILE_ARGS=$(build_compile_args "$@")' \
-    '' \
-    'log "Device args: ${DEVICE_ARGS:-none}"' \
-    'log "Compile args: ${COMPILE_ARGS}"' \
-    'log "Server: ${API_SERVER_NAME}:${API_SERVER_PORT}"' \
-    '' \
-    'exec uv run python -m fish_speech_server.app \' \
-    '  --listen "${API_SERVER_NAME}:${API_SERVER_PORT}" \' \
-    '  --llama-checkpoint-path "${LLAMA_CHECKPOINT_PATH}" \' \
-    '  --decoder-checkpoint-path "${DECODER_CHECKPOINT_PATH}" \' \
-    '  --decoder-config-name "${DECODER_CONFIG_NAME}" \' \
-    '  ${DEVICE_ARGS} ${COMPILE_ARGS}' \
+    'DEVICE_ARGS=\$(build_device_args)' \
+    'COMPILE_ARGS=\$(build_compile_args "\$@")' \
+    'exec uv run python -m fish_speech_server.app --listen "\${API_SERVER_NAME}:\${API_SERVER_PORT}" --llama-checkpoint-path "\${LLAMA_CHECKPOINT_PATH:-checkpoints/fs-1.2-int8-s2-pro-int8}" --decoder-checkpoint-path "\${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}" --decoder-config-name "\${DECODER_CONFIG_NAME:-modded_dac_vq}" \${DEVICE_ARGS} \${COMPILE_ARGS}' \
     > /app/start_server.sh && chmod +x /app/start_server.sh
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:${API_SERVER_PORT}/v1/health || exit 1
 
 ENTRYPOINT ["/app/start_server.sh"]
 
 # Proxy Server
 FROM app-base AS proxy
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-
 ARG PROXY_SERVER_NAME="0.0.0.0"
 ARG PROXY_SERVER_PORT=9000
-
 EXPOSE ${PROXY_SERVER_PORT}
-
 ENV PROXY_SERVER_NAME=${PROXY_SERVER_NAME}
 ENV PROXY_SERVER_PORT=${PROXY_SERVER_PORT}
 
 RUN printf '%s\n' \
     '#!/bin/bash' \
     'source /app/common.sh' \
-    '' \
-    'log "Starting Fish Speech PCM Proxy..."' \
-    '' \
-    'exec uv run python -m uvicorn fish_speech_server.proxy.pcm:app \' \
-    '  --host "${PROXY_SERVER_NAME}" \' \
-    '  --port "${PROXY_SERVER_PORT}"' \
+    'log "Starting PCM Proxy..."' \
+    'exec uv run python -m uvicorn fish_speech_server.proxy.pcm:app --host "\${PROXY_SERVER_NAME}" --port "\${PROXY_SERVER_PORT}"' \
     > /app/start_proxy.sh && chmod +x /app/start_proxy.sh
-
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:${PROXY_SERVER_PORT}/health || exit 1
 
 ENTRYPOINT ["/app/start_proxy.sh"]
 
 # Preact Web UI
 FROM app-base AS webui-preact
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-
 ARG WEBUI_SERVER_NAME="0.0.0.0"
 ARG WEBUI_SERVER_PORT=9001
-
 EXPOSE ${WEBUI_SERVER_PORT}
-
 ENV WEBUI_SERVER_NAME=${WEBUI_SERVER_NAME}
 ENV WEBUI_SERVER_PORT=${WEBUI_SERVER_PORT}
 
 RUN printf '%s\n' \
     '#!/bin/bash' \
     'source /app/common.sh' \
-    '' \
-    'log "Starting Fish Speech Web UI (Preact)..."' \
-    '' \
-    'exec uv run python -m fish_speech_web_ui.server \' \
-    '  --host "${WEBUI_SERVER_NAME}" \' \
-    '  --port "${WEBUI_SERVER_PORT}"' \
+    'log "Starting Web UI (Preact)..."' \
+    'exec uv run python -m fish_speech_web_ui.server --host "\${WEBUI_SERVER_NAME}" --port "\${WEBUI_SERVER_PORT}"' \
     > /app/start_webui_preact.sh && chmod +x /app/start_webui_preact.sh
-
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:${WEBUI_SERVER_PORT}/health || exit 1
 
 ENTRYPOINT ["/app/start_webui_preact.sh"]
 
 # Development stage
 FROM app-base AS dev
 USER root
-
-# Install development tools
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update \
-    && apt-get install -y --no-install-recommends \
-        vim \
-        htop \
-        strace \
-        gdb \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
-
+RUN apt-get update && apt-get install -y --no-install-recommends vim htop strace gdb && apt-get clean && rm -rf /var/lib/apt/lists/*
 USER ${USER_UID}:${USER_GID}
-
-# Install development dependencies
 RUN uv sync --extra ${UV_EXTRA} --dev
-
-# Default to bash for development
 ENTRYPOINT ["/bin/bash"]

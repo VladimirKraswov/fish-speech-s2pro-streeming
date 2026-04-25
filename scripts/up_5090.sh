@@ -12,20 +12,15 @@ require_cmd curl
 require_cmd docker
 
 IMAGE="${IMAGE:-fish-speech-server:cu129}"
-CONTAINER="${CONTAINER:-fish-speech-5090}"
 BUILD_IMAGE="${BUILD_IMAGE:-0}"
-START_PROXY="${START_PROXY:-1}"
-START_WEBUI="${START_WEBUI:-1}"
-EXTRA_WARMUP="${EXTRA_WARMUP:-1}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-1800}"
 
 CUDA_VER="${CUDA_VER:-12.9.0}"
 UV_EXTRA="${UV_EXTRA:-cu129}"
-PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-SERVER_HOST="${SERVER_HOST:-$(runtime_get 'network.server.host')}"
 SERVER_PORT="${SERVER_PORT:-$(runtime_get 'network.server.port')}"
 PROXY_PORT="${PROXY_PORT:-$(runtime_get 'network.proxy.port')}"
+WEBUI_PORT=9001
 
 LLAMA_CHECKPOINT_PATH="${LLAMA_CHECKPOINT_PATH:-$(runtime_path 'paths.llama_checkpoint_path')}"
 DECODER_CHECKPOINT_PATH="${DECODER_CHECKPOINT_PATH:-$(runtime_path 'paths.decoder_checkpoint_path')}"
@@ -41,69 +36,52 @@ require_dir "$LLAMA_CHECKPOINT_PATH"
 require_file "$DECODER_CHECKPOINT_PATH"
 
 echo "=== Fish Speech startup (RTX 5090) ==="
-echo "REPO_ROOT=$REPO_ROOT"
-echo "RUNTIME_CONFIG=$RUNTIME_CONFIG"
-echo "IMAGE=$IMAGE"
-echo "CONTAINER=$CONTAINER"
-echo "SERVER=${SERVER_HOST}:${SERVER_PORT}"
+echo "SERVER_PORT=$SERVER_PORT"
 echo "PROXY_PORT=$PROXY_PORT"
-echo "LLAMA_CHECKPOINT_PATH=$LLAMA_CHECKPOINT_PATH"
-echo "DECODER_CHECKPOINT_PATH=$DECODER_CHECKPOINT_PATH"
-echo "DEFAULT_REFERENCE_ID=$DEFAULT_REFERENCE_ID"
-echo "WARMUP_REFERENCE_ID=$WARMUP_REFERENCE_ID"
+echo "WEBUI_PORT=$WEBUI_PORT"
 echo
 
-if [[ "$BUILD_IMAGE" == "1" ]] || ! docker_cmd image inspect "$IMAGE" >/dev/null 2>&1; then
-  echo "[1/5] Building Docker image..."
-  docker_cmd build \
-    --platform linux/amd64 \
-    -f docker/Dockerfile \
-    --build-arg BACKEND=cuda \
-    --build-arg CUDA_VER="$CUDA_VER" \
-    --build-arg UV_EXTRA="$UV_EXTRA" \
-    --target server \
-    -t "$IMAGE" .
+if [[ "$BUILD_IMAGE" == "1" ]]; then
+  echo "[1/4] Building full-stack Docker images..."
+  docker_compose_cmd build
 else
-  echo "[1/5] Using existing image: $IMAGE"
+  echo "[1/4] Using existing images (skip build)"
 fi
 
-echo "[2/5] Stopping previous processes..."
-CONTAINER="$CONTAINER" DOCKER_USE_SUDO="${DOCKER_USE_SUDO:-0}" bash "$REPO_ROOT/scripts/down_5090.sh"
+echo "[2/4] Stopping previous processes..."
+bash "$REPO_ROOT/scripts/down_5090.sh"
 
-echo "[3/5] Starting model container..."
-CID="$(
-  docker_cmd run -d --rm \
-    --name "$CONTAINER" \
-    -p "${SERVER_PORT}:${SERVER_PORT}" \
-    --gpus all \
-    -e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF" \
-    -e PYTHONPATH=/workspace \
-    -v "$REPO_ROOT":/workspace \
-    -w /workspace \
-    --entrypoint /app/.venv/bin/python \
-    "$IMAGE" \
-    -m fish_speech_server.app \
-    --listen "0.0.0.0:${SERVER_PORT}"
-)"
+echo "[3/4] Starting services (full-stack)..."
+docker_compose_cmd --profile full-stack up -d
 
-echo "Container started: $CID"
-echo
-
-echo "[4/5] Waiting for model health..."
+echo "[4/4] Waiting for services health..."
 if ! wait_http_ok "http://127.0.0.1:${SERVER_PORT}/v1/health" "$HEALTH_TIMEOUT" 5; then
   echo "ERROR: model did not become healthy" >&2
-  docker_cmd logs --tail 200 "$CONTAINER" || true
+  docker_compose_cmd logs server --tail 200
   exit 1
 fi
 
-echo "Model is healthy"
+if ! wait_http_ok "http://127.0.0.1:${PROXY_PORT}/health" 60 2; then
+  echo "ERROR: proxy did not become healthy" >&2
+  docker_compose_cmd logs proxy --tail 200
+  exit 1
+fi
+
+if ! wait_http_ok "http://127.0.0.1:${WEBUI_PORT}/health" 30 1; then
+  echo "ERROR: web-ui did not become healthy" >&2
+  docker_compose_cmd logs web-ui --tail 200
+  exit 1
+fi
+
+echo "All services are healthy"
 echo
+
 echo "Current model memory:"
 curl -sf "http://127.0.0.1:${SERVER_PORT}/v1/debug/memory" || true
 echo
 echo
 
-if [[ "$EXTRA_WARMUP" == "1" ]]; then
+if [[ "${EXTRA_WARMUP:-1}" == "1" ]]; then
   echo "Running extra warmup request..."
   PORT="$SERVER_PORT" \
   BASE_URL="http://127.0.0.1:${SERVER_PORT}" \
@@ -112,27 +90,10 @@ if [[ "$EXTRA_WARMUP" == "1" ]]; then
   echo
 fi
 
-if [[ "$START_PROXY" == "1" ]]; then
-  echo "[5/5] Starting proxy..."
-  PROXY_PORT="$PROXY_PORT" \
-  bash "$REPO_ROOT/scripts/run_proxy.sh"
-else
-  echo "[5/5] Proxy start skipped"
-fi
-
-if [[ "$START_WEBUI" == "1" ]]; then
-  echo "Starting Web UI..."
-  bash "$REPO_ROOT/scripts/run_web_ui.sh"
-else
-  echo "Web UI start skipped"
-fi
-
 echo
 echo "=== READY ==="
-echo "Model health:       http://127.0.0.1:${SERVER_PORT}/v1/health"
-echo "Model memory:       http://127.0.0.1:${SERVER_PORT}/v1/debug/memory"
-echo "Proxy health:       http://127.0.0.1:${PROXY_PORT}/health"
-echo "Proxy open session: http://127.0.0.1:${PROXY_PORT}/session/open"
-echo "Web UI:             http://127.0.0.1:9001"
-echo "Logs:               bash scripts/logs_5090.sh"
-echo "Status:             bash scripts/status_5090.sh"
+echo "Model API:   http://127.0.0.1:${SERVER_PORT}/v1/health"
+echo "Proxy API:   http://127.0.0.1:${PROXY_PORT}/health"
+echo "Web UI:      http://127.0.0.1:${WEBUI_PORT}"
+echo "Logs:        docker compose logs -f"
+echo "Status:      bash scripts/status_5090.sh"

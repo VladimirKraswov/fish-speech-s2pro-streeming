@@ -13,6 +13,14 @@ docker_cmd() {
   fi
 }
 
+docker_compose_cmd() {
+  if [[ "${DOCKER_USE_SUDO:-0}" == "1" ]]; then
+    sudo docker compose "$@"
+  else
+    docker compose "$@"
+  fi
+}
+
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
     echo "ERROR: required command not found: $1" >&2

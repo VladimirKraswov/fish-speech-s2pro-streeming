@@ -38,6 +38,6 @@ fi
 "$VENV_DIR/bin/pip" install -q -r "$SETUP_DIR/requirements.txt"
 echo -e "${GREEN}✓ Зависимости установщика готовы${NC}"
 
-# Запуск установщика с переданными аргументами (если есть) или с меню
+# Переходим в корень проекта и запускаем установщик как модуль
 cd "$PROJECT_ROOT"
-exec "$VENV_DIR/bin/python" "$SETUP_DIR/installer.py" "$@"
+exec "$VENV_DIR/bin/python" -m setup.installer "$@"

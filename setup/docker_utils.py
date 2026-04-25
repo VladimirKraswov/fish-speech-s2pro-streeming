@@ -1,3 +1,5 @@
+# setup/docker_utils.py
+
 """Обёртки для docker и docker compose."""
 
 import subprocess
@@ -40,8 +42,10 @@ def logs(service: Optional[str] = None, tail: int = 50) -> str:
     result = run(["docker", "compose"] + cmd, capture=True, check=False)
     return result.stdout + result.stderr
 
-def generate_lock_file(ui_dir: Path) -> None:
-    """Запустить npm install внутри контейнера, чтобы создать package-lock.json."""
+def generate_lock_file(ui_dir: Path) -> bool:
+    """Запустить npm install внутри контейнера, чтобы создать package-lock.json.
+    Возвращает True при успехе, False при ошибке (например, нет сети).
+    """
     ui_dir = ui_dir.resolve()
     cmd = [
         "docker", "run", "--rm",
@@ -49,4 +53,9 @@ def generate_lock_file(ui_dir: Path) -> None:
         "-w", "/app",
         "node:22-slim", "npm", "install"
     ]
-    run(cmd)
+    try:
+        run(cmd)
+        return True
+    except subprocess.CalledProcessError as e:
+        # Не ругаемся, просто возвращаем False
+        return False

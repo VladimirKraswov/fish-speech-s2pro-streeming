@@ -2,20 +2,26 @@
 
 """Обёртки для docker и docker compose."""
 
+import os
 import subprocess
-import sys
 from pathlib import Path
 from typing import List, Optional, Union
-import shlex
 
 from .config import get_docker_sudo
 
 
 def run(cmd: List[str], capture: bool = False, check: bool = True) -> subprocess.CompletedProcess:
-    """Выполнить команду с префиксом sudo, если нужно."""
+    """Выполнить команду с sudo и нужными переменными окружения."""
     if get_docker_sudo() and cmd[0] == "docker":
-        cmd = ["sudo"] + cmd
-    return subprocess.run(cmd, capture_output=capture, text=True, check=check)
+        # -E сохраняет текущее окружение пользователя
+        cmd = ["sudo", "-E"] + cmd
+
+    # Переменные для сборки Docker (если не заданы в системе)
+    env = os.environ.copy()
+    env.setdefault("UV_EXTRA", "cu129")
+    env.setdefault("CUDA_VER", "12.9.0")
+
+    return subprocess.run(cmd, capture_output=capture, text=True, check=check, env=env)
 
 
 def compose(*args: str) -> subprocess.CompletedProcess:

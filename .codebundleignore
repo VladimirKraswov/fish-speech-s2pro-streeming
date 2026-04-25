@@ -26,6 +26,7 @@ pnpm-lock.yaml
 bundle-code.js
 uv.lock
 .project-root
+codebundle.txt
 
 
 *.png

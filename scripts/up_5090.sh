@@ -2,98 +2,53 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-# shellcheck source=/dev/null
 source "$SCRIPT_DIR/lib_5090.sh"
 
 cd "$REPO_ROOT"
 
-require_cmd "$PYTHON_BIN"
 require_cmd curl
 require_cmd docker
 
+# Используем уже существующие переменные окружения
 IMAGE="${IMAGE:-fish-speech-server:cu129}"
-BUILD_IMAGE="${BUILD_IMAGE:-0}"
-HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-1800}"
-
-CUDA_VER="${CUDA_VER:-12.9.0}"
-UV_EXTRA="${UV_EXTRA:-cu129}"
+BUILD_IMAGE="${BUILD_IMAGE:-0}"   # обычно 0, т.к. образ уже готов
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-300}"  # 5 минут достаточно, если модели уже смонтированы
 
 SERVER_PORT="${SERVER_PORT:-$(runtime_get 'network.server.port')}"
 PROXY_PORT="${PROXY_PORT:-$(runtime_get 'network.proxy.port')}"
 WEBUI_PORT=9001
 
-LLAMA_CHECKPOINT_PATH="${LLAMA_CHECKPOINT_PATH:-$(runtime_path 'paths.llama_checkpoint_path')}"
-DECODER_CHECKPOINT_PATH="${DECODER_CHECKPOINT_PATH:-$(runtime_path 'paths.decoder_checkpoint_path')}"
-DEFAULT_REFERENCE_ID="${DEFAULT_REFERENCE_ID:-$(runtime_get 'proxy.default_reference_id')}"
-WARMUP_REFERENCE_ID="${WARMUP_REFERENCE_ID:-$(runtime_get 'warmup.reference_id')}"
+echo "=== Fish Speech startup (fast) ==="
+echo "SERVER_PORT=$SERVER_PORT  PROXY_PORT=$PROXY_PORT  WEBUI_PORT=$WEBUI_PORT"
 
-if [[ -z "$WARMUP_REFERENCE_ID" ]]; then
-  WARMUP_REFERENCE_ID="$DEFAULT_REFERENCE_ID"
+# Проверка, что модели действительно существуют (необязательно, но полезно)
+LLAMA_PATH="$(runtime_path 'paths.llama_checkpoint_path')"
+DECODER_PATH="$(runtime_path 'paths.decoder_checkpoint_path')"
+if [[ ! -d "$LLAMA_PATH" ]] || [[ ! -f "$DECODER_PATH" ]]; then
+    echo "ERROR: Models not found. Run 'bash scripts/deploy_5090.sh' first." >&2
+    exit 1
 fi
 
-require_file "$RUNTIME_CONFIG"
-require_dir "$LLAMA_CHECKPOINT_PATH"
-require_file "$DECODER_CHECKPOINT_PATH"
-
-echo "=== Fish Speech startup (RTX 5090) ==="
-echo "SERVER_PORT=$SERVER_PORT"
-echo "PROXY_PORT=$PROXY_PORT"
-echo "WEBUI_PORT=$WEBUI_PORT"
-echo
-
-if [[ "$BUILD_IMAGE" == "1" ]]; then
-  echo "[1/4] Building full-stack Docker images..."
-  docker_compose_cmd build
-else
-  echo "[1/4] Using existing images (skip build)"
-fi
-
-echo "[2/4] Stopping previous processes..."
+# Остановить старые контейнеры
 bash "$REPO_ROOT/scripts/down_5090.sh"
 
-echo "[3/4] Starting services (full-stack)..."
+# Запустить (используем уже собранный образ)
+echo "[up] Starting containers..."
 docker_compose_cmd --profile full-stack up -d
 
-echo "[4/4] Waiting for services health..."
-if ! wait_http_ok "http://127.0.0.1:${SERVER_PORT}/v1/health" "$HEALTH_TIMEOUT" 5; then
-  echo "ERROR: model did not become healthy" >&2
-  docker_compose_cmd logs server --tail 200
-  exit 1
+# Ждём здоровье сервера (теперь должно быть быстро, т.к. модели уже на хосте и не скачиваются)
+echo "[up] Waiting for server health (up to ${HEALTH_TIMEOUT}s)..."
+if ! wait_http_ok "http://127.0.0.1:${SERVER_PORT}/v1/health" "$HEALTH_TIMEOUT" 2; then
+    echo "ERROR: server health check timeout" >&2
+    docker_compose_cmd logs server --tail 50
+    exit 1
 fi
 
-if ! wait_http_ok "http://127.0.0.1:${PROXY_PORT}/health" 60 2; then
-  echo "ERROR: proxy did not become healthy" >&2
-  docker_compose_cmd logs proxy --tail 200
-  exit 1
-fi
+# Проверка proxy и web-ui
+wait_http_ok "http://127.0.0.1:${PROXY_PORT}/health" 30 2
+wait_http_ok "http://127.0.0.1:${WEBUI_PORT}/health" 10 1
 
-if ! wait_http_ok "http://127.0.0.1:${WEBUI_PORT}/health" 30 1; then
-  echo "ERROR: web-ui did not become healthy" >&2
-  docker_compose_cmd logs web-ui --tail 200
-  exit 1
-fi
-
-echo "All services are healthy"
-echo
-
-echo "Current model memory:"
-curl -sf "http://127.0.0.1:${SERVER_PORT}/v1/debug/memory" || true
-echo
-echo
-
-if [[ "${EXTRA_WARMUP:-1}" == "1" ]]; then
-  echo "Running extra warmup request..."
-  PORT="$SERVER_PORT" \
-  BASE_URL="http://127.0.0.1:${SERVER_PORT}" \
-  WARMUP_REFERENCE_ID="$WARMUP_REFERENCE_ID" \
-  bash "$REPO_ROOT/scripts/warmup_5090.sh"
-  echo
-fi
-
-echo
 echo "=== READY ==="
-echo "Model API:   http://127.0.0.1:${SERVER_PORT}/v1/health"
-echo "Proxy API:   http://127.0.0.1:${PROXY_PORT}/health"
-echo "Web UI:      http://127.0.0.1:${WEBUI_PORT}"
-echo "Logs:        docker compose logs -f"
-echo "Status:      bash scripts/status_5090.sh"
+echo "API: http://127.0.0.1:${SERVER_PORT}"
+echo "Proxy: http://127.0.0.1:${PROXY_PORT}"
+echo "Web UI: http://127.0.0.1:${WEBUI_PORT}"

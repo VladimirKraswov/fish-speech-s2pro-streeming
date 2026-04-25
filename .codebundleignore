@@ -10,6 +10,7 @@ libs/
 web/
 datasets/
 smoke-test/
+fish_speech/
 fish_speech/i18n/
 temp/
 results/

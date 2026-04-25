@@ -373,6 +373,62 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
 
 ENTRYPOINT ["/app/start_server.sh"]
 
+# Proxy Server
+FROM app-base AS proxy
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+
+ARG PROXY_SERVER_NAME="0.0.0.0"
+ARG PROXY_SERVER_PORT=9000
+
+EXPOSE ${PROXY_SERVER_PORT}
+
+ENV PROXY_SERVER_NAME=${PROXY_SERVER_NAME}
+ENV PROXY_SERVER_PORT=${PROXY_SERVER_PORT}
+
+RUN printf '%s\n' \
+    '#!/bin/bash' \
+    'source /app/common.sh' \
+    '' \
+    'log "Starting Fish Speech PCM Proxy..."' \
+    '' \
+    'exec uv run python -m uvicorn fish_speech_server.proxy.pcm:app \' \
+    '  --host "${PROXY_SERVER_NAME}" \' \
+    '  --port "${PROXY_SERVER_PORT}"' \
+    > /app/start_proxy.sh && chmod +x /app/start_proxy.sh
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:${PROXY_SERVER_PORT}/health || exit 1
+
+ENTRYPOINT ["/app/start_proxy.sh"]
+
+# Preact Web UI
+FROM app-base AS webui-preact
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+
+ARG WEBUI_SERVER_NAME="0.0.0.0"
+ARG WEBUI_SERVER_PORT=9001
+
+EXPOSE ${WEBUI_SERVER_PORT}
+
+ENV WEBUI_SERVER_NAME=${WEBUI_SERVER_NAME}
+ENV WEBUI_SERVER_PORT=${WEBUI_SERVER_PORT}
+
+RUN printf '%s\n' \
+    '#!/bin/bash' \
+    'source /app/common.sh' \
+    '' \
+    'log "Starting Fish Speech Web UI (Preact)..."' \
+    '' \
+    'exec uv run python -m fish_speech_web_ui.server \' \
+    '  --host "${WEBUI_SERVER_NAME}" \' \
+    '  --port "${WEBUI_SERVER_PORT}"' \
+    > /app/start_webui_preact.sh && chmod +x /app/start_webui_preact.sh
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:${WEBUI_SERVER_PORT}/health || exit 1
+
+ENTRYPOINT ["/app/start_webui_preact.sh"]
+
 # Development stage
 FROM app-base AS dev
 USER root

@@ -9,8 +9,8 @@ import { LLMSimulator } from './lib/simulator';
 import type { StreamEvent, CommittedItem } from './types';
 import './app.css';
 
-const PROXY_URL = 'http://localhost:9000';
-const SERVER_URL = 'http://localhost:8080';
+const PROXY_URL = `http://${window.location.hostname}:9000`;
+const SERVER_URL = `http://${window.location.hostname}:8080`;
 
 const DEFAULT_CONFIG = {
     commit: {

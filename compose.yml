@@ -22,6 +22,32 @@ services:
       target: server
     environment:
       COMPILE: ${COMPILE:-0}
-    profiles: ["server"]
+    profiles: ["server", "full-stack"]
     ports:
       - "${API_PORT:-8080}:8080"
+
+  proxy:
+    extends:
+      file: compose.base.yml
+      service: app-base
+    build:
+      target: proxy
+    depends_on:
+      server:
+        condition: service_healthy
+    profiles: ["proxy", "full-stack"]
+    ports:
+      - "${PROXY_PORT:-9000}:9000"
+
+  web-ui:
+    extends:
+      file: compose.base.yml
+      service: app-base
+    build:
+      target: webui-preact
+    depends_on:
+      proxy:
+        condition: service_started
+    profiles: ["web-ui", "full-stack"]
+    ports:
+      - "${WEBUI_PORT:-9001}:9001"

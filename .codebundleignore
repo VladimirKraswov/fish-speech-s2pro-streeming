@@ -14,6 +14,9 @@ fish_speech/i18n/
 temp/
 results/
 fish_speech/i18n/
+logs/
+ish_speech_web_ui/static
+fish_speech_web_ui/ui/public
 
 
 package-lock.json

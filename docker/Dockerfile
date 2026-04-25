@@ -168,11 +168,11 @@ RUN printf '%s\n' \
     'set -euo pipefail' \
     '' \
     '# Set user info from build args' \
-    'USER_UID='${USER_UID} \
-    'USER_GID='${USER_GID} \
+    "USER_UID=${USER_UID}" \
+    "USER_GID=${USER_GID}" \
     '' \
     '# Logging function' \
-    'log() { echo "[$(date +"%Y-%m-%d %H:%M:%S")] \$*" >&2; }' \
+    'log() { echo "[$(date +"%Y-%m-%d %H:%M:%S")] $*" >&2; }' \
     '' \
     '# Validate environment' \
     'validate_env() {' \
@@ -183,7 +183,7 @@ RUN printf '%s\n' \
     '        log "WARNING: /app/references directory not found. Please mount your references."' \
     '    else' \
     '        if [ ! -w "/app/references" ]; then' \
-    '            log "ERROR: Cannot write to /app/references directory. Please ensure UID \${USER_UID} has permissions."' \
+    '            log "ERROR: Cannot write to /app/references directory. Please ensure UID ${USER_UID} has permissions."' \
     '            exit 1' \
     '        fi' \
     '    fi' \
@@ -191,18 +191,18 @@ RUN printf '%s\n' \
     '' \
     '# Build device arguments' \
     'build_device_args() {' \
-    '    if [ "\${BACKEND:-}" = "cpu" ]; then' \
+    '    if [ "${BACKEND:-}" = "cpu" ]; then' \
     '        echo "--device cpu"' \
     '    fi' \
     '}' \
     '' \
     '# Build compile arguments' \
     'build_compile_args() {' \
-    '    if [ "\${1:-}" = "compile" ] || [ "\${COMPILE:-}" = "1" ] || [ "\${COMPILE:-}" = "true" ]; then' \
+    '    if [ "${1:-}" = "compile" ] || [ "${COMPILE:-}" = "1" ] || [ "${COMPILE:-}" = "true" ]; then' \
     '        echo "--compile"' \
     '        shift' \
     '    fi' \
-    '    echo "\$@"' \
+    '    echo "$@"' \
     '}' \
     > /app/common.sh && chmod +x /app/common.sh
 
@@ -224,9 +224,9 @@ RUN printf '%s\n' \
     'source /app/common.sh' \
     'log "Starting Gradio WebUI..."' \
     'validate_env' \
-    'DEVICE_ARGS=\$(build_device_args)' \
-    'COMPILE_ARGS=\$(build_compile_args "\$@")' \
-    'exec uv run tools/run_webui.py --llama-checkpoint-path "\${LLAMA_CHECKPOINT_PATH:-checkpoints/fs-1.2-int8-s2-pro-int8}" --decoder-checkpoint-path "\${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}" --decoder-config-name "\${DECODER_CONFIG_NAME:-modded_dac_vq}" \${DEVICE_ARGS} \${COMPILE_ARGS}' \
+    'DEVICE_ARGS=$(build_device_args)' \
+    'COMPILE_ARGS=$(build_compile_args "$@")' \
+    'exec uv run tools/run_webui.py --llama-checkpoint-path "${LLAMA_CHECKPOINT_PATH:-checkpoints/fs-1.2-int8-s2-pro-int8}" --decoder-checkpoint-path "${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}" --decoder-config-name "${DECODER_CONFIG_NAME:-modded_dac_vq}" ${DEVICE_ARGS} ${COMPILE_ARGS}' \
     > /app/start_webui.sh && chmod +x /app/start_webui.sh
 
 ENTRYPOINT ["/app/start_webui.sh"]
@@ -245,9 +245,9 @@ RUN printf '%s\n' \
     'source /app/common.sh' \
     'log "Starting API Server..."' \
     'validate_env' \
-    'DEVICE_ARGS=\$(build_device_args)' \
-    'COMPILE_ARGS=\$(build_compile_args "\$@")' \
-    'exec uv run python -m fish_speech_server.app --listen "\${API_SERVER_NAME}:\${API_SERVER_PORT}" --llama-checkpoint-path "\${LLAMA_CHECKPOINT_PATH:-checkpoints/fs-1.2-int8-s2-pro-int8}" --decoder-checkpoint-path "\${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}" --decoder-config-name "\${DECODER_CONFIG_NAME:-modded_dac_vq}" \${DEVICE_ARGS} \${COMPILE_ARGS}' \
+    'DEVICE_ARGS=$(build_device_args)' \
+    'COMPILE_ARGS=$(build_compile_args "$@")' \
+    'exec uv run python -m fish_speech_server.app --listen "${API_SERVER_NAME}:${API_SERVER_PORT}" --llama-checkpoint-path "${LLAMA_CHECKPOINT_PATH:-checkpoints/fs-1.2-int8-s2-pro-int8}" --decoder-checkpoint-path "${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}" --decoder-config-name "${DECODER_CONFIG_NAME:-modded_dac_vq}" ${DEVICE_ARGS} ${COMPILE_ARGS}' \
     > /app/start_server.sh && chmod +x /app/start_server.sh
 
 ENTRYPOINT ["/app/start_server.sh"]
@@ -265,7 +265,7 @@ RUN printf '%s\n' \
     '#!/bin/bash' \
     'source /app/common.sh' \
     'log "Starting PCM Proxy..."' \
-    'exec uv run python -m uvicorn fish_speech_server.proxy.pcm:app --host "\${PROXY_SERVER_NAME}" --port "\${PROXY_SERVER_PORT}"' \
+    'exec uv run python -m uvicorn fish_speech_server.proxy.pcm:app --host "${PROXY_SERVER_NAME}" --port "${PROXY_SERVER_PORT}"' \
     > /app/start_proxy.sh && chmod +x /app/start_proxy.sh
 
 ENTRYPOINT ["/app/start_proxy.sh"]
@@ -283,7 +283,7 @@ RUN printf '%s\n' \
     '#!/bin/bash' \
     'source /app/common.sh' \
     'log "Starting Web UI (Preact)..."' \
-    'exec uv run python -m fish_speech_web_ui.server --host "\${WEBUI_SERVER_NAME}" --port "\${WEBUI_SERVER_PORT}"' \
+    'exec uv run python -m fish_speech_web_ui.server --host "${WEBUI_SERVER_NAME}" --port "${WEBUI_SERVER_PORT}"' \
     > /app/start_webui_preact.sh && chmod +x /app/start_webui_preact.sh
 
 ENTRYPOINT ["/app/start_webui_preact.sh"]

@@ -85,15 +85,15 @@ docker-compose*.yml
 .dockerignore
 
 # Checkpoints and models (should be mounted)
-checkpoints/
-models/
+/checkpoints/
+/models/
 *.pth
 *.ckpt
 *.safetensors
 *.bin
 
 # Reference voices (should be mounted)
-references/
+/references/
 
 # Generated audio files
 *.wav
@@ -106,7 +106,7 @@ fake.npy
 
 # Cache directories
 .cache/
-cache/
+/cache/
 .uv_cache/
 
 # Development files

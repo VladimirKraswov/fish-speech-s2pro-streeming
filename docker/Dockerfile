@@ -1,4 +1,5 @@
-# docker/Dockerfile — финальная версия, зависимости устанавливаются в образ через pip
+# docker/Dockerfile — финальная версия с виртуальным окружением (venv)
+# Все зависимости устанавливаются при сборке, при запуске — только загрузка моделей
 
 ARG CUDA_VER=12.9.0
 ARG UV_EXTRA=cu129
@@ -11,23 +12,26 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# Системные зависимости
+# Установка системных зависимостей
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3-pip python3-dev git ca-certificates curl \
+    python3-pip python3-dev python3-venv git ca-certificates curl \
     libsox-dev build-essential cmake libasound-dev portaudio19-dev \
     libportaudio2 libportaudiocpp0 ffmpeg \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Копируем все файлы проекта (для простоты)
+# Копируем все файлы проекта
 COPY . .
 
-# Устанавливаем Python-зависимости (прямо в системный Python, без venv)
-# Используем [cu129] для установки PyTorch с CUDA 12.9
-RUN pip3 install --no-cache-dir -e ".[cu129]"
+# Создаём виртуальное окружение
+RUN python3 -m venv /app/venv
 
-# Скрипт для общих функций
+# Устанавливаем зависимости внутри venv (без флага --system)
+# Используем [cu129] для правильной версии PyTorch с CUDA 12.9
+RUN /app/venv/bin/pip install --no-cache-dir -e ".[cu129]"
+
+# Общий вспомогательный скрипт (использует python из venv)
 RUN printf '%s\n' \
     '#!/bin/bash' \
     'log() { echo "[$(date +"%Y-%m-%d %H:%M:%S")] $*" >&2; }' \
@@ -36,7 +40,7 @@ RUN printf '%s\n' \
     'build_compile_args() { if [ "${1:-}" = "compile" ] || [ "${COMPILE:-}" = "1" ] || [ "${COMPILE:-}" = "true" ]; then echo "--compile"; shift; fi; echo "$@"; }' \
     > /app/common.sh && chmod +x /app/common.sh
 
-# API сервер
+# ---------- API сервер ----------
 FROM base AS server
 ARG API_SERVER_NAME="0.0.0.0" API_SERVER_PORT=8080
 EXPOSE ${API_SERVER_PORT}
@@ -48,11 +52,11 @@ RUN printf '%s\n' \
     'validate_env' \
     'DEVICE_ARGS=$(build_device_args)' \
     'COMPILE_ARGS=$(build_compile_args "$@")' \
-    'exec python3 -m fish_speech_server.app --listen "${API_SERVER_NAME}:${API_SERVER_PORT}" --llama-checkpoint-path "${LLAMA_CHECKPOINT_PATH:-checkpoints/fs-1.2-int8-s2-pro-int8}" --decoder-checkpoint-path "${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}" --decoder-config-name "${DECODER_CONFIG_NAME:-modded_dac_vq}" ${DEVICE_ARGS} ${COMPILE_ARGS}' \
+    'exec /app/venv/bin/python -m fish_speech_server.app --listen "${API_SERVER_NAME}:${API_SERVER_PORT}" --llama-checkpoint-path "${LLAMA_CHECKPOINT_PATH:-checkpoints/fs-1.2-int8-s2-pro-int8}" --decoder-checkpoint-path "${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}" --decoder-config-name "${DECODER_CONFIG_NAME:-modded_dac_vq}" ${DEVICE_ARGS} ${COMPILE_ARGS}' \
     > /app/start_server.sh && chmod +x /app/start_server.sh
 ENTRYPOINT ["/app/start_server.sh"]
 
-# Proxy
+# ---------- Proxy ----------
 FROM base AS proxy
 ARG PROXY_SERVER_NAME="0.0.0.0" PROXY_SERVER_PORT=9000
 EXPOSE ${PROXY_SERVER_PORT}
@@ -61,11 +65,11 @@ RUN printf '%s\n' \
     '#!/bin/bash' \
     'source /app/common.sh' \
     'log "Starting PCM Proxy..."' \
-    'exec python3 -m uvicorn fish_speech_server.proxy.pcm:app --host "${PROXY_SERVER_NAME}" --port "${PROXY_SERVER_PORT}"' \
+    'exec /app/venv/bin/python -m uvicorn fish_speech_server.proxy.pcm:app --host "${PROXY_SERVER_NAME}" --port "${PROXY_SERVER_PORT}"' \
     > /app/start_proxy.sh && chmod +x /app/start_proxy.sh
 ENTRYPOINT ["/app/start_proxy.sh"]
 
-# Web UI (Preact)
+# ---------- Web UI (Preact) ----------
 FROM base AS webui-preact
 ARG WEBUI_SERVER_NAME="0.0.0.0" WEBUI_SERVER_PORT=9001
 EXPOSE ${WEBUI_SERVER_PORT}
@@ -74,6 +78,6 @@ RUN printf '%s\n' \
     '#!/bin/bash' \
     'source /app/common.sh' \
     'log "Starting Web UI (Preact)..."' \
-    'exec python3 -m fish_speech_web_ui.server --host "${WEBUI_SERVER_NAME}" --port "${WEBUI_SERVER_PORT}"' \
+    'exec /app/venv/bin/python -m fish_speech_web_ui.server --host "${WEBUI_SERVER_NAME}" --port "${WEBUI_SERVER_PORT}"' \
     > /app/start_webui_preact.sh && chmod +x /app/start_webui_preact.sh
 ENTRYPOINT ["/app/start_webui_preact.sh"]

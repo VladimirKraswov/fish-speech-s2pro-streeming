@@ -15,9 +15,9 @@ pytest.importorskip("ormsgpack")
 
 def test_dump_memory_snapshot_no_cuda():
     """When CUDA is not available, _dump_memory_snapshot returns (None, error message)."""
-    from tools.server.views import _dump_memory_snapshot
+    from tools.tts_server.api.views import _dump_memory_snapshot
 
-    with mock.patch("tools.server.views.torch") as mtorch:
+    with mock.patch("tools.tts_server.api.views.torch") as mtorch:
         mtorch.cuda.is_available.return_value = False
         path, err = _dump_memory_snapshot(out_dir=tempfile.gettempdir())
     assert path is None
@@ -28,9 +28,9 @@ def test_dump_memory_snapshot_no_dump_fn():
     """When _dump_snapshot is missing, returns (None, error message)."""
     import torch
 
-    from tools.server.views import _dump_memory_snapshot
+    from tools.tts_server.api.views import _dump_memory_snapshot
 
-    with mock.patch("tools.server.views.torch") as mtorch:
+    with mock.patch("tools.tts_server.api.views.torch") as mtorch:
         mtorch.cuda.is_available.return_value = True
         mtorch.cuda.memory._dump_snapshot = None
         path, err = _dump_memory_snapshot(out_dir=tempfile.gettempdir())
@@ -42,9 +42,9 @@ def test_dump_memory_snapshot_dump_fails():
     """When _dump_snapshot raises, returns (None, error message)."""
     import torch
 
-    from tools.server.views import _dump_memory_snapshot
+    from tools.tts_server.api.views import _dump_memory_snapshot
 
-    with mock.patch("tools.server.views.torch") as mtorch:
+    with mock.patch("tools.tts_server.api.views.torch") as mtorch:
         mtorch.cuda.is_available.return_value = True
         mtorch.cuda.memory._dump_snapshot = mock.Mock(
             side_effect=RuntimeError("_cuda_memorySnapshot not found")

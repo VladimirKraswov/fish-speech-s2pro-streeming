@@ -16,7 +16,7 @@ from fish_speech.generation.decode import (
     _to_normal_tensor,
     decode_n_tokens,
 )
-from tools.server.adapter import (
+from tools.tts_server.services.adapter import (
     split_text_by_bytes,
     split_text_by_speaker,
 )

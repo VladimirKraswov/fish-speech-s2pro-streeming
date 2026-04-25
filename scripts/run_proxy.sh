@@ -80,11 +80,12 @@ if [[ -f "$PID_FILE" ]]; then
   rm -f "$PID_FILE"
 fi
 
+pkill -f 'uvicorn.*tools.tts_server.proxy.pcm:app' 2>/dev/null || true
 pkill -f 'uvicorn.*tools.proxy.fish_proxy_pcm:app' 2>/dev/null || true
 
 export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
 
-nohup "$PROXY_PYTHON" -m uvicorn tools.proxy.fish_proxy_pcm:app \
+nohup "$PROXY_PYTHON" -m uvicorn tools.tts_server.proxy.pcm:app \
   --host "$PROXY_HOST" \
   --port "$PROXY_PORT" \
   --log-level "$PROXY_LOG_LEVEL" \

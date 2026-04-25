@@ -538,7 +538,9 @@ class BaseTransformer(nn.Module):
         else:
             if "int8" in str(Path(path)):
                 logger.info("Using int8 weight-only quantization!")
-                from tools.llama.quantize import WeightOnlyInt8QuantHandler
+                from fish_speech.models.text2semantic.quantization import (
+                    WeightOnlyInt8QuantHandler,
+                )
 
                 simple_quantizer = WeightOnlyInt8QuantHandler(model)
                 model = simple_quantizer.convert_for_runtime()
@@ -548,7 +550,9 @@ class BaseTransformer(nn.Module):
                 path_comps = path.name.split("-")
                 assert path_comps[-2].startswith("g")
                 groupsize = int(path_comps[-2][1:])
-                from tools.llama.quantize import WeightOnlyInt4QuantHandler
+                from fish_speech.models.text2semantic.quantization import (
+                    WeightOnlyInt4QuantHandler,
+                )
 
                 simple_quantizer = WeightOnlyInt4QuantHandler(model, groupsize)
                 model = simple_quantizer.convert_for_runtime()

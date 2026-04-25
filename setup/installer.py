@@ -14,7 +14,7 @@ from rich.prompt import Prompt, Confirm
 from rich import print as rprint
 
 from .config import get_config_value
-from .docker_utils import build_images, up_detached, down, logs
+from .docker_utils import build_images, try_build_service, up_detached, down, logs
 from .model_manager import download_models_parallel
 from .health import wait_healthy
 from .ui_utils import ensure_package_lock
@@ -26,8 +26,10 @@ API_URL = f"http://127.0.0.1:{get_config_value('network.server.port', 8080)}/v1/
 WEBUI_URL = "http://127.0.0.1:9001/health"
 PROXY_URL = f"http://127.0.0.1:{get_config_value('network.proxy.port', 9000)}/health"
 
+
 def print_banner(text: str):
     console.print(Panel(text, style="bold magenta"))
+
 
 def check_prereqs():
     """Проверка Docker и nvidia-smi."""
@@ -45,14 +47,17 @@ def check_prereqs():
     except Exception:
         console.print("[yellow]⚠ nvidia-smi не найден (GPU может быть недоступен)[/]")
 
+
 def step(message: str):
     console.print(f"\n[bold cyan]▶ {message}[/]")
+
 
 @click.group(invoke_without_command=True)
 @click.pass_context
 def cli(ctx):
     if ctx.invoked_subcommand is None:
         show_menu()
+
 
 @cli.command()
 def install():
@@ -69,7 +74,16 @@ def install():
     download_models_parallel()
 
     step("4. Сборка Docker-образов")
-    build_images(no_cache=True)
+    # Обязательные сервисы
+    build_images(["server", "proxy"], no_cache=True)
+    console.print("[green]✓ Сервер и прокси собраны[/]")
+
+    # WebUI — опционально, не прерывает установку при ошибке
+    if try_build_service("webui", no_cache=True):
+        console.print("[green]✓ WebUI собран[/]")
+    else:
+        console.print("[yellow]⚠ Сборка WebUI не удалась (возможные проблемы с исходным кодом)[/]")
+        console.print("   Сервер и прокси будут работать. WebUI можно собрать позже.")
 
     step("5. Запуск сервисов")
     up_detached()
@@ -83,7 +97,8 @@ def install():
 
     console.print("\n[bold green]Установка завершена![/]")
     console.print(f"API: http://localhost:{get_config_value('network.server.port', 8080)}")
-    console.print(f"WebUI: http://localhost:9001")
+    console.print(f"WebUI: http://localhost:9001 (если был собран)")
+
 
 @cli.command()
 def run():
@@ -93,12 +108,14 @@ def run():
     wait_healthy(API_URL, timeout=60)
     console.print("[green]Сервисы запущены[/]")
 
+
 @cli.command()
 def restart():
     """Перезапуск."""
     print_banner("🔄 ПЕРЕЗАПУСК")
     down()
     run()
+
 
 @cli.command()
 def stop():
@@ -107,6 +124,7 @@ def stop():
     down()
     console.print("[green]Контейнеры остановлены[/]")
 
+
 @cli.command()
 def clear():
     """Полная очистка, кроме моделей и references."""
@@ -114,11 +132,11 @@ def clear():
     if not Confirm.ask("Удалить контейнеры, образы, кэш? Модели и references не пострадают", default=False):
         return
     down()
-    # Удаление образов
     import subprocess
     subprocess.run(["docker", "images", "-q", "fish-speech-*", "|", "xargs", "-r", "docker", "rmi", "-f"], shell=True)
     subprocess.run(["docker", "builder", "prune", "-a", "-f"])
     console.print("[green]Очистка завершена[/]")
+
 
 def show_menu():
     """Интерактивное меню с пунктами."""
@@ -133,7 +151,7 @@ def show_menu():
     table.add_row("0", "выход")
     console.print(table)
 
-    choice = Prompt.ask("Выберите действие", choices=["1","2","3","4","5","0"], default="0")
+    choice = Prompt.ask("Выберите действие", choices=["1", "2", "3", "4", "5", "0"], default="0")
     if choice == "1":
         install()
     elif choice == "2":
@@ -146,6 +164,7 @@ def show_menu():
         clear()
     else:
         sys.exit(0)
+
 
 if __name__ == "__main__":
     cli()

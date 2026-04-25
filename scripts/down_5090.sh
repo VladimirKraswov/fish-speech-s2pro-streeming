@@ -58,7 +58,7 @@ stop_from_pidfile() {
 }
 
 if [[ "$STOP_PROXY" == "1" ]]; then
-  stop_from_pidfile "$PROXY_PID_FILE" "proxy" 'tools.proxy.fish_proxy_pcm:app'
+  stop_from_pidfile "$PROXY_PID_FILE" "proxy" 'fish_speech_server.proxy.pcm:app'
 else
   echo "Skipping proxy stop"
 fi

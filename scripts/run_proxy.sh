@@ -7,7 +7,7 @@ cd "$REPO_ROOT"
 PROXY_PORT="${PROXY_PORT:-9000}"
 PROXY_HOST="${PROXY_HOST:-0.0.0.0}"
 PROXY_LOG_LEVEL="${PROXY_LOG_LEVEL:-info}"
-PROXY_APP="${PROXY_APP:-tools.proxy.fish_proxy_pcm:app}"
+PROXY_APP="${PROXY_APP:-fish_speech_server.proxy.pcm:app}"
 
 MODEL_PORT="${MODEL_PORT:-8080}"
 MODEL_BASE_URL="${MODEL_BASE_URL:-http://127.0.0.1:${MODEL_PORT}}"

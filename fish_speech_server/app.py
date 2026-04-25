@@ -11,7 +11,6 @@ warnings.filterwarnings(
     module="torch._inductor",
 )
 
-import pyrootutils
 import uvicorn
 from kui.asgi import (
     Depends,
@@ -28,12 +27,12 @@ from kui.security import bearer_auth
 from loguru import logger
 from typing_extensions import Annotated
 
-pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
-from tools.server.api_utils import MsgPackRequest, parse_args
-from tools.server.exception_handler import ExceptionHandler
-from tools.server.model_manager import ModelManager
-from tools.server.views import routes
+from fish_speech_server.api.utils import MsgPackRequest
+from fish_speech_server.config import parse_args
+from fish_speech_server.api.exception_handler import ExceptionHandler
+from fish_speech_server.services.model_manager import ModelManager
+from fish_speech_server.api.views import routes
 
 
 class API(ExceptionHandler):

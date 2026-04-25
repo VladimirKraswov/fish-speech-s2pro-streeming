@@ -37,18 +37,18 @@ from fish_speech.utils.schema import (
     ServeVQGANEncodeResponse,
     UpdateReferenceResponse,
 )
-from tools.server.api_utils import (
+from fish_speech_server.api.utils import (
     buffer_to_async_generator,
     format_response,
     get_content_type,
     inference_async,
 )
-from tools.server.inference import (
+from fish_speech_server.services.inference import (
     float_audio_to_pcm16_bytes,
     inference_wrapper as inference,
 )
-from tools.server.model_manager import ModelManager
-from tools.server.model_utils import (
+from fish_speech_server.services.model_manager import ModelManager
+from fish_speech_server.services.model_utils import (
     batch_vqgan_decode,
     cached_vqgan_batch_encode,
 )

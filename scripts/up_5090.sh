@@ -188,7 +188,7 @@ start_model() {
     -w /workspace
     --entrypoint /app/.venv/bin/python
     "$IMAGE"
-    /workspace/tools/api_server.py
+    -m fish_speech_server.app
     --listen 0.0.0.0:8080
     --device cuda
     --llama-checkpoint-path "/workspace/$CHECKPOINTS_DIR"

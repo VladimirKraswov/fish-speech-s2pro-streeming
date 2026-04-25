@@ -321,7 +321,7 @@ ls -la references/voice
 
 Если вы работаете **через proxy**, обычно достаточно `proxy.default_reference_id = "voice"` и `proxy.tts.reference_id = "voice"`.
 
-Если же вы хотите, чтобы **прямой вызов** `/v1/tts` тоже автоматически подставлял `voice`, можно добавить это в `tools/server/views.py` внутри функции `tts`:
+Если же вы хотите, чтобы **прямой вызов** `/v1/tts` тоже автоматически подставлял `voice`, можно добавить это в `fish_speech_server/api/views.py` внутри функции `tts`:
 
 ```python
 if req.reference_id is None:

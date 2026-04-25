@@ -129,6 +129,6 @@ dev = [
 ]
 
 [tool.setuptools]
-packages = ["fish_speech", "tools"]
+packages = ["fish_speech", "fish_speech_server", "tools"]
 
 [tool.setuptools_scm]

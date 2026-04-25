@@ -82,6 +82,14 @@ proxy_log_file() {
   echo "${PROXY_LOG_FILE:-$REPO_ROOT/logs/proxy.log}"
 }
 
+webui_pid_file() {
+  echo "$REPO_ROOT/run/webui.pid"
+}
+
+webui_log_file() {
+  echo "${WEBUI_LOG_FILE:-$REPO_ROOT/logs/webui.log}"
+}
+
 wait_http_ok() {
   local url="$1"
   local timeout="${2:-300}"

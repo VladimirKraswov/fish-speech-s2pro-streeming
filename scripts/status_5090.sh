@@ -11,6 +11,7 @@ CONTAINER="${CONTAINER:-fish-speech-5090}"
 SERVER_PORT="${SERVER_PORT:-$(runtime_get 'network.server.port')}"
 PROXY_PORT="${PROXY_PORT:-$(runtime_get 'network.proxy.port')}"
 PID_FILE="$(proxy_pid_file)"
+WEBUI_PID_FILE="$(webui_pid_file)"
 
 echo "=== Fish Speech status ==="
 echo "runtime:   $RUNTIME_CONFIG"
@@ -31,6 +32,11 @@ curl -sf "http://127.0.0.1:${PROXY_PORT}/health" || echo "proxy: unavailable"
 echo
 echo
 
+echo "[web ui health]"
+curl -sf "http://127.0.0.1:9001/health" || echo "web-ui: unavailable"
+echo
+echo
+
 echo "[proxy pid]"
 if [[ -f "$PID_FILE" ]]; then
   PID="$(cat "$PID_FILE" 2>/dev/null || true)"
@@ -41,6 +47,19 @@ if [[ -f "$PID_FILE" ]]; then
   fi
 else
   echo "proxy pid file not found"
+fi
+echo
+
+echo "[web ui pid]"
+if [[ -f "$WEBUI_PID_FILE" ]]; then
+  PID="$(cat "$WEBUI_PID_FILE" 2>/dev/null || true)"
+  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
+    echo "web ui pid: $PID (running)"
+  else
+    echo "web ui pid file exists, but process is not running"
+  fi
+else
+  echo "web ui pid file not found"
 fi
 echo
 

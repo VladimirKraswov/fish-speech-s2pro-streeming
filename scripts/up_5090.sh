@@ -15,6 +15,7 @@ IMAGE="${IMAGE:-fish-speech-server:cu129}"
 CONTAINER="${CONTAINER:-fish-speech-5090}"
 BUILD_IMAGE="${BUILD_IMAGE:-0}"
 START_PROXY="${START_PROXY:-1}"
+START_WEBUI="${START_WEBUI:-1}"
 EXTRA_WARMUP="${EXTRA_WARMUP:-1}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-1800}"
 
@@ -119,11 +120,19 @@ else
   echo "[5/5] Proxy start skipped"
 fi
 
+if [[ "$START_WEBUI" == "1" ]]; then
+  echo "Starting Web UI..."
+  bash "$REPO_ROOT/scripts/run_web_ui.sh"
+else
+  echo "Web UI start skipped"
+fi
+
 echo
 echo "=== READY ==="
 echo "Model health:       http://127.0.0.1:${SERVER_PORT}/v1/health"
 echo "Model memory:       http://127.0.0.1:${SERVER_PORT}/v1/debug/memory"
 echo "Proxy health:       http://127.0.0.1:${PROXY_PORT}/health"
 echo "Proxy open session: http://127.0.0.1:${PROXY_PORT}/session/open"
+echo "Web UI:             http://127.0.0.1:9001"
 echo "Logs:               bash scripts/logs_5090.sh"
 echo "Status:             bash scripts/status_5090.sh"

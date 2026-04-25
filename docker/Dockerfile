@@ -1,39 +1,22 @@
 # docker/Dockerfile
+# Исправленная версия: зависимости устанавливаются при сборке, а не при запуске.
 
-# IMPORTANT: The docker images do not contain the checkpoints. You need to mount the checkpoints to the container.
-
-# Build the image:
-#   docker build \
-#       --platform linux/amd64 \
-#       -f docker/Dockerfile \
-#       --build-arg BACKEND=[cuda, cpu] \
-#       --target [webui, server, proxy, webui-preact] \
-#       -t fish-speech-[webui, server, proxy, webui-preact]:[cuda, cpu] .
-
-# Select the specific cuda version (see https://hub.docker.com/r/nvidia/cuda/)
-ARG CUDA_VER=12.6.0
-# Adapt the uv extra to fit the cuda version (one of [cu126, cu128, cu129])
-ARG UV_EXTRA=cu126
+ARG CUDA_VER=12.9.0
+ARG UV_EXTRA=cu129
 ARG BACKEND=cuda
 
 ARG UBUNTU_VER=24.04
 ARG PY_VER=3.12
 ARG UV_VERSION=0.8.15
 
-# Create non-root user early for security
 ARG USERNAME=fish
 ARG USER_UID=1000
 ARG USER_GID=1000
 
-##############################################################
-# Base stage per backend
-##############################################################
-
-# --- CUDA (x86_64) ---
+# ---------- Базовый слой CUDA ----------
 FROM nvidia/cuda:${CUDA_VER}-cudnn-runtime-ubuntu${UBUNTU_VER} AS base-cuda
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install system dependencies in a single layer with cleanup
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     set -eux \
@@ -49,16 +32,12 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# --- CPU-only (portable x86_64) ---
+# ---------- Базовый слой CPU (не используется, но оставлен) ----------
 FROM python:${PY_VER}-slim AS base-cpu
 ENV UV_EXTRA=cpu
-
-# Install system dependencies in a single layer with cleanup
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     set -eux \
-    && rm -f /etc/apt/apt.conf.d/docker-clean \
-    && echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' >/etc/apt/apt.conf.d/keep-cache \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
         git \
@@ -67,18 +46,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-
-##############################################################
-# UV stage
-##############################################################
-
+# ---------- UV ----------
 ARG UV_VERSION
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv-bin
 
-##############################################################
-# Shared app base stage
-##############################################################
-
+# ---------- App base ----------
 FROM base-${BACKEND} AS app-base
 
 ARG PY_VER
@@ -94,7 +66,7 @@ ENV BACKEND=${BACKEND} \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# System dependencies for audio processing
+# Системные зависимости для аудио
 ARG DEPENDENCIES=" \
     libsox-dev \
     build-essential \
@@ -105,21 +77,18 @@ ARG DEPENDENCIES=" \
     libportaudiocpp0 \
     ffmpeg"
 
-# Install system dependencies with caching and cleanup
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     set -eux \
-    && rm -f /etc/apt/apt.conf.d/docker-clean \
-    && echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' >/etc/apt/apt.conf.d/keep-cache \
     && apt-get update \
     && apt-get install -y --no-install-recommends ${DEPENDENCIES} \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Install specific uv version
+# Установка uv
 COPY --from=uv-bin /uv /uvx /bin/
 
-# Create non-root user (or use existing user)
+# Создание непривилегированного пользователя
 RUN set -eux; \
     if getent group ${USER_GID} >/dev/null 2>&1; then \
         echo "Group ${USER_GID} already exists"; \
@@ -137,44 +106,36 @@ RUN set -eux; \
         chown -R ${USERNAME}:${USERNAME} /app /home/${USERNAME}/.cache; \
     fi
 
-# Create references directory with proper permissions for the non-root user
 RUN mkdir -p /app/references \
     && chown -R ${USER_UID}:${USER_GID} /app/references \
     && chmod 755 /app/references
 
-# Set working directory
 WORKDIR /app
 
-# Copy dependency files first for better caching
+# Копируем только файлы зависимостей для кеширования
 COPY --chown=${USER_UID}:${USER_GID} pyproject.toml uv.lock README.md ./
 
-# Switch to non-root user for package installation
-USER ${USER_UID}:${USER_GID}
+# Создаём и активируем venv, устанавливаем зависимости (один раз при сборке)
+RUN uv venv /app/.venv
+ENV VIRTUAL_ENV=/app/.venv
+ENV PATH="/app/.venv/bin:$PATH"
 
-# Install Python dependencies (cacheable by lockfiles)
-RUN --mount=type=cache,target=/tmp/uv-cache,uid=${USER_UID},gid=${USER_GID} \
-    uv python pin ${PY_VER} \
-    && uv sync --extra ${UV_EXTRA} --frozen --no-install-project
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --no-cache-dir -e . --extra ${UV_EXTRA}
 
-# Copy application code
+# Копируем остальной код (после установки зависимостей)
 COPY --chown=${USER_UID}:${USER_GID} . .
 
-# Install the local package after copying source code
-RUN uv sync --extra ${UV_EXTRA} --frozen
-
-# Create common entrypoint script
+# Общий вспомогательный скрипт (исправлен)
 RUN printf '%s\n' \
     '#!/bin/bash' \
     'set -euo pipefail' \
     '' \
-    '# Set user info from build args' \
     "USER_UID=${USER_UID}" \
     "USER_GID=${USER_GID}" \
     '' \
-    '# Logging function' \
     'log() { echo "[$(date +"%Y-%m-%d %H:%M:%S")] $*" >&2; }' \
     '' \
-    '# Validate environment' \
     'validate_env() {' \
     '    if [ ! -d "/app/checkpoints" ]; then' \
     '        log "WARNING: /app/checkpoints directory not found. Please mount your checkpoints."' \
@@ -189,14 +150,12 @@ RUN printf '%s\n' \
     '    fi' \
     '}' \
     '' \
-    '# Build device arguments' \
     'build_device_args() {' \
     '    if [ "${BACKEND:-}" = "cpu" ]; then' \
     '        echo "--device cpu"' \
     '    fi' \
     '}' \
     '' \
-    '# Build compile arguments' \
     'build_compile_args() {' \
     '    if [ "${1:-}" = "compile" ] || [ "${COMPILE:-}" = "1" ] || [ "${COMPILE:-}" = "true" ]; then' \
     '        echo "--compile"' \
@@ -206,34 +165,8 @@ RUN printf '%s\n' \
     '}' \
     > /app/common.sh && chmod +x /app/common.sh
 
-##############################################################
-# App stages
-##############################################################
-
-# Gradio WebUI
-FROM app-base AS webui
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-ARG GRADIO_SERVER_NAME="0.0.0.0"
-ARG GRADIO_SERVER_PORT=7860
-EXPOSE ${GRADIO_SERVER_PORT}
-ENV GRADIO_SERVER_NAME=${GRADIO_SERVER_NAME}
-ENV GRADIO_SERVER_PORT=${GRADIO_SERVER_PORT}
-
-RUN printf '%s\n' \
-    '#!/bin/bash' \
-    'source /app/common.sh' \
-    'log "Starting Gradio WebUI..."' \
-    'validate_env' \
-    'DEVICE_ARGS=$(build_device_args)' \
-    'COMPILE_ARGS=$(build_compile_args "$@")' \
-    'exec uv run tools/run_webui.py --llama-checkpoint-path "${LLAMA_CHECKPOINT_PATH:-checkpoints/fs-1.2-int8-s2-pro-int8}" --decoder-checkpoint-path "${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}" --decoder-config-name "${DECODER_CONFIG_NAME:-modded_dac_vq}" ${DEVICE_ARGS} ${COMPILE_ARGS}' \
-    > /app/start_webui.sh && chmod +x /app/start_webui.sh
-
-ENTRYPOINT ["/app/start_webui.sh"]
-
-# API Server
+# ---------- API сервер ----------
 FROM app-base AS server
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 ARG API_SERVER_NAME="0.0.0.0"
 ARG API_SERVER_PORT=8080
 EXPOSE ${API_SERVER_PORT}
@@ -247,14 +180,12 @@ RUN printf '%s\n' \
     'validate_env' \
     'DEVICE_ARGS=$(build_device_args)' \
     'COMPILE_ARGS=$(build_compile_args "$@")' \
-    'exec uv run python -m fish_speech_server.app --listen "${API_SERVER_NAME}:${API_SERVER_PORT}" --llama-checkpoint-path "${LLAMA_CHECKPOINT_PATH:-checkpoints/fs-1.2-int8-s2-pro-int8}" --decoder-checkpoint-path "${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}" --decoder-config-name "${DECODER_CONFIG_NAME:-modded_dac_vq}" ${DEVICE_ARGS} ${COMPILE_ARGS}' \
+    'exec /app/.venv/bin/python -m fish_speech_server.app --listen "${API_SERVER_NAME}:${API_SERVER_PORT}" --llama-checkpoint-path "${LLAMA_CHECKPOINT_PATH:-checkpoints/fs-1.2-int8-s2-pro-int8}" --decoder-checkpoint-path "${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}" --decoder-config-name "${DECODER_CONFIG_NAME:-modded_dac_vq}" ${DEVICE_ARGS} ${COMPILE_ARGS}' \
     > /app/start_server.sh && chmod +x /app/start_server.sh
-
 ENTRYPOINT ["/app/start_server.sh"]
 
-# Proxy Server
+# ---------- Proxy ----------
 FROM app-base AS proxy
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 ARG PROXY_SERVER_NAME="0.0.0.0"
 ARG PROXY_SERVER_PORT=9000
 EXPOSE ${PROXY_SERVER_PORT}
@@ -265,14 +196,12 @@ RUN printf '%s\n' \
     '#!/bin/bash' \
     'source /app/common.sh' \
     'log "Starting PCM Proxy..."' \
-    'exec uv run python -m uvicorn fish_speech_server.proxy.pcm:app --host "${PROXY_SERVER_NAME}" --port "${PROXY_SERVER_PORT}"' \
+    'exec /app/.venv/bin/python -m uvicorn fish_speech_server.proxy.pcm:app --host "${PROXY_SERVER_NAME}" --port "${PROXY_SERVER_PORT}"' \
     > /app/start_proxy.sh && chmod +x /app/start_proxy.sh
-
 ENTRYPOINT ["/app/start_proxy.sh"]
 
-# Preact Web UI
+# ---------- Preact Web UI ----------
 FROM app-base AS webui-preact
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 ARG WEBUI_SERVER_NAME="0.0.0.0"
 ARG WEBUI_SERVER_PORT=9001
 EXPOSE ${WEBUI_SERVER_PORT}
@@ -283,15 +212,33 @@ RUN printf '%s\n' \
     '#!/bin/bash' \
     'source /app/common.sh' \
     'log "Starting Web UI (Preact)..."' \
-    'exec uv run python -m fish_speech_web_ui.server --host "${WEBUI_SERVER_NAME}" --port "${WEBUI_SERVER_PORT}"' \
+    'exec /app/.venv/bin/python -m fish_speech_web_ui.server --host "${WEBUI_SERVER_NAME}" --port "${WEBUI_SERVER_PORT}"' \
     > /app/start_webui_preact.sh && chmod +x /app/start_webui_preact.sh
-
 ENTRYPOINT ["/app/start_webui_preact.sh"]
 
-# Development stage
+# ---------- Gradio WebUI (опционально) ----------
+FROM app-base AS webui
+ARG GRADIO_SERVER_NAME="0.0.0.0"
+ARG GRADIO_SERVER_PORT=7860
+EXPOSE ${GRADIO_SERVER_PORT}
+ENV GRADIO_SERVER_NAME=${GRADIO_SERVER_NAME}
+ENV GRADIO_SERVER_PORT=${GRADIO_SERVER_PORT}
+
+RUN printf '%s\n' \
+    '#!/bin/bash' \
+    'source /app/common.sh' \
+    'log "Starting Gradio WebUI..."' \
+    'validate_env' \
+    'DEVICE_ARGS=$(build_device_args)' \
+    'COMPILE_ARGS=$(build_compile_args "$@")' \
+    'exec /app/.venv/bin/python tools/run_webui.py --llama-checkpoint-path "${LLAMA_CHECKPOINT_PATH:-checkpoints/fs-1.2-int8-s2-pro-int8}" --decoder-checkpoint-path "${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}" --decoder-config-name "${DECODER_CONFIG_NAME:-modded_dac_vq}" ${DEVICE_ARGS} ${COMPILE_ARGS}' \
+    > /app/start_webui.sh && chmod +x /app/start_webui.sh
+ENTRYPOINT ["/app/start_webui.sh"]
+
+# ---------- Разработка ----------
 FROM app-base AS dev
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends vim htop strace gdb && apt-get clean && rm -rf /var/lib/apt/lists/*
 USER ${USER_UID}:${USER_GID}
-RUN uv sync --extra ${UV_EXTRA} --dev
+RUN /app/.venv/bin/pip install --no-cache-dir .[dev]
 ENTRYPOINT ["/bin/bash"]

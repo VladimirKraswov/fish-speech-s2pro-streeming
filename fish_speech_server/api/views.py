@@ -57,8 +57,15 @@ MAX_NUM_SAMPLES = int(os.getenv("NUM_SAMPLES", 1))
 routes = Routes()
 
 
+# =============================================================================
+# Endpoint: Health check (проверка работоспособности)
+# =============================================================================
 @routes.http("/v1/health")
 class Health(HttpView):
+    """GET/POST /v1/health — проверка, что сервер жив и модель загружена.
+    Используется Docker healthcheck и мониторингом.
+    """
+
     @classmethod
     async def get(cls):
         return JSONResponse({"status": "ok"})
@@ -68,15 +75,20 @@ class Health(HttpView):
         return JSONResponse({"status": "ok"})
 
 
+# =============================================================================
+# Вспомогательные функции для получения информации о памяти GPU
+# =============================================================================
 def _model_param_memory_gb(module: torch.nn.Module) -> tuple[float, int]:
-    """Weights-only memory (GB) and param count for a module."""
+    """Возвращает память (ГБ), занимаемую только весами модели, и количество параметров."""
     total_bytes = sum(p.numel() * p.element_size() for p in module.parameters())
     count = sum(p.numel() for p in module.parameters())
     return (round(total_bytes / (1024**3), 3), count)
 
 
 def _gpu_memory_info(model_manager: ModelManager | None = None):
-    """Current GPU memory usage (read-only, safe to call anytime)."""
+    """Собирает текущую информацию об использовании видеопамяти CUDA.
+    Возвращает словарь с allocated, reserved, max, а также информацию о моделях (DAC, LLaMA).
+    """
     if not torch.cuda.is_available():
         return {"cuda_available": False}
     gb = 1024**3
@@ -127,7 +139,7 @@ def _gpu_memory_info(model_manager: ModelManager | None = None):
 
 
 def _gpu_memory_text(info: dict) -> str:
-    """Format GPU memory info as plain text (readable table)."""
+    """Форматирует информацию о памяти GPU в читаемый текст (таблица)."""
     if not info.get("cuda_available"):
         return "CUDA not available.\n"
     lines = [
@@ -158,7 +170,7 @@ def _gpu_memory_text(info: dict) -> str:
 
 
 def _dump_memory_snapshot(out_dir: str = "/workspace") -> tuple[str | None, str | None]:
-    """Dump current CUDA memory snapshot to a pickle file. Returns (path, None) or (None, error_message)."""
+    """Сохраняет снапшот памяти CUDA в pickle-файл для последующего анализа (memory viz)."""
     if not torch.cuda.is_available():
         return None, "CUDA not available"
     dump_fn = getattr(torch.cuda.memory, "_dump_snapshot", None)
@@ -176,13 +188,16 @@ def _dump_memory_snapshot(out_dir: str = "/workspace") -> tuple[str | None, str 
         )
 
 
+# =============================================================================
+# Endpoint: Отладка памяти GPU
+# =============================================================================
 @routes.http.get("/v1/debug/memory")
 async def debug_memory():
     """
-    Return current GPU memory usage (allocated, reserved, max).
-    If model_manager is available, includes models.dac and models.llama param memory (weights only).
-    Query: ?format=text for plain text (table aligned), default JSON.
-    Query: ?dump=1 to also write torch.cuda.memory._dump_snapshot() to /workspace (requires FISH_RECORD_MEMORY_HISTORY=1 at startup).
+    GET /v1/debug/memory — возвращает текущее использование видеопамяти.
+    Параметры:
+        ?format=text  -> текстовый формат (таблица)
+        ?dump=1       -> дополнительно создать .pickle снапшот (требуется FISH_RECORD_MEMORY_HISTORY=1)
     """
     model_manager = getattr(request.app.state, "model_manager", None)
     info = _gpu_memory_info(model_manager)
@@ -204,24 +219,25 @@ async def debug_memory():
     return JSONResponse(info)
 
 
+# =============================================================================
+# Endpoint: VQGAN кодирование аудио в токены
+# =============================================================================
 @routes.http.post("/v1/vqgan/encode")
 async def vqgan_encode(req: Annotated[ServeVQGANEncodeRequest, Body(exclusive=True)]):
     """
-    Encode audio using VQGAN model.
+    POST /v1/vqgan/encode — кодирует аудио в дискретные коды (токены) с помощью VQGAN (DAC).
+    Используется для предвычисления референсов.
     """
     try:
-        # Get the model from the app
         model_manager: ModelManager = request.app.state.model_manager
         decoder_model = model_manager.decoder_model
 
-        # Encode the audio
         start_time = time.time()
         tokens = cached_vqgan_batch_encode(decoder_model, req.audios)
         logger.info(
             f"[EXEC] VQGAN encode time: {(time.time() - start_time) * 1000:.2f}ms"
         )
 
-        # Return the response
         return ormsgpack.packb(
             ServeVQGANEncodeResponse(tokens=[i.tolist() for i in tokens]),
             option=ormsgpack.OPT_SERIALIZE_PYDANTIC,
@@ -233,17 +249,18 @@ async def vqgan_encode(req: Annotated[ServeVQGANEncodeRequest, Body(exclusive=Tr
         )
 
 
+# =============================================================================
+# Endpoint: VQGAN декодирование токенов в аудио
+# =============================================================================
 @routes.http.post("/v1/vqgan/decode")
 async def vqgan_decode(req: Annotated[ServeVQGANDecodeRequest, Body(exclusive=True)]):
     """
-    Decode tokens to audio using VQGAN model.
+    POST /v1/vqgan/decode — декодирует токены обратно в аудио (PCM).
     """
     try:
-        # Get the model from the app
         model_manager: ModelManager = request.app.state.model_manager
         decoder_model = model_manager.decoder_model
 
-        # Decode the audio
         tokens = [torch.tensor(token, dtype=torch.int) for token in req.tokens]
         start_time = time.time()
         audios = batch_vqgan_decode(decoder_model, tokens)
@@ -252,7 +269,6 @@ async def vqgan_decode(req: Annotated[ServeVQGANDecodeRequest, Body(exclusive=Tr
         )
         audios = [audio.astype(np.float16).tobytes() for audio in audios]
 
-        # Return the response
         return ormsgpack.packb(
             ServeVQGANDecodeResponse(audios=audios),
             option=ormsgpack.OPT_SERIALIZE_PYDANTIC,
@@ -264,13 +280,19 @@ async def vqgan_decode(req: Annotated[ServeVQGANDecodeRequest, Body(exclusive=Tr
         )
 
 
+# =============================================================================
+# Основной эндпоинт: синтез речи (Text‑to‑Speech)
+# =============================================================================
 @routes.http.post("/v1/tts")
 async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
     """
-    Generate speech from text using TTS model.
+    POST /v1/tts — синтезирует речь из текста.
+    Поддерживает:
+        - Потоковый режим (streaming=True) -> отдаёт WAV чанками.
+        - Пакетный режим -> возвращает полный аудиофайл.
+    Обязательно указать reference_id или загруженные references.
     """
     try:
-        # Get the model from the app
         app_state = request.app.state
         model_manager: ModelManager = app_state.model_manager
         driver = model_manager.driver
@@ -283,21 +305,18 @@ async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
 
         sample_rate = driver.sample_rate
 
-        # Check if the text is too long
         if app_state.max_text_length > 0 and len(req.text) > app_state.max_text_length:
             raise HTTPException(
                 HTTPStatus.BAD_REQUEST,
                 content=f"Text is too long, max length is {app_state.max_text_length}",
             )
 
-        # Check if streaming is enabled
         if req.streaming and req.format != "wav":
             raise HTTPException(
                 HTTPStatus.BAD_REQUEST,
                 content="Streaming only supports WAV format",
             )
 
-        # Perform TTS
         if req.streaming:
             return StreamResponse(
                 iterable=inference_async(req, driver),
@@ -335,7 +354,6 @@ async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
                 content_type=get_content_type(req.format),
             )
     except HTTPException:
-        # Re-raise HTTP exceptions as they are already properly formatted
         raise
     except Exception as e:
         logger.error(f"Error in TTS generation: {e}", exc_info=True)
@@ -344,39 +362,42 @@ async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
         )
 
 
+# =============================================================================
+# Управление референсными голосами (Reference Voices)
+# =============================================================================
+
+# 1. Добавление нового референса (загружается аудиофайл и текст)
 @routes.http.post("/v1/references/add")
 async def add_reference(
     id: str = Body(...), audio: UploadFile = Body(...), text: str = Body(...)
 ):
     """
-    Add a new reference voice with audio file and text.
+    POST /v1/references/add — добавляет новый референсный голос.
+    Параметры:
+        id: уникальное имя референса (латиница, цифры, -, _, пробел)
+        audio: WAV‑файл
+        text: транскрипция (текст, произнесённый в аудио)
     """
     temp_file_path = None
 
     try:
-        # Validate input parameters
         if not id or not id.strip():
             raise ValueError("Reference ID cannot be empty")
-
         if not text or not text.strip():
             raise ValueError("Reference text cannot be empty")
 
-        # Get the model manager to access the reference loader
         app_state = request.app.state
         model_manager: ModelManager = app_state.model_manager
         driver = model_manager.driver
 
-        # Read the uploaded audio file
         audio_content = audio.read()
         if not audio_content:
             raise ValueError("Audio file is empty or could not be read")
 
-        # Create a temporary file for the audio data
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
             temp_file.write(audio_content)
             temp_file_path = temp_file.name
 
-        # Add the reference through the driver reference store.
         driver.add_reference(id, temp_file_path, text)
 
         response = AddReferenceResponse(
@@ -393,7 +414,7 @@ async def add_reference(
             message=f"Reference ID '{id}' already exists",
             reference_id=id,
         )
-        return format_response(response, status_code=409)  # Conflict
+        return format_response(response, status_code=409)
 
     except ValueError as e:
         logger.warning(f"Invalid input for reference '{id}': {e}")
@@ -415,7 +436,6 @@ async def add_reference(
         return format_response(response, status_code=500)
 
     finally:
-        # Clean up temporary file
         if temp_file_path and os.path.exists(temp_file_path):
             try:
                 os.unlink(temp_file_path)
@@ -425,6 +445,7 @@ async def add_reference(
                 )
 
 
+# 2. Добавление предварительно закодированного референса (минуя кодирование на сервере)
 @routes.http.post("/v1/references/add_encoded")
 async def add_reference_encoded(
     id: str = Body(...),
@@ -433,8 +454,8 @@ async def add_reference_encoded(
     stem: str | None = Body(None),
 ):
     """
-    Add or update a pre-encoded reference (.codes.pt + .lab). Skips write if content hash matches.
-    Optional stem: file names under references/<id>/ (default id). Use for multi-stem references.
+    POST /v1/references/add_encoded — добавляет или обновляет референс, уже закодированный в .codes.pt и .lab.
+    Позволяет избежать повторного кодирования аудио на сервере.
     """
     try:
         if not id or not id.strip():
@@ -483,18 +504,17 @@ async def add_reference_encoded(
         )
 
 
+# 3. Получение списка всех доступных референсов
 @routes.http.get("/v1/references/list")
 async def list_references():
     """
-    Get a list of all available reference voice IDs.
+    GET /v1/references/list — возвращает массив имён (ID) всех загруженных референсных голосов.
     """
     try:
-        # Get the model manager to access the driver reference store.
         app_state = request.app.state
         model_manager: ModelManager = app_state.model_manager
         driver = model_manager.driver
 
-        # Get the list of reference IDs
         reference_ids = driver.list_reference_ids()
 
         response = ListReferencesResponse(
@@ -512,22 +532,21 @@ async def list_references():
         return format_response(response, status_code=500)
 
 
+# 4. Удаление референса по ID
 @routes.http.delete("/v1/references/delete")
 async def delete_reference(reference_id: str = Body(...)):
     """
-    Delete a reference voice by ID.
+    DELETE /v1/references/delete — удаляет референсный голос и все его файлы.
+    Тело запроса: { "reference_id": "имя" }
     """
     try:
-        # Validate input parameters
         if not reference_id or not reference_id.strip():
             raise ValueError("Reference ID cannot be empty")
 
-        # Get the model manager to access the reference loader
         app_state = request.app.state
         model_manager: ModelManager = app_state.model_manager
         driver = model_manager.driver
 
-        # Delete the reference through the driver reference store.
         driver.delete_reference(reference_id)
 
         response = DeleteReferenceResponse(
@@ -544,7 +563,7 @@ async def delete_reference(reference_id: str = Body(...)):
             message=f"Reference ID '{reference_id}' not found",
             reference_id=reference_id,
         )
-        return format_response(response, status_code=404)  # Not Found
+        return format_response(response, status_code=404)
 
     except ValueError as e:
         logger.warning(f"Invalid input for reference '{reference_id}': {e}")
@@ -574,15 +593,16 @@ async def delete_reference(reference_id: str = Body(...)):
         return format_response(response, status_code=500)
 
 
+# 5. Переименование референса (старый ID -> новый ID)
 @routes.http.post("/v1/references/update")
 async def update_reference(
     old_reference_id: str = Body(...), new_reference_id: str = Body(...)
 ):
     """
-    Rename a reference voice directory from old_reference_id to new_reference_id.
+    POST /v1/references/update — переименовывает референсный голос.
+    Тело: { "old_reference_id": "старое_имя", "new_reference_id": "новое_имя" }
     """
     try:
-        # Validate input parameters
         if not old_reference_id or not old_reference_id.strip():
             raise ValueError("Old reference ID cannot be empty")
         if not new_reference_id or not new_reference_id.strip():
@@ -590,14 +610,12 @@ async def update_reference(
         if old_reference_id == new_reference_id:
             raise ValueError("New reference ID must be different from old reference ID")
 
-        # Validate ID format per ReferenceLoader rules
         id_pattern = r"^[a-zA-Z0-9\-_ ]+$"
         if not re.match(id_pattern, new_reference_id) or len(new_reference_id) > 255:
             raise ValueError(
                 "New reference ID contains invalid characters or is too long"
             )
 
-        # Access the driver reference store and update caches after renaming.
         app_state = request.app.state
         model_manager: ModelManager = app_state.model_manager
         driver = model_manager.driver
@@ -606,11 +624,9 @@ async def update_reference(
         old_dir = refs_base / old_reference_id
         new_dir = refs_base / new_reference_id
 
-        # Existence checks
         if not old_dir.exists() or not old_dir.is_dir():
             raise FileNotFoundError(f"Reference ID '{old_reference_id}' not found")
         if new_dir.exists():
-            # Conflict: destination already exists
             response = UpdateReferenceResponse(
                 success=False,
                 message=f"Reference ID '{new_reference_id}' already exists",
@@ -619,7 +635,6 @@ async def update_reference(
             )
             return format_response(response, status_code=409)
 
-        # Perform rename
         driver.rename_reference(old_reference_id, new_reference_id)
 
         response = UpdateReferenceResponse(

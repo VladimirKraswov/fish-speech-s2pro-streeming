@@ -2,17 +2,7 @@
 
 # IMPORTANT: The docker images do not contain the checkpoints. You need to mount the checkpoints to the container.
 
-# Build the image:
-#   docker build \
-#       --platform linux/amd64 \
-#       -f docker/Dockerfile \
-#       --build-arg BACKEND=[cuda, cpu] \
-#       --target [webui, server, proxy, webui-preact] \
-#       -t fish-speech-[webui, server, proxy, webui-preact]:[cuda, cpu] .
-
-# Select the specific cuda version (see https://hub.docker.com/r/nvidia/cuda/)
 ARG CUDA_VER=12.6.0
-# Adapt the uv extra to fit the cuda version (one of [cu126, cu128, cu129])
 ARG UV_EXTRA=cu126
 ARG BACKEND=cuda
 
@@ -162,47 +152,36 @@ COPY --chown=${USER_UID}:${USER_GID} . .
 # Install the local package after copying source code
 RUN uv sync --extra ${UV_EXTRA} --frozen
 
-# Create common entrypoint script
+# Create common entrypoint helper
 RUN printf '%s\n' \
     '#!/bin/bash' \
     'set -euo pipefail' \
-    '' \
-    '# Set user info from build args' \
     'USER_UID='${USER_UID} \
     'USER_GID='${USER_GID} \
-    '' \
-    '# Logging function' \
-    'log() { echo "[$(date +"%Y-%m-%d %H:%M:%S")] \$*" >&2; }' \
-    '' \
-    '# Validate environment' \
+    'log() { echo "[$(date +"%Y-%m-%d %H:%M:%S")] $*" >&2; }' \
     'validate_env() {' \
     '    if [ ! -d "/app/checkpoints" ]; then' \
-    '        log "WARNING: /app/checkpoints directory not found. Please mount your checkpoints."' \
+    '        log "WARNING: /app/checkpoints directory not found."' \
     '    fi' \
     '    if [ ! -d "/app/references" ]; then' \
-    '        log "WARNING: /app/references directory not found. Please mount your references."' \
+    '        log "WARNING: /app/references directory not found."' \
     '    else' \
     '        if [ ! -w "/app/references" ]; then' \
-    '            log "ERROR: Cannot write to /app/references directory. Please ensure UID \${USER_UID} has permissions."' \
+    '            log "ERROR: Cannot write to /app/references directory. Please ensure UID ${USER_UID} has permissions."' \
     '            exit 1' \
     '        fi' \
     '    fi' \
     '}' \
-    '' \
-    '# Build device arguments' \
     'build_device_args() {' \
-    '    if [ "\${BACKEND:-}" = "cpu" ]; then' \
-    '        echo "--device cpu"' \
-    '    fi' \
+    '    if [ "${BACKEND:-}" = "cpu" ]; then echo "--device cpu"; fi' \
     '}' \
-    '' \
-    '# Build compile arguments' \
     'build_compile_args() {' \
-    '    if [ "\${1:-}" = "compile" ] || [ "\${COMPILE:-}" = "1" ] || [ "\${COMPILE:-}" = "true" ]; then' \
-    '        echo "--compile"' \
-    '        shift' \
+    '    if [ "${1:-}" = "compile" ] || [ "${COMPILE:-}" = "0" ] || [ "${COMPILE:-}" = "false" ]; then' \
+    '        if [ "${COMPILE:-}" = "1" ] || [ "${COMPILE:-}" = "true" ]; then echo "--compile"; fi' \
     '    fi' \
-    '    echo "\$@"' \
+    '    # This is a bit complex for a one-liner, just return the rest of args' \
+    '    shift || true' \
+    '    echo "$@"' \
     '}' \
     > /app/common.sh && chmod +x /app/common.sh
 
@@ -210,44 +189,24 @@ RUN printf '%s\n' \
 # App stages
 ##############################################################
 
-# Gradio WebUI
-FROM app-base AS webui
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-ARG GRADIO_SERVER_NAME="0.0.0.0"
-ARG GRADIO_SERVER_PORT=7860
-EXPOSE ${GRADIO_SERVER_PORT}
-ENV GRADIO_SERVER_NAME=${GRADIO_SERVER_NAME}
-ENV GRADIO_SERVER_PORT=${GRADIO_SERVER_PORT}
-
-RUN printf '%s\n' \
-    '#!/bin/bash' \
-    'source /app/common.sh' \
-    'log "Starting Gradio WebUI..."' \
-    'validate_env' \
-    'DEVICE_ARGS=\$(build_device_args)' \
-    'COMPILE_ARGS=\$(build_compile_args "\$@")' \
-    'exec uv run tools/run_webui.py --llama-checkpoint-path "\${LLAMA_CHECKPOINT_PATH:-checkpoints/fs-1.2-int8-s2-pro-int8}" --decoder-checkpoint-path "\${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}" --decoder-config-name "\${DECODER_CONFIG_NAME:-modded_dac_vq}" \${DEVICE_ARGS} \${COMPILE_ARGS}' \
-    > /app/start_webui.sh && chmod +x /app/start_webui.sh
-
-ENTRYPOINT ["/app/start_webui.sh"]
-
 # API Server
 FROM app-base AS server
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-ARG API_SERVER_NAME="0.0.0.0"
-ARG API_SERVER_PORT=8080
-EXPOSE ${API_SERVER_PORT}
-ENV API_SERVER_NAME=${API_SERVER_NAME}
-ENV API_SERVER_PORT=${API_SERVER_PORT}
+ENV API_SERVER_NAME="0.0.0.0"
+ENV API_SERVER_PORT=8080
+ENV LLAMA_CHECKPOINT_PATH="checkpoints/fs-1.2-int8-s2-pro-int8"
+ENV DECODER_CHECKPOINT_PATH="checkpoints/s2-pro/codec.pth"
+ENV DECODER_CONFIG_NAME="modded_dac_vq"
+EXPOSE 8080
 
 RUN printf '%s\n' \
     '#!/bin/bash' \
     'source /app/common.sh' \
-    'log "Starting API Server..."' \
+    'log "Starting API Server on ${API_SERVER_NAME}:${API_SERVER_PORT}..."' \
     'validate_env' \
-    'DEVICE_ARGS=\$(build_device_args)' \
-    'COMPILE_ARGS=\$(build_compile_args "\$@")' \
-    'exec uv run python -m fish_speech_server.app --listen "\${API_SERVER_NAME}:\${API_SERVER_PORT}" --llama-checkpoint-path "\${LLAMA_CHECKPOINT_PATH:-checkpoints/fs-1.2-int8-s2-pro-int8}" --decoder-checkpoint-path "\${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}" --decoder-config-name "\${DECODER_CONFIG_NAME:-modded_dac_vq}" \${DEVICE_ARGS} \${COMPILE_ARGS}' \
+    'COMPILE_ARG=""' \
+    'if [ "${COMPILE:-0}" = "1" ] || [ "${COMPILE:-0}" = "true" ]; then COMPILE_ARG="--compile"; fi' \
+    'exec uv run python -m fish_speech_server.app --listen "${API_SERVER_NAME}:${API_SERVER_PORT}" --llama-checkpoint-path "${LLAMA_CHECKPOINT_PATH}" --decoder-checkpoint-path "${DECODER_CHECKPOINT_PATH}" --decoder-config-name "${DECODER_CONFIG_NAME}" $(build_device_args) ${COMPILE_ARG} "$@"' \
     > /app/start_server.sh && chmod +x /app/start_server.sh
 
 ENTRYPOINT ["/app/start_server.sh"]
@@ -255,17 +214,15 @@ ENTRYPOINT ["/app/start_server.sh"]
 # Proxy Server
 FROM app-base AS proxy
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-ARG PROXY_SERVER_NAME="0.0.0.0"
-ARG PROXY_SERVER_PORT=9000
-EXPOSE ${PROXY_SERVER_PORT}
-ENV PROXY_SERVER_NAME=${PROXY_SERVER_NAME}
-ENV PROXY_SERVER_PORT=${PROXY_SERVER_PORT}
+ENV PROXY_SERVER_NAME="0.0.0.0"
+ENV PROXY_SERVER_PORT=9000
+EXPOSE 9000
 
 RUN printf '%s\n' \
     '#!/bin/bash' \
     'source /app/common.sh' \
-    'log "Starting PCM Proxy..."' \
-    'exec uv run python -m uvicorn fish_speech_server.proxy.pcm:app --host "\${PROXY_SERVER_NAME}" --port "\${PROXY_SERVER_PORT}"' \
+    'log "Starting PCM Proxy on ${PROXY_SERVER_NAME}:${PROXY_SERVER_PORT}..."' \
+    'exec uv run python -m uvicorn fish_speech_server.proxy.pcm:app --host "${PROXY_SERVER_NAME}" --port "${PROXY_SERVER_PORT}" "$@"' \
     > /app/start_proxy.sh && chmod +x /app/start_proxy.sh
 
 ENTRYPOINT ["/app/start_proxy.sh"]
@@ -273,20 +230,37 @@ ENTRYPOINT ["/app/start_proxy.sh"]
 # Preact Web UI
 FROM app-base AS webui-preact
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-ARG WEBUI_SERVER_NAME="0.0.0.0"
-ARG WEBUI_SERVER_PORT=9001
-EXPOSE ${WEBUI_SERVER_PORT}
-ENV WEBUI_SERVER_NAME=${WEBUI_SERVER_NAME}
-ENV WEBUI_SERVER_PORT=${WEBUI_SERVER_PORT}
+ENV WEBUI_SERVER_NAME="0.0.0.0"
+ENV WEBUI_SERVER_PORT=9001
+EXPOSE 9001
 
 RUN printf '%s\n' \
     '#!/bin/bash' \
     'source /app/common.sh' \
-    'log "Starting Web UI (Preact)..."' \
-    'exec uv run python -m fish_speech_web_ui.server --host "\${WEBUI_SERVER_NAME}" --port "\${WEBUI_SERVER_PORT}"' \
+    'log "Starting Web UI (Preact) on ${WEBUI_SERVER_NAME}:${WEBUI_SERVER_PORT}..."' \
+    'exec uv run python -m fish_speech_web_ui.server --host "${WEBUI_SERVER_NAME}" --port "${WEBUI_SERVER_PORT}" "$@"' \
     > /app/start_webui_preact.sh && chmod +x /app/start_webui_preact.sh
 
 ENTRYPOINT ["/app/start_webui_preact.sh"]
+
+# Gradio WebUI (Legacy)
+FROM app-base AS webui
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+ENV GRADIO_SERVER_NAME="0.0.0.0"
+ENV GRADIO_SERVER_PORT=7860
+EXPOSE 7860
+
+RUN printf '%s\n' \
+    '#!/bin/bash' \
+    'source /app/common.sh' \
+    'log "Starting Gradio WebUI..."' \
+    'validate_env' \
+    'COMPILE_ARG=""' \
+    'if [ "${COMPILE:-0}" = "1" ] || [ "${COMPILE:-0}" = "true" ]; then COMPILE_ARG="--compile"; fi' \
+    'exec uv run tools/run_webui.py --llama-checkpoint-path "${LLAMA_CHECKPOINT_PATH:-checkpoints/fs-1.2-int8-s2-pro-int8}" --decoder-checkpoint-path "${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}" --decoder-config-name "${DECODER_CONFIG_NAME:-modded_dac_vq}" $(build_device_args) ${COMPILE_ARG} "$@"' \
+    > /app/start_webui.sh && chmod +x /app/start_webui.sh
+
+ENTRYPOINT ["/app/start_webui.sh"]
 
 # Development stage
 FROM app-base AS dev

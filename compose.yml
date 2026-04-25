@@ -2,18 +2,6 @@
 name: fish-speech
 
 services:
-  webui:
-    extends:
-      file: compose.base.yml
-      service: app-base
-    build:
-      target: webui
-    environment:
-      COMPILE: ${COMPILE:-0}
-    profiles: ["webui"]
-    ports:
-      - "${GRADIO_PORT:-7860}:7860"
-
   server:
     extends:
       file: compose.base.yml
@@ -27,9 +15,10 @@ services:
       - "${API_PORT:-8080}:8080"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/v1/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      interval: 15s
+      timeout: 10s
+      retries: 20  # Give model plenty of time to load (300s total)
+      start_period: 30s
 
   proxy:
     extends:
@@ -45,6 +34,11 @@ services:
     profiles: ["proxy", "full-stack"]
     ports:
       - "${PROXY_PORT:-9000}:9000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   web-ui:
     extends:
@@ -54,7 +48,12 @@ services:
       target: webui-preact
     depends_on:
       proxy:
-        condition: service_started
+        condition: service_healthy
     profiles: ["web-ui", "full-stack"]
     ports:
       - "${WEBUI_PORT:-9001}:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3

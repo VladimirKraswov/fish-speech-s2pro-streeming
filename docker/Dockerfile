@@ -1,5 +1,6 @@
 # docker/Dockerfile
-# Исправленная версия: зависимости устанавливаются при сборке через uv sync
+# Исправленная версия: зависимости устанавливаются при сборке через uv sync,
+# а entrypoint использует прямое выполнение из .venv
 
 ARG CUDA_VER=12.9.0
 ARG UV_EXTRA=cu129
@@ -32,7 +33,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# ---------- Базовый слой CPU (не используется, но оставлен) ----------
+# ---------- Базовый слой CPU (не используется) ----------
 FROM python:${PY_VER}-slim AS base-cpu
 ENV UV_EXTRA=cpu
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -64,7 +65,8 @@ ARG UV_EXTRA
 ENV BACKEND=${BACKEND} \
     DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    UV_EXTRA=${UV_EXTRA}
 
 # Системные зависимости для аудио
 ARG DEPENDENCIES=" \
@@ -112,20 +114,19 @@ RUN mkdir -p /app/references \
 
 WORKDIR /app
 
-# Копируем только файлы зависимостей для кеширования
-COPY --chown=${USER_UID}:${USER_GID} pyproject.toml uv.lock README.md ./
-
-# Устанавливаем зависимости через uv sync (создаст .venv и установит всё)
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --extra ${UV_EXTRA} --frozen --no-install-project
-
-# Копируем остальной код
+# Копируем все файлы проекта (для простоты, слой кеширования будет работать на уровне COPY)
 COPY --chown=${USER_UID}:${USER_GID} . .
 
-# Дополнительная установка самого проекта (быстро)
-RUN uv sync --extra ${UV_EXTRA} --frozen
+# Создаём и наполняем venv с зависимостями
+RUN uv venv /app/.venv
+ENV VIRTUAL_ENV=/app/.venv
+ENV PATH="/app/.venv/bin:$PATH"
 
-# Общий вспомогательный скрипт (исправлен)
+# Устанавливаем зависимости в venv (используем uv pip, так как uv sync может быть капризным)
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --no-cache-dir -e ".[${UV_EXTRA}]"
+
+# Общий вспомогательный скрипт (использует python из venv)
 RUN printf '%s\n' \
     '#!/bin/bash' \
     'set -euo pipefail' \
@@ -179,7 +180,7 @@ RUN printf '%s\n' \
     'validate_env' \
     'DEVICE_ARGS=$(build_device_args)' \
     'COMPILE_ARGS=$(build_compile_args "$@")' \
-    'exec uv run python -m fish_speech_server.app --listen "${API_SERVER_NAME}:${API_SERVER_PORT}" --llama-checkpoint-path "${LLAMA_CHECKPOINT_PATH:-checkpoints/fs-1.2-int8-s2-pro-int8}" --decoder-checkpoint-path "${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}" --decoder-config-name "${DECODER_CONFIG_NAME:-modded_dac_vq}" ${DEVICE_ARGS} ${COMPILE_ARGS}' \
+    'exec /app/.venv/bin/python -m fish_speech_server.app --listen "${API_SERVER_NAME}:${API_SERVER_PORT}" --llama-checkpoint-path "${LLAMA_CHECKPOINT_PATH:-checkpoints/fs-1.2-int8-s2-pro-int8}" --decoder-checkpoint-path "${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}" --decoder-config-name "${DECODER_CONFIG_NAME:-modded_dac_vq}" ${DEVICE_ARGS} ${COMPILE_ARGS}' \
     > /app/start_server.sh && chmod +x /app/start_server.sh
 ENTRYPOINT ["/app/start_server.sh"]
 
@@ -195,7 +196,7 @@ RUN printf '%s\n' \
     '#!/bin/bash' \
     'source /app/common.sh' \
     'log "Starting PCM Proxy..."' \
-    'exec uv run python -m uvicorn fish_speech_server.proxy.pcm:app --host "${PROXY_SERVER_NAME}" --port "${PROXY_SERVER_PORT}"' \
+    'exec /app/.venv/bin/python -m uvicorn fish_speech_server.proxy.pcm:app --host "${PROXY_SERVER_NAME}" --port "${PROXY_SERVER_PORT}"' \
     > /app/start_proxy.sh && chmod +x /app/start_proxy.sh
 ENTRYPOINT ["/app/start_proxy.sh"]
 
@@ -211,7 +212,7 @@ RUN printf '%s\n' \
     '#!/bin/bash' \
     'source /app/common.sh' \
     'log "Starting Web UI (Preact)..."' \
-    'exec uv run python -m fish_speech_web_ui.server --host "${WEBUI_SERVER_NAME}" --port "${WEBUI_SERVER_PORT}"' \
+    'exec /app/.venv/bin/python -m fish_speech_web_ui.server --host "${WEBUI_SERVER_NAME}" --port "${WEBUI_SERVER_PORT}"' \
     > /app/start_webui_preact.sh && chmod +x /app/start_webui_preact.sh
 ENTRYPOINT ["/app/start_webui_preact.sh"]
 
@@ -230,7 +231,7 @@ RUN printf '%s\n' \
     'validate_env' \
     'DEVICE_ARGS=$(build_device_args)' \
     'COMPILE_ARGS=$(build_compile_args "$@")' \
-    'exec uv run tools/run_webui.py --llama-checkpoint-path "${LLAMA_CHECKPOINT_PATH:-checkpoints/fs-1.2-int8-s2-pro-int8}" --decoder-checkpoint-path "${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}" --decoder-config-name "${DECODER_CONFIG_NAME:-modded_dac_vq}" ${DEVICE_ARGS} ${COMPILE_ARGS}' \
+    'exec /app/.venv/bin/python tools/run_webui.py --llama-checkpoint-path "${LLAMA_CHECKPOINT_PATH:-checkpoints/fs-1.2-int8-s2-pro-int8}" --decoder-checkpoint-path "${DECODER_CHECKPOINT_PATH:-checkpoints/s2-pro/codec.pth}" --decoder-config-name "${DECODER_CONFIG_NAME:-modded_dac_vq}" ${DEVICE_ARGS} ${COMPILE_ARGS}' \
     > /app/start_webui.sh && chmod +x /app/start_webui.sh
 ENTRYPOINT ["/app/start_webui.sh"]
 
@@ -239,5 +240,4 @@ FROM app-base AS dev
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends vim htop strace gdb && apt-get clean && rm -rf /var/lib/apt/lists/*
 USER ${USER_UID}:${USER_GID}
-RUN uv sync --extra ${UV_EXTRA} --dev
 ENTRYPOINT ["/bin/bash"]

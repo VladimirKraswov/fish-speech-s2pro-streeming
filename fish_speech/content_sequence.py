@@ -1,4 +1,4 @@
-# fish_speech/content_sequence.py
+# Internal prompt representation for Fish Speech driver generation.
 from dataclasses import dataclass, field
 from typing import List, Literal, Union
 

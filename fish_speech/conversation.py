@@ -1,4 +1,4 @@
-# fish_speech/conversation.py
+# Internal prompt assembly helper for committed-segment synthesis.
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Literal
@@ -91,7 +91,6 @@ class Conversation:
             tokenizer,
             add_shift=add_shift,
             ignore_loss_tokens=ignore_loss_tokens,
-            max_length=max_length,
         )
 
     def encode_for_inference(

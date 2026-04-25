@@ -1,12 +1,10 @@
 import torch
 from loguru import logger
 
-from fish_speech.inference_engine import TTSInferenceEngine
-from fish_speech.models.dac.inference import load_model as load_decoder_model
-from fish_speech.models.text2semantic.inference import launch_thread_safe_queue
-from fish_speech.runtime_config import load_runtime_config
-from fish_speech.utils.schema import ServeTTSRequest
+from fish_speech import FishSpeechDriver
+from tools.server.config import load_runtime_config
 from tools.server.inference import inference_wrapper as inference
+from tools.server.schema import ServeTTSRequest
 
 
 class ModelManager:
@@ -38,18 +36,15 @@ class ModelManager:
 
         self._worker_memory_info = {}
 
-        self.load_llama_model(
-            llama_checkpoint_path, self.device, self.precision, self.compile, self.mode
+        self.load_driver(
+            llama_checkpoint_path=llama_checkpoint_path,
+            decoder_checkpoint_path=decoder_checkpoint_path,
+            decoder_config_name=decoder_config_name,
         )
-        self.load_decoder_model(
-            decoder_config_name, decoder_checkpoint_path, self.device
-        )
-        self.tts_inference_engine = TTSInferenceEngine(
-            llama_queue=self.llama_queue,
-            decoder_model=self.decoder_model,
-            precision=self.precision,
-            compile=self.compile,
-        )
+
+        self.tts_inference_engine = self.driver.engine
+        self.llama_queue = self.tts_inference_engine.llama_queue
+        self.decoder_model = self.tts_inference_engine.decoder_model
 
         if torch.cuda.is_available() and self.runtime.model.record_memory_history:
             try:
@@ -68,35 +63,32 @@ class ModelManager:
                 "torch.compile enabled — running warmup now. "
                 "Server will accept connections after this."
             )
-            self.warm_up(self.tts_inference_engine, compile=True)
+            self.warm_up(self.driver, compile=True)
             logger.warning("torch.compile warmup finished — server ready.")
 
-    def load_llama_model(
-        self, checkpoint_path, device, precision, compile, mode
+    def load_driver(
+        self,
+        *,
+        llama_checkpoint_path: str,
+        decoder_checkpoint_path: str,
+        decoder_config_name: str,
     ) -> None:
+        if self.mode != "tts":
+            raise ValueError(f"Invalid mode: {self.mode}")
 
-        if mode == "tts":
-            self.llama_queue = launch_thread_safe_queue(
-                checkpoint_path=checkpoint_path,
-                device=device,
-                precision=precision,
-                compile=compile,
-                memory_info=self._worker_memory_info,
-            )
-        else:
-            raise ValueError(f"Invalid mode: {mode}")
-
-        logger.info("LLAMA model loaded.")
-
-    def load_decoder_model(self, config_name, checkpoint_path, device) -> None:
-        self.decoder_model = load_decoder_model(
-            config_name=config_name,
-            checkpoint_path=checkpoint_path,
-            device=device,
+        self.driver = FishSpeechDriver.from_model_paths(
+            llama_checkpoint_path=llama_checkpoint_path,
+            decoder_checkpoint_path=decoder_checkpoint_path,
+            decoder_config_name=decoder_config_name,
+            device=self.device,
+            precision=self.precision,
+            compile=self.compile,
+            config=self.runtime,
+            memory_info=self._worker_memory_info,
         )
-        logger.info("Decoder model loaded.")
+        logger.info("Fish Speech driver loaded.")
 
-    def warm_up(self, tts_inference_engine, *, compile: bool = False) -> None:
+    def warm_up(self, driver: FishSpeechDriver, *, compile: bool = False) -> None:
         warmup = self.runtime.warmup
         reference_id = (
             warmup.reference_id
@@ -124,7 +116,7 @@ class ModelManager:
             use_memory_cache=self.runtime.proxy.tts.use_memory_cache,
             seed=self.runtime.proxy.tts.seed,
         )
-        list(inference(request, tts_inference_engine))
+        list(inference(request, driver))
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         logger.info("Warmup done.")

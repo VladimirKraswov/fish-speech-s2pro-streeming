@@ -11,7 +11,7 @@ from pydub import AudioSegment
 from pydub.playback import play
 
 from fish_speech.utils.file import audio_to_bytes, read_ref_text
-from fish_speech.utils.schema import ServeReferenceAudio, ServeTTSRequest
+from tools.server.schema import ServeReferenceAudio, ServeTTSRequest
 
 
 def parse_args():

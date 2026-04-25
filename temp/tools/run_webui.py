@@ -10,9 +10,10 @@ from loguru import logger
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
 from fish_speech.inference_engine import TTSInferenceEngine
+from fish_speech.generation.worker import launch_thread_safe_queue
 from fish_speech.models.dac.inference import load_model as load_decoder_model
-from fish_speech.models.text2semantic.inference import launch_thread_safe_queue
-from fish_speech.utils.schema import ServeTTSRequest
+from tools.server.adapter import api_tts_to_driver_request
+from tools.server.schema import ServeTTSRequest
 from tools.webui import build_app
 from tools.webui.inference import get_inference_wrapper
 
@@ -85,16 +86,18 @@ if __name__ == "__main__":
     # Dry run to check if the model is loaded correctly and avoid the first-time latency
     list(
         inference_engine.inference(
-            ServeTTSRequest(
-                text="Hello world.",
-                references=[],
-                reference_id=None,
-                max_new_tokens=1024,
-                chunk_length=200,
-                top_p=0.7,
-                repetition_penalty=1.5,
-                temperature=0.7,
-                format="wav",
+            api_tts_to_driver_request(
+                ServeTTSRequest(
+                    text="Hello world.",
+                    references=[],
+                    reference_id=None,
+                    max_new_tokens=1024,
+                    chunk_length=200,
+                    top_p=0.7,
+                    repetition_penalty=1.5,
+                    temperature=0.7,
+                    format="wav",
+                )
             )
         )
     )

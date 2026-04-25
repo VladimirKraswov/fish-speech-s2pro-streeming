@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from fish_speech.inference_engine import TTSInferenceEngine
-from fish_speech.models.text2semantic.inference import GenerateResponse
+from fish_speech.generation.prompt_builder import GenerateResponse
 
 
 class TestGetAudioSegment:

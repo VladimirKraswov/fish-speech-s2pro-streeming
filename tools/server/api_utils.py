@@ -13,10 +13,10 @@ from kui.asgi import (
 from loguru import logger
 from pydantic import BaseModel
 
-from fish_speech.inference_engine import TTSInferenceEngine
-from fish_speech.runtime_config import load_runtime_config
-from fish_speech.utils.schema import ServeTTSRequest
+from fish_speech import FishSpeechDriver
+from tools.server.config import load_runtime_config
 from tools.server.inference import inference_wrapper as inference
+from tools.server.schema import ServeTTSRequest
 
 
 def parse_args():
@@ -88,8 +88,8 @@ class MsgPackRequest(HttpRequest):
         )
 
 
-async def inference_async(req: ServeTTSRequest, engine: TTSInferenceEngine):
-    for chunk in inference(req, engine):
+async def inference_async(req: ServeTTSRequest, driver: FishSpeechDriver):
+    for chunk in inference(req, driver):
         print("Got chunk")
         if isinstance(chunk, bytes):
             yield chunk

@@ -1,0 +1,235 @@
+from __future__ import annotations
+
+import json
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from fish_speech.driver.config import (
+    DEFAULT_RUNTIME_CONFIG_PATH,
+    ModelConfig,
+    PathsConfig,
+    WarmupConfig,
+)
+
+
+class NetworkEndpointConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    host: str
+    port: int = Field(..., ge=1, le=65535)
+
+
+class NetworkConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    server: NetworkEndpointConfig
+    proxy: NetworkEndpointConfig
+    upstream_tts_url: str
+
+
+class CommitStageConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    min_chars: int = Field(..., ge=1)
+    target_chars: int = Field(..., ge=1)
+    max_chars: int = Field(..., ge=1)
+    max_wait_ms: int = Field(..., ge=1)
+    allow_partial_after_ms: int = Field(..., ge=1)
+
+    @model_validator(mode="after")
+    def validate_lengths(self) -> "CommitStageConfig":
+        if self.min_chars > self.target_chars:
+            raise ValueError("min_chars must be <= target_chars")
+        if self.target_chars > self.max_chars:
+            raise ValueError("target_chars must be <= max_chars")
+        if self.max_wait_ms > self.allow_partial_after_ms:
+            raise ValueError("max_wait_ms must be <= allow_partial_after_ms")
+        return self
+
+
+class CommitPolicyConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    first: CommitStageConfig
+    next: CommitStageConfig
+    flush_on_sentence_punctuation: bool = True
+    flush_on_clause_punctuation: bool = True
+    flush_on_newline: bool = True
+    carry_incomplete_tail: bool = True
+
+
+class ProxyTTSConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reference_id: str = "voice"
+    format: str = "wav"
+    normalize: bool = True
+    use_memory_cache: str = "on"
+    seed: int | None = None
+    max_new_tokens: int = Field(128, ge=1, le=512)
+    chunk_length: int = Field(180, ge=100, le=300)
+    top_p: float = Field(0.8, ge=0.1, le=1.0)
+    repetition_penalty: float = Field(1.08, ge=0.9, le=2.0)
+    temperature: float = Field(0.75, ge=0.1, le=1.0)
+    stream_tokens: bool = True
+    initial_stream_chunk_size: int = Field(8, ge=1, le=200)
+    stream_chunk_size: int = Field(8, ge=1, le=200)
+
+    @field_validator("format")
+    @classmethod
+    def validate_format(cls, value: str) -> str:
+        value = value.strip().lower()
+        if value != "wav":
+            raise ValueError("only format='wav' is supported in proxy runtime config")
+        return value
+
+    @field_validator("use_memory_cache")
+    @classmethod
+    def validate_use_memory_cache(cls, value: str) -> str:
+        value = value.strip().lower()
+        if value not in {"on", "off"}:
+            raise ValueError("use_memory_cache must be 'on' or 'off'")
+        return value
+
+    @model_validator(mode="after")
+    def validate_chunk_sizes(self) -> "ProxyTTSConfig":
+        if self.initial_stream_chunk_size < self.stream_chunk_size:
+            raise ValueError("initial_stream_chunk_size must be >= stream_chunk_size")
+        return self
+
+
+class PlaybackConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_emit_bytes: int = Field(4096, ge=512, le=32768)
+    start_buffer_ms: int = Field(90, ge=0, le=5000)
+    stop_grace_ms: int = Field(40, ge=0, le=5000)
+
+    @field_validator("target_emit_bytes")
+    @classmethod
+    def validate_even_bytes(cls, value: int) -> int:
+        if value % 2 != 0:
+            raise ValueError("target_emit_bytes must be even for PCM16")
+        return value
+
+
+class SessionRuntimeConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_buffer_chars: int = Field(4000, ge=256, le=100_000)
+    auto_close_on_finish: bool = False
+
+
+class ProxyConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    default_reference_id: str = "voice"
+    session_ttl_sec: int = Field(1800, ge=1)
+    session_max_count: int = Field(128, ge=1)
+
+    version: int = 1
+    commit: CommitPolicyConfig
+    tts: ProxyTTSConfig
+    playback: PlaybackConfig
+    session: SessionRuntimeConfig
+
+    @model_validator(mode="after")
+    def normalize_reference_id(self) -> "ProxyConfig":
+        if not self.tts.reference_id.strip():
+            self.tts.reference_id = self.default_reference_id
+        return self
+
+
+class FrontendOverridesConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    allowed_paths: list[str] = Field(default_factory=list)
+
+
+class ServerRuntimeConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = 1
+    paths: PathsConfig
+    network: NetworkConfig
+    model: ModelConfig
+    warmup: WarmupConfig
+    proxy: ProxyConfig
+    frontend_overrides: FrontendOverridesConfig
+
+
+AppConfig = ServerRuntimeConfig
+
+
+def deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    out = json.loads(json.dumps(base))
+    for key, value in patch.items():
+        if key in out and isinstance(out[key], dict) and isinstance(value, dict):
+            out[key] = deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _iter_leaf_paths(value: Any, prefix: str = "") -> list[str]:
+    if isinstance(value, dict):
+        paths: list[str] = []
+        for key, child in value.items():
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            paths.extend(_iter_leaf_paths(child, child_prefix))
+        return paths
+    return [prefix] if prefix else []
+
+
+def _normalize_allowed_path(path: str) -> str:
+    path = path.strip().strip(".")
+    if path.startswith("proxy."):
+        path = path[len("proxy.") :]
+    if path.startswith("session."):
+        path = path[len("session.") :]
+    return path
+
+
+def merge_frontend_proxy_override(
+    override_patch: dict[str, Any],
+    runtime: ServerRuntimeConfig | None = None,
+) -> ProxyConfig:
+    runtime = runtime or load_runtime_config()
+
+    if not isinstance(override_patch, dict):
+        raise ValueError("frontend override must be a JSON object")
+
+    if runtime.frontend_overrides.enabled:
+        requested = {
+            _normalize_allowed_path(path)
+            for path in _iter_leaf_paths(override_patch)
+            if path.strip()
+        }
+        allowed = {
+            _normalize_allowed_path(path)
+            for path in runtime.frontend_overrides.allowed_paths
+            if path.strip()
+        }
+        disallowed = sorted(path for path in requested if path not in allowed)
+        if disallowed:
+            raise ValueError(
+                "frontend override contains disallowed paths: " + ", ".join(disallowed)
+            )
+
+    merged = deep_merge(runtime.proxy.model_dump(mode="python"), override_patch)
+    return ProxyConfig.model_validate(merged)
+
+
+@lru_cache(maxsize=4)
+def load_runtime_config(path: str | Path | None = None) -> ServerRuntimeConfig:
+    config_path = Path(path) if path is not None else DEFAULT_RUNTIME_CONFIG_PATH
+    with config_path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    return ServerRuntimeConfig.model_validate(payload)
+
+
+load_server_config = load_runtime_config

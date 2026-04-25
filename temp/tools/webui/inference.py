@@ -3,7 +3,8 @@ from functools import partial
 from typing import Any, Callable
 
 from fish_speech.i18n import i18n
-from fish_speech.utils.schema import ServeReferenceAudio, ServeTTSRequest
+from tools.server.adapter import api_tts_to_driver_request
+from tools.server.schema import ServeReferenceAudio, ServeTTSRequest
 
 
 def inference_wrapper(
@@ -43,7 +44,7 @@ def inference_wrapper(
         use_memory_cache=use_memory_cache,
     )
 
-    for result in engine.inference(req):
+    for result in engine.inference(api_tts_to_driver_request(req)):
         match result.code:
             case "final":
                 return result.audio, None

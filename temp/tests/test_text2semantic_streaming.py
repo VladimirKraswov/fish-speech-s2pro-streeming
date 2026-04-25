@@ -12,9 +12,11 @@ import unittest.mock as mock
 import pytest
 import torch
 
-from fish_speech.models.text2semantic.inference import (
+from fish_speech.generation.decode import (
     _to_normal_tensor,
     decode_n_tokens,
+)
+from tools.server.adapter import (
     split_text_by_bytes,
     split_text_by_speaker,
 )
@@ -132,7 +134,7 @@ class TestDecodeNTokens:
         semantic_logit_bias = torch.zeros(1, 1, 100, device=device)
         return cur_token, input_pos, temperature, top_p, semantic_logit_bias
 
-    @mock.patch("fish_speech.models.text2semantic.inference.tqdm", lambda x: x)
+    @mock.patch("fish_speech.generation.decode.tqdm", lambda x: x)
     def test_streaming_yields_chunks_of_requested_size(self, mock_model):
         """With stream_chunk_size=5 and mock returning 12 tokens then EOS, we get chunks [5, 5, 2]."""
         cur_token, input_pos, temperature, top_p, semantic_logit_bias = (
@@ -154,7 +156,7 @@ class TestDecodeNTokens:
                 out[0, 0, 0] = EOS_ID
             return out
 
-        with mock.patch("fish_speech.models.text2semantic.inference.logger"):
+        with mock.patch("fish_speech.generation.decode.logger"):
             chunks = list(
                 decode_n_tokens(
                     mock_model,
@@ -180,7 +182,7 @@ class TestDecodeNTokens:
         assert chunks[2].shape == (1, codebook_dim * 2, 1)
         assert call_count == tokens_to_generate
 
-    @mock.patch("fish_speech.models.text2semantic.inference.tqdm", lambda x: x)
+    @mock.patch("fish_speech.generation.decode.tqdm", lambda x: x)
     def test_non_streaming_yields_single_chunk(self, mock_model):
         """With stream_chunk_size=None we get one chunk with all generated tokens."""
         cur_token, input_pos, temperature, top_p, semantic_logit_bias = (
@@ -200,7 +202,7 @@ class TestDecodeNTokens:
                 out[0, 0, 0] = EOS_ID
             return out
 
-        with mock.patch("fish_speech.models.text2semantic.inference.logger"):
+        with mock.patch("fish_speech.generation.decode.logger"):
             chunks = list(
                 decode_n_tokens(
                     mock_model,
@@ -223,7 +225,7 @@ class TestDecodeNTokens:
         assert chunks[0].shape == (1, 11 * total_tokens, 1)
         assert call_count == total_tokens
 
-    @mock.patch("fish_speech.models.text2semantic.inference.tqdm", lambda x: x)
+    @mock.patch("fish_speech.generation.decode.tqdm", lambda x: x)
     def test_streaming_eos_before_full_chunk(self, mock_model):
         """EOS after 2 tokens with stream_chunk_size=5 yields one remainder chunk of 2."""
         cur_token, input_pos, temperature, top_p, semantic_logit_bias = (
@@ -242,7 +244,7 @@ class TestDecodeNTokens:
                 out[0, 0, 0] = EOS_ID
             return out
 
-        with mock.patch("fish_speech.models.text2semantic.inference.logger"):
+        with mock.patch("fish_speech.generation.decode.logger"):
             chunks = list(
                 decode_n_tokens(
                     mock_model,

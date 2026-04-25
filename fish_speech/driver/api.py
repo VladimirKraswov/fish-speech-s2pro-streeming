@@ -1,0 +1,196 @@
+from __future__ import annotations
+
+from typing import Any, Iterator
+
+from fish_speech.driver.session import DriverSession, DriverSessionConfig
+from fish_speech.driver.types import (
+    DriverAudioChunkEvent,
+    DriverErrorEvent,
+    DriverFinalAudioEvent,
+    DriverHealth,
+    DriverReference,
+    DriverStats,
+    DriverSynthesisRequest,
+    DriverTokenChunkEvent,
+)
+
+
+class FishSpeechDriver:
+    def __init__(self, engine: Any, config: Any | None = None) -> None:
+        self.engine = engine
+        self.config = config
+        self._closed = False
+        self._sessions_opened = 0
+
+    @classmethod
+    def from_engine(cls, engine: Any, config: Any | None = None) -> "FishSpeechDriver":
+        return cls(engine=engine, config=config)
+
+    @classmethod
+    def from_config(cls, config: Any | None = None) -> "FishSpeechDriver":
+        from fish_speech.driver.config import load_driver_config
+        import torch
+
+        config = config or load_driver_config()
+        model_cfg = config.model
+        paths = config.paths
+        precision = {
+            "float16": torch.float16,
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+        }[model_cfg.precision]
+
+        device = model_cfg.device
+        if torch.backends.mps.is_available():
+            device = "mps"
+        elif not torch.cuda.is_available():
+            device = "cpu"
+
+        return cls.from_model_paths(
+            llama_checkpoint_path=paths.llama_checkpoint_path,
+            decoder_checkpoint_path=paths.decoder_checkpoint_path,
+            decoder_config_name=paths.decoder_config_name,
+            device=device,
+            precision=precision,
+            compile=model_cfg.compile,
+            config=config,
+        )
+
+    @classmethod
+    def from_model_paths(
+        cls,
+        *,
+        llama_checkpoint_path: str,
+        decoder_checkpoint_path: str,
+        decoder_config_name: str,
+        device: str,
+        precision: Any,
+        compile: bool,
+        config: Any | None = None,
+        memory_info: dict | None = None,
+    ) -> "FishSpeechDriver":
+        from fish_speech.codec.dac import load_model as load_decoder_model
+        from fish_speech.generation.worker import launch_thread_safe_queue
+        from fish_speech.inference_engine import TTSInferenceEngine
+
+        llama_queue = launch_thread_safe_queue(
+            checkpoint_path=llama_checkpoint_path,
+            device=device,
+            precision=precision,
+            compile=compile,
+            memory_info=memory_info,
+        )
+        decoder_model = load_decoder_model(
+            config_name=decoder_config_name,
+            checkpoint_path=decoder_checkpoint_path,
+            device=device,
+        )
+        engine = TTSInferenceEngine(
+            llama_queue=llama_queue,
+            decoder_model=decoder_model,
+            precision=precision,
+            compile=compile,
+        )
+        return cls(engine=engine, config=config)
+
+    @property
+    def sample_rate(self) -> int:
+        decoder_model = self.engine.decoder_model
+        if hasattr(decoder_model, "spec_transform"):
+            return int(decoder_model.spec_transform.sample_rate)
+        return int(decoder_model.sample_rate)
+
+    def open_session(
+        self,
+        config: DriverSessionConfig | None = None,
+        *,
+        reference_id: str | None = None,
+        references: list[DriverReference] | None = None,
+    ) -> DriverSession:
+        if self._closed:
+            raise RuntimeError("fish speech driver is closed")
+        if config is None:
+            config = DriverSessionConfig(
+                reference_id=reference_id,
+                references=list(references or []),
+            )
+        self._sessions_opened += 1
+        return DriverSession(driver=self, config=config)
+
+    def synthesize(
+        self,
+        request: DriverSynthesisRequest,
+    ) -> Iterator[
+        DriverAudioChunkEvent
+        | DriverFinalAudioEvent
+        | DriverTokenChunkEvent
+        | DriverErrorEvent
+    ]:
+        session = self.open_session(
+            DriverSessionConfig(
+                reference_id=request.reference_id,
+                references=list(request.references),
+                generation=request.generation,
+                seed=request.seed,
+                use_memory_cache=request.use_memory_cache,
+                normalize=request.normalize,
+                stream_audio=request.stream_audio,
+            )
+        )
+        try:
+            yield from session.synthesize_request(request)
+        finally:
+            session.close()
+
+    def warmup(self) -> None:
+        from fish_speech.driver.warmup import run_driver_warmup
+
+        run_driver_warmup(self)
+
+    def health(self) -> DriverHealth:
+        return DriverHealth(ok=not self._closed)
+
+    def stats(self) -> DriverStats:
+        return DriverStats(sessions_opened=self._sessions_opened)
+
+    def close(self) -> None:
+        self._closed = True
+        llama_queue = getattr(self.engine, "llama_queue", None)
+        if llama_queue is not None:
+            llama_queue.put(None)
+
+    def list_reference_ids(self) -> list[str]:
+        return self.engine.list_reference_ids()
+
+    @property
+    def references_dir(self):
+        return self.engine.references_dir
+
+    def add_reference(self, reference_id: str, wav_file_path: str, text: str) -> None:
+        self.engine.add_reference(reference_id, wav_file_path, text)
+
+    def add_reference_encoded(
+        self,
+        reference_id: str,
+        codes_bytes: bytes,
+        lab_text: str,
+        stem: str | None = None,
+    ) -> str:
+        return self.engine.add_reference_encoded(
+            reference_id,
+            codes_bytes,
+            lab_text,
+            stem=stem,
+        )
+
+    def delete_reference(self, reference_id: str) -> None:
+        self.engine.delete_reference(reference_id)
+
+    def rename_reference(self, old_reference_id: str, new_reference_id: str) -> None:
+        old_dir = self.references_dir / old_reference_id
+        new_dir = self.references_dir / new_reference_id
+        old_dir.rename(new_dir)
+        if old_reference_id in self.engine.ref_by_id:
+            self.engine.ref_by_id[new_reference_id] = self.engine.ref_by_id.pop(
+                old_reference_id
+            )

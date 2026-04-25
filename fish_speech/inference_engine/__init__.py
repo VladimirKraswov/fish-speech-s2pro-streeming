@@ -8,17 +8,15 @@ import numpy as np
 import torch
 from loguru import logger
 
-from fish_speech.inference_engine.reference_loader import ReferenceLoader
-from fish_speech.inference_engine.utils import InferenceResult, wav_chunk_header
-from fish_speech.inference_engine.vq_manager import VQManager
+from fish_speech.driver import DriverSynthesisRequest
+from fish_speech.inference_engine.utils import InferenceResult
 from fish_speech.models.dac.modded_dac import DAC
-from fish_speech.models.text2semantic.inference import (
-    GenerateRequest,
-    GenerateResponse,
-)
-from fish_speech.runtime_config import load_runtime_config
+from fish_speech.generation.prompt_builder import GenerateResponse
+from fish_speech.generation.worker import GenerateRequest
+from fish_speech.references.loader import ReferenceLoader
+from fish_speech.driver.config import load_runtime_config
 from fish_speech.utils import autocast_exclude_mps, set_seed
-from fish_speech.utils.schema import ServeTTSRequest
+from fish_speech.codec.vq import VQManager
 
 
 class TTSInferenceEngine(ReferenceLoader, VQManager):
@@ -91,7 +89,9 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         if should_cleanup:
             self._cuda_cleanup(reason="success")
 
-    def inference(self, req: ServeTTSRequest) -> Generator[InferenceResult, None, None]:
+    def inference(
+        self, req: DriverSynthesisRequest
+    ) -> Generator[InferenceResult, None, None]:
         """
         Main inference function:
         - Loads the reference audio and text.
@@ -153,7 +153,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                 set_seed(req.seed)
                 logger.warning(f"set seed: {req.seed}")
 
-            stream_tokens = bool(getattr(req, "stream_tokens", False))
+            stream_tokens = bool(req.stream_tokens)
             ack_queue = queue.Queue() if stream_tokens else None
             response_queue = self.send_Llama_request(
                 req, prompt_tokens, prompt_texts, req_tag=req_tag, ack_queue=ack_queue
@@ -168,17 +168,6 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                 sample_rate = self.decoder_model.spec_transform.sample_rate
             else:
                 sample_rate = self.decoder_model.sample_rate
-
-            if req.streaming:
-                _mark("yield_header")
-                yield InferenceResult(
-                    code="header",
-                    audio=(
-                        sample_rate,
-                        np.array(wav_chunk_header(sample_rate=sample_rate)),
-                    ),
-                    error=None,
-                )
 
             segments = []
             seg_idx = 0
@@ -228,6 +217,17 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
                 result = wrapped_result.response
                 if result.action != "next":
+                    if req.stream_tokens and result.codes is not None:
+                        yield InferenceResult(
+                            code="tokens",
+                            audio=None,
+                            error=None,
+                            tokens=(
+                                result.codes.cpu()
+                                if getattr(result.codes, "is_cuda", False)
+                                else result.codes
+                            ),
+                        )
                     if stream_tokens:
                         logger.info(
                             "stream: decoding segment seg_idx={} codes_shape={} req={}",
@@ -275,7 +275,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                             req_tag,
                         )
 
-                    if req.streaming:
+                    if req.stream_audio:
                         _mark("yield_segment", segment_idx=seg_idx)
                         yield InferenceResult(
                             code="segment",
@@ -326,7 +326,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
     def send_Llama_request(
         self,
-        req: ServeTTSRequest,
+        req: DriverSynthesisRequest,
         prompt_tokens: list,
         prompt_texts: list,
         req_tag: str,
@@ -336,12 +336,13 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         Send a request to the LLAMA model to generate the symbolic tokens.
         """
 
-        stream_tokens = bool(getattr(req, "stream_tokens", False))
+        stream_tokens = bool(req.stream_tokens)
         request = dict(
             device=self.decoder_model.device,
             req_tag=req_tag,
             max_new_tokens=req.max_new_tokens,
             text=req.text,
+            segments=req.committed_segments(),
             top_p=req.top_p,
             repetition_penalty=req.repetition_penalty,
             temperature=req.temperature,
@@ -351,8 +352,8 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             prompt_tokens=prompt_tokens,
             prompt_text=prompt_texts,
             stream_tokens=stream_tokens,
-            stream_chunk_size=getattr(req, "stream_chunk_size", 8),
-            initial_stream_chunk_size=getattr(req, "initial_stream_chunk_size", 10),
+            stream_chunk_size=req.stream_chunk_size,
+            initial_stream_chunk_size=req.initial_stream_chunk_size,
             ack_queue=ack_queue,
         )
 

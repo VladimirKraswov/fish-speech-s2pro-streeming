@@ -26,7 +26,9 @@ from loguru import logger
 from starlette.responses import Response
 from typing_extensions import Annotated
 
-from fish_speech.utils.schema import (
+from fish_speech import DriverErrorEvent, DriverFinalAudioEvent
+from tools.server.adapter import api_tts_to_driver_request
+from tools.server.schema import (
     AddEncodedReferenceResponse,
     AddReferenceRequest,
     AddReferenceResponse,
@@ -45,7 +47,6 @@ from tools.server.api_utils import (
     get_content_type,
     inference_async,
 )
-from tools.server.inference import inference_wrapper as inference
 from tools.server.model_manager import ModelManager
 from tools.server.model_utils import (
     batch_vqgan_decode,
@@ -273,7 +274,7 @@ async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
         # Get the model from the app
         app_state = request.app.state
         model_manager: ModelManager = app_state.model_manager
-        engine = model_manager.tts_inference_engine
+        driver = model_manager.driver
 
         if not req.reference_id and not req.references:
             raise HTTPException(
@@ -281,7 +282,7 @@ async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
                 content="Reference is required for this test mode: provide reference_id or references",
             )
 
-        sample_rate = engine.decoder_model.sample_rate
+        sample_rate = driver.sample_rate
 
         # Check if the text is too long
         if app_state.max_text_length > 0 and len(req.text) > app_state.max_text_length:
@@ -300,7 +301,7 @@ async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
         # Perform TTS
         if req.streaming:
             return StreamResponse(
-                iterable=inference_async(req, engine),
+                iterable=inference_async(req, driver),
                 headers={
                     "Content-Disposition": f"attachment; filename=audio.{req.format}",
                 },
@@ -308,13 +309,11 @@ async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
             )
         else:
             chunks = []
-            for result in engine.inference(req):
-                if result.code == "error" and result.error:
-                    raise RuntimeError(str(result.error))
-                if result.code in ("segment", "final") and isinstance(
-                    result.audio, tuple
-                ):
-                    chunks.append(result.audio[1])
+            for event in driver.synthesize(api_tts_to_driver_request(req)):
+                if isinstance(event, DriverErrorEvent) and event.error:
+                    raise RuntimeError(str(event.error))
+                if isinstance(event, DriverFinalAudioEvent):
+                    chunks.append(event.audio)
             if not chunks:
                 raise HTTPException(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -366,7 +365,7 @@ async def add_reference(
         # Get the model manager to access the reference loader
         app_state = request.app.state
         model_manager: ModelManager = app_state.model_manager
-        engine = model_manager.tts_inference_engine
+        driver = model_manager.driver
 
         # Read the uploaded audio file
         audio_content = audio.read()
@@ -378,8 +377,8 @@ async def add_reference(
             temp_file.write(audio_content)
             temp_file_path = temp_file.name
 
-        # Add the reference using the engine's reference loader
-        engine.add_reference(id, temp_file_path, text)
+        # Add the reference through the driver reference store.
+        driver.add_reference(id, temp_file_path, text)
 
         response = AddReferenceResponse(
             success=True,
@@ -452,9 +451,9 @@ async def add_reference_encoded(
 
         app_state = request.app.state
         model_manager: ModelManager = app_state.model_manager
-        engine = model_manager.tts_inference_engine
+        driver = model_manager.driver
 
-        status = engine.add_reference_encoded(id, codes_bytes, lab_text, stem=stem_val)
+        status = driver.add_reference_encoded(id, codes_bytes, lab_text, stem=stem_val)
 
         response = AddEncodedReferenceResponse(
             success=True,
@@ -491,13 +490,13 @@ async def list_references():
     Get a list of all available reference voice IDs.
     """
     try:
-        # Get the model manager to access the reference loader
+        # Get the model manager to access the driver reference store.
         app_state = request.app.state
         model_manager: ModelManager = app_state.model_manager
-        engine = model_manager.tts_inference_engine
+        driver = model_manager.driver
 
         # Get the list of reference IDs
-        reference_ids = engine.list_reference_ids()
+        reference_ids = driver.list_reference_ids()
 
         response = ListReferencesResponse(
             success=True,
@@ -527,10 +526,10 @@ async def delete_reference(reference_id: str = Body(...)):
         # Get the model manager to access the reference loader
         app_state = request.app.state
         model_manager: ModelManager = app_state.model_manager
-        engine = model_manager.tts_inference_engine
+        driver = model_manager.driver
 
-        # Delete the reference using the engine's reference loader
-        engine.delete_reference(reference_id)
+        # Delete the reference through the driver reference store.
+        driver.delete_reference(reference_id)
 
         response = DeleteReferenceResponse(
             success=True,
@@ -599,12 +598,12 @@ async def update_reference(
                 "New reference ID contains invalid characters or is too long"
             )
 
-        # Access engine to update caches after renaming
+        # Access the driver reference store and update caches after renaming.
         app_state = request.app.state
         model_manager: ModelManager = app_state.model_manager
-        engine = model_manager.tts_inference_engine
+        driver = model_manager.driver
 
-        refs_base = Path("references")
+        refs_base = driver.references_dir
         old_dir = refs_base / old_reference_id
         new_dir = refs_base / new_reference_id
 
@@ -622,11 +621,7 @@ async def update_reference(
             return format_response(response, status_code=409)
 
         # Perform rename
-        old_dir.rename(new_dir)
-
-        # Update in-memory cache key if present
-        if old_reference_id in engine.ref_by_id:
-            engine.ref_by_id[new_reference_id] = engine.ref_by_id.pop(old_reference_id)
+        driver.rename_reference(old_reference_id, new_reference_id)
 
         response = UpdateReferenceResponse(
             success=True,

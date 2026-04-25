@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from fish_speech.runtime_config import (
+from tools.server.config import (
     CommitPolicyConfig,
     ProxyConfig,
     load_runtime_config,

@@ -10,7 +10,7 @@ from fish_speech.driver import (
 )
 
 if TYPE_CHECKING:
-    from tools.tts_server.schema import ServeTTSRequest
+    from fish_speech_server.schema import ServeTTSRequest
 
 
 def split_text_by_speaker(text: str) -> list[str]:

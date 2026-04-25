@@ -9,9 +9,9 @@ from fish_speech import (
     DriverFinalAudioEvent,
     FishSpeechDriver,
 )
-from tools.tts_server.services.adapter import api_tts_to_driver_request
-from tools.tts_server.services.audio import wav_chunk_header
-from tools.tts_server.schema import ServeTTSRequest
+from fish_speech_server.services.adapter import api_tts_to_driver_request
+from fish_speech_server.services.audio import wav_chunk_header
+from fish_speech_server.schema import ServeTTSRequest
 
 # float аудио в диапазоне [-1.0, 1.0] -> int16 PCM
 AMPLITUDE = 32768

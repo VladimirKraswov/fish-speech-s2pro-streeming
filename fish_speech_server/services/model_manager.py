@@ -2,9 +2,9 @@ import torch
 from loguru import logger
 
 from fish_speech import FishSpeechDriver
-from tools.tts_server.config import load_runtime_config
-from tools.tts_server.services.inference import inference_wrapper as inference
-from tools.tts_server.schema import ServeTTSRequest
+from fish_speech_server.config import load_runtime_config
+from fish_speech_server.services.inference import inference_wrapper as inference
+from fish_speech_server.schema import ServeTTSRequest
 
 
 class ModelManager:

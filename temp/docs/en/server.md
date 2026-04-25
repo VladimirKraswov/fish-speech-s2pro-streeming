@@ -4,12 +4,12 @@ This page covers server-side inference for Fish Audio S2, plus quick links for W
 
 ## API Server Inference
 
-Fish Speech provides an HTTP API server entrypoint at `tools/api_server.py`.
+Fish Speech provides an HTTP API server entrypoint at `python -m fish_speech_server.app`.
 
 ### Start the server locally
 
 ```bash
-python tools/api_server.py \
+python -m fish_speech_server.app \
   --llama-checkpoint-path checkpoints/s2-pro \
   --decoder-checkpoint-path checkpoints/s2-pro/codec.pth \
   --listen 0.0.0.0:8080

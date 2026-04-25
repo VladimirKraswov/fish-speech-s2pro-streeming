@@ -26,8 +26,8 @@ from starlette.responses import Response
 from typing_extensions import Annotated
 
 from fish_speech import DriverErrorEvent, DriverFinalAudioEvent
-from tools.tts_server.services.adapter import api_tts_to_driver_request
-from tools.tts_server.schema import (
+from fish_speech_server.services.adapter import api_tts_to_driver_request
+from fish_speech_server.schema import (
     AddEncodedReferenceResponse,
     AddReferenceRequest,
     AddReferenceResponse,
@@ -40,14 +40,14 @@ from tools.tts_server.schema import (
     ServeVQGANEncodeResponse,
     UpdateReferenceResponse,
 )
-from tools.tts_server.api.utils import (
+from fish_speech_server.api.utils import (
     buffer_to_async_generator,
     format_response,
     get_content_type,
     inference_async,
 )
-from tools.tts_server.services.model_manager import ModelManager
-from tools.tts_server.services.model_utils import (
+from fish_speech_server.services.model_manager import ModelManager
+from fish_speech_server.services.model_utils import (
     batch_vqgan_decode,
     cached_vqgan_batch_encode,
 )

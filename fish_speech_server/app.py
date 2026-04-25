@@ -22,10 +22,10 @@ from typing_extensions import Annotated
 
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
-from tools.tts_server.api.utils import MsgPackRequest, parse_args
-from tools.tts_server.api.exception_handler import ExceptionHandler
-from tools.tts_server.services.model_manager import ModelManager
-from tools.tts_server.api.views import routes
+from fish_speech_server.api.utils import MsgPackRequest, parse_args
+from fish_speech_server.api.exception_handler import ExceptionHandler
+from fish_speech_server.services.model_manager import ModelManager
+from fish_speech_server.api.views import routes
 
 
 class API(ExceptionHandler):

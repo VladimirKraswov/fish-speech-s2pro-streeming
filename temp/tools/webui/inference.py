@@ -3,8 +3,8 @@ from functools import partial
 from typing import Any, Callable
 
 from fish_speech.i18n import i18n
-from tools.tts_server.services.adapter import api_tts_to_driver_request
-from tools.tts_server.schema import ServeReferenceAudio, ServeTTSRequest
+from fish_speech_server.services.adapter import api_tts_to_driver_request
+from fish_speech_server.schema import ServeReferenceAudio, ServeTTSRequest
 
 
 def inference_wrapper(

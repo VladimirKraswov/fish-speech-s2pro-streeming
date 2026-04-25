@@ -30,7 +30,7 @@ if [[ -z "$PROXY_PYTHON" || ! -x "$PROXY_PYTHON" ]]; then
   echo "  $REPO_ROOT/.venv-proxy/bin/python" >&2
   echo "  $REPO_ROOT/.venv/bin/python" >&2
   echo "Create/update it with:" >&2
-  echo "  python3.12 -m venv .venv-proxy && .venv-proxy/bin/python -m pip install -U pip && .venv-proxy/bin/python -m pip install -r tools/proxy/requirements.txt" >&2
+  echo "  python3.12 -m venv .venv-proxy && .venv-proxy/bin/python -m pip install -U pip && .venv-proxy/bin/python -m pip install -r fish_speech_server/proxy/requirements.txt" >&2
   exit 1
 fi
 
@@ -43,7 +43,7 @@ then
   echo "Selected python: $PROXY_PYTHON" >&2
   "$PROXY_PYTHON" --version >&2 || true
   echo "Create/update it with:" >&2
-  echo "  python3.12 -m venv .venv-proxy && .venv-proxy/bin/python -m pip install -U pip && .venv-proxy/bin/python -m pip install -r tools/proxy/requirements.txt" >&2
+  echo "  python3.12 -m venv .venv-proxy && .venv-proxy/bin/python -m pip install -U pip && .venv-proxy/bin/python -m pip install -r fish_speech_server/proxy/requirements.txt" >&2
   exit 1
 fi
 
@@ -56,7 +56,7 @@ then
   echo "ERROR: proxy python is missing required packages: fastapi, uvicorn, httpx" >&2
   echo "Selected python: $PROXY_PYTHON" >&2
   echo "Create/update it with:" >&2
-  echo "  $PROXY_PYTHON -m pip install -U pip && $PROXY_PYTHON -m pip install -r tools/proxy/requirements.txt" >&2
+  echo "  $PROXY_PYTHON -m pip install -U pip && $PROXY_PYTHON -m pip install -r fish_speech_server/proxy/requirements.txt" >&2
   exit 1
 fi
 
@@ -80,12 +80,11 @@ if [[ -f "$PID_FILE" ]]; then
   rm -f "$PID_FILE"
 fi
 
-pkill -f 'uvicorn.*tools.tts_server.proxy.pcm:app' 2>/dev/null || true
-pkill -f 'uvicorn.*tools.proxy.fish_proxy_pcm:app' 2>/dev/null || true
+pkill -f 'uvicorn.*fish_speech_server.proxy.pcm:app' 2>/dev/null || true
 
 export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
 
-nohup "$PROXY_PYTHON" -m uvicorn tools.tts_server.proxy.pcm:app \
+nohup "$PROXY_PYTHON" -m uvicorn fish_speech_server.proxy.pcm:app \
   --host "$PROXY_HOST" \
   --port "$PROXY_PORT" \
   --log-level "$PROXY_LOG_LEVEL" \

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fish_speech.generation.prompt_builder import generate_committed_segments
 
-from tools.tts_server.services.adapter import split_text_for_generation
+from fish_speech_server.services.adapter import split_text_for_generation
 
 
 def generate_long(

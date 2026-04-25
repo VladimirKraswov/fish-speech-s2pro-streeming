@@ -82,8 +82,9 @@ requires = ["setuptools", "setuptools-scm"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["fish_speech*", "tools*"]
+include = ["fish_speech*", "fish_speech_server*", "tools*"]
 namespaces = true
 
 [tool.setuptools.package-data]
 fish_speech = ["configs/*.yaml"]
+fish_speech_server = ["proxy/requirements.txt"]

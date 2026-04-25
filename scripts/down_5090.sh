@@ -23,8 +23,7 @@ if [[ -f "$PID_FILE" ]]; then
   rm -f "$PID_FILE"
 fi
 
-pkill -f 'uvicorn.*tools.tts_server.proxy.pcm:app' 2>/dev/null || true
-pkill -f 'uvicorn.*tools.proxy.fish_proxy_pcm:app' 2>/dev/null || true
+pkill -f 'uvicorn.*fish_speech_server.proxy.pcm:app' 2>/dev/null || true
 
 echo "[2/2] Stopping model container"
 docker_cmd rm -f "$CONTAINER" 2>/dev/null || true

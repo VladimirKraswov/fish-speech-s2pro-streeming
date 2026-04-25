@@ -359,7 +359,7 @@ RUN printf '%s\n' \
     'log "Compile args: ${COMPILE_ARGS}"' \
     'log "Server: ${API_SERVER_NAME}:${API_SERVER_PORT}"' \
     '' \
-    'exec uv run tools/api_server.py \' \
+    'exec uv run python -m fish_speech_server.app \' \
     '  --listen "${API_SERVER_NAME}:${API_SERVER_PORT}" \' \
     '  --llama-checkpoint-path "${LLAMA_CHECKPOINT_PATH}" \' \
     '  --decoder-checkpoint-path "${DECODER_CHECKPOINT_PATH}" \' \

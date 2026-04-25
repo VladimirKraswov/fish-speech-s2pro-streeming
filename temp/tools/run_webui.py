@@ -12,8 +12,8 @@ pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 from fish_speech.inference_engine import TTSInferenceEngine
 from fish_speech.generation.worker import launch_thread_safe_queue
 from fish_speech.models.dac.inference import load_model as load_decoder_model
-from tools.tts_server.services.adapter import api_tts_to_driver_request
-from tools.tts_server.schema import ServeTTSRequest
+from fish_speech_server.services.adapter import api_tts_to_driver_request
+from fish_speech_server.schema import ServeTTSRequest
 from tools.webui import build_app
 from tools.webui.inference import get_inference_wrapper
 

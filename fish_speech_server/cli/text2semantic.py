@@ -18,7 +18,7 @@ from fish_speech.generation import (
     init_model,
     load_codec_model,
 )
-from tools.tts_server.services.adapter import split_text_for_generation
+from fish_speech_server.services.adapter import split_text_for_generation
 
 
 @click.command()

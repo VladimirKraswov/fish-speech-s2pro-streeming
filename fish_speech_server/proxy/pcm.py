@@ -24,8 +24,9 @@ from fish_speech_server.config import (
     merge_frontend_proxy_override,
 )
 
+import os
 _RUNTIME = load_runtime_config()
-UPSTREAM_TTS_URL = _RUNTIME.network.upstream_tts_url
+UPSTREAM_TTS_URL = os.getenv("FISH_UPSTREAM_TTS_URL", _RUNTIME.network.upstream_tts_url)
 UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=None)
 DEFAULT_REFERENCE_ID = _RUNTIME.proxy.default_reference_id
 SESSION_TTL_SEC = _RUNTIME.proxy.session_ttl_sec

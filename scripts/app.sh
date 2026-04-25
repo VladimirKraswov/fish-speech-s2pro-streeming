@@ -9,19 +9,22 @@ COMPOSE="${COMPOSE:-docker compose}"
 cmd="${1:-help}"
 
 models() {
-  mkdir -p checkpoints/fs-1.2-int8-s2-pro-int8 checkpoints/s2-pro
+  HF_VENV="$ROOT/.venv-tools"
 
-  if ! command -v huggingface-cli >/dev/null 2>&1; then
-    python3 -m pip install -U huggingface-hub
+  if [[ ! -x "$HF_VENV/bin/huggingface-cli" ]]; then
+    python3 -m venv "$HF_VENV"
+    "$HF_VENV/bin/python" -m pip install -U pip huggingface-hub
   fi
 
-  if [[ ! -d checkpoints/fs-1.2-int8-s2-pro-int8 ]] || [[ -z "$(ls -A checkpoints/fs-1.2-int8-s2-pro-int8 2>/dev/null)" ]]; then
-    huggingface-cli download fishaudio/fs-1.2-int8-s2-pro-int8 \
+  mkdir -p checkpoints/fs-1.2-int8-s2-pro-int8 checkpoints/s2-pro
+
+  if [[ -z "$(ls -A checkpoints/fs-1.2-int8-s2-pro-int8 2>/dev/null)" ]]; then
+    "$HF_VENV/bin/huggingface-cli" download fishaudio/fs-1.2-int8-s2-pro-int8 \
       --local-dir checkpoints/fs-1.2-int8-s2-pro-int8
   fi
 
   if [[ ! -f checkpoints/s2-pro/codec.pth ]]; then
-    huggingface-cli download fishaudio/s2-pro codec.pth \
+    "$HF_VENV/bin/huggingface-cli" download fishaudio/s2-pro codec.pth \
       --local-dir checkpoints/s2-pro
   fi
 }

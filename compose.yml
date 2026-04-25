@@ -32,6 +32,8 @@ services:
       service: app-base
     build:
       target: proxy
+    environment:
+      FISH_UPSTREAM_TTS_URL: http://server:8080/v1/tts
     depends_on:
       server:
         condition: service_healthy

@@ -13,8 +13,13 @@ services:
       - ./references:/app/references
       - ./config:/app/config
     environment:
-      COMPILE: "0"
+      # COMPILE не задаём, чтобы использовалось значение из runtime.json
+      # или явно задаём COMPILE: "1"
+      COMPILE: "1"
       BACKEND: cuda
+      TORCHINDUCTOR_COMPILE_THREADS: "1"
+      TORCHDYNAMO_VERBOSE: "1"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
     deploy:
       resources:
         reservations:
@@ -24,12 +29,15 @@ services:
               capabilities: [gpu]
     ports:
       - "8080:8080"
+    # Добавляем лимиты памяти и /dev/shm (через docker-compose.override.yml или прямо здесь)
+    mem_limit: 64g
+    shm_size: 16g
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/v1/health"]
       interval: 30s
-      timeout: 10s
-      retries: 10
-      start_period: 120s
+      timeout: 30s               # увеличиваем таймаут ответа
+      retries: 20                # больше попыток
+      start_period: 900s         # 15 минут на компиляцию
 
   proxy:
     build:
@@ -58,7 +66,7 @@ services:
       dockerfile: docker/Dockerfile.webui
     image: fish-speech-webui:latest
     volumes:
-      - ./config:/app/config
+      - ./config:/app/config   # если webui использует конфиг
     ports:
       - "9001:9001"
     depends_on:

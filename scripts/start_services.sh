@@ -20,12 +20,9 @@ stop_services() {
 trap stop_services EXIT INT TERM
 
 # --------------------------------------------------
-# Запуск сервера с умным ожиданием по логам
-# --------------------------------------------------
 log_info "=== Запуск сервера (fish-speech-server) ==="
 docker compose up -d server
 
-# Убедимся, что контейнер вообще запустился
 sleep 2
 if ! docker ps --filter "name=fish-speech-server" --format "{{.Names}}" | grep -q "fish-speech-server"; then
     log_error "Контейнер server не запустился."
@@ -34,39 +31,32 @@ fi
 
 log_info "Ожидание готовности сервера (ищем 'Application startup complete' или 'Warmup done', таймаут 30 минут)..."
 
-# Функция для чтения логов и поиска нужной строки
 wait_for_server() {
-    local timeout=1800   # 30 минут
+    local timeout=1800
     local start_time=$(date +%s)
-    local log_pid=""
-
-    # Запускаем чтение логов в фоне
+    
     docker compose logs -f server 2>&1 | while read line; do
         echo "$line"
         if [[ "$line" == *"Application startup complete"* ]] || [[ "$line" == *"Warmup done"* ]]; then
-            log_info "Найдена строка готовности: $line"
-            # Убиваем процесс docker compose logs (он в подпроцессе)
+            log_info "Готовность обнаружена"
             pkill -P $$ docker compose logs 2>/dev/null || true
             return 0
         fi
+        if [[ "$line" == *"Application startup failed"* ]] || [[ "$line" == *"exited with code"* ]]; then
+            log_error "Ошибка запуска: $line"
+            pkill -P $$ docker compose logs 2>/dev/null || true
+            return 1
+        fi
     done &
-    log_pid=$!
-
-    # Ждём, пока либо найдём строку, либо истечёт таймаут
+    local log_pid=$!
+    
     while true; do
         if ! ps -p $log_pid > /dev/null 2>&1; then
-            # Потомок завершился, проверяем, успешно ли
             wait $log_pid
-            local exit_code=$?
-            if [ $exit_code -eq 0 ]; then
-                return 0
-            else
-                return 1
-            fi
+            return $?
         fi
-        local now=$(date +%s)
-        if (( now - start_time > timeout )); then
-            log_error "Таймаут: сервер не завершил инициализацию за ${timeout} секунд."
+        if (( $(date +%s) - start_time > timeout )); then
+            log_error "Таймаут ожидания готовности сервера"
             kill $log_pid 2>/dev/null || true
             return 1
         fi
@@ -75,58 +65,47 @@ wait_for_server() {
 }
 
 if wait_for_server; then
-    log_info "Сервер завершил инициализацию (компиляция/прогрев выполнены)."
+    log_info "Сервер завершил инициализацию."
 else
-    log_error "Не удалось дождаться готовности сервера."
+    log_error "Сервер не запустился корректно."
     exit 1
 fi
 
-# Даём пару секунд на появление health-эндпоинта
 sleep 5
-
-# Финальная проверка health
-log_info "Проверка HTTP health..."
+log_info "Проверка health endpoint..."
 for i in {1..30}; do
     if curl -sf http://localhost:8080/v1/health > /dev/null; then
-        log_info "Сервер здоров и готов принимать запросы."
+        log_info "Сервер здоров."
         break
     fi
     if [ $i -eq 30 ]; then
-        log_error "Сервер не отвечает на health запрос после инициализации."
+        log_error "Health check провален."
         exit 1
     fi
     sleep 2
 done
 
 # --------------------------------------------------
-# Запуск прокси
-# --------------------------------------------------
-log_info "=== Запуск прокси (fish-speech-proxy) ==="
+log_info "=== Запуск прокси ==="
 docker compose up -d proxy
-
-log_info "Ожидание готовности прокси (healthcheck)..."
 for i in {1..20}; do
     if curl -sf http://localhost:9000/health > /dev/null; then
-        log_info "Прокси здоров и готов."
+        log_info "Прокси здоров."
         break
     fi
     if [ $i -eq 20 ]; then
-        log_error "Прокси не стал здоровым за 40 секунд."
+        log_error "Прокси не стал здоровым."
         exit 1
     fi
     sleep 2
 done
 
 # --------------------------------------------------
-# Запуск WebUI
-# --------------------------------------------------
-log_info "=== Запуск WebUI (fish-speech-webui) ==="
+log_info "=== Запуск WebUI ==="
 docker compose up -d webui
-
-log_info "Ожидание готовности WebUI..."
 for i in {1..20}; do
     if curl -sf http://localhost:9001/health > /dev/null; then
-        log_info "WebUI здоров и доступен на http://localhost:9001"
+        log_info "WebUI доступен на http://localhost:9001"
         break
     fi
     if [ $i -eq 20 ]; then

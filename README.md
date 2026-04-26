@@ -5,13 +5,18 @@
 - прокси для управления сессиями и PCM‑стриминга
 - веб‑интерфейс для интерактивного тестирования
 
-Всё работает через **Docker Compose** и оптимизировано для **NVIDIA RTX 5090** (но подойдёт и для других GPU с достаточным объёмом VRAM).
+Всё работает через **Docker Compose** и оптимизировано для **NVIDIA RTX 5090** (но подойдёт для любых GPU с достаточным объёмом VRAM).
 
 ---
 
-## Быстрый старт (если уже скачаны модели и квантование)
+## Быстрый старт (если модели и референс уже подготовлены)
 
-Если у вас уже есть папка `checkpoints/fs-1.2-int8-s2-pro-int8` (int8‑квантованная модель) и `checkpoints/s2-pro/codec.pth`, а также подготовлен референсный голос в `references/voice/voice.codes.pt` и `references/voice/voice.lab`, то достаточно выполнить:
+Если у вас уже есть:
+- `checkpoints/fs-1.2-int8-s2-pro-int8/model.pth` (int8‑квантованная модель)
+- `checkpoints/s2-pro/codec.pth`
+- `references/voice/voice.codes.pt` и `references/voice/voice.lab`
+
+то запуск одной командой:
 
 ```bash
 git clone <url-репозитория>
@@ -19,11 +24,14 @@ cd fish-speech-s2pro-streeming
 docker compose up -d
 ```
 
-Через минуту сервер будет доступен на `http://localhost:8080`, прокси на `http://localhost:9000`, WebUI на `http://localhost:9001`.
+Через 1–2 минуты сервисы будут доступны:
+- TTS сервер: `http://localhost:8080`
+- Прокси: `http://localhost:9000`
+- WebUI: `http://localhost:9001`
 
 ---
 
-## Полная установка с нуля (подготовка моделей и референса)
+## Полная установка с нуля
 
 ### 1. Требования
 
@@ -33,17 +41,15 @@ docker compose up -d
 - **Python 3.10+** и **uv** (для вспомогательных скриптов)
 - **ffmpeg** (для конвертации аудио)
 
-### 2. Клонирование и установка локальных зависимостей
+### 2. Клонирование и локальные зависимости
 
 ```bash
 git clone <url>
 cd fish-speech-s2pro-streeming
-uv sync --extra cu129   # или просто python -m venv .venv && source .venv/bin/activate && pip install -e .[cu129]
+uv sync --extra cu129   # или python -m venv .venv && source .venv/bin/activate && pip install -e .[cu129]
 ```
 
 ### 3. Сборка Docker‑образов
-
-В проекте три сервиса: `server`, `proxy`, `webui`. Для удобства они собираются одной командой:
 
 ```bash
 docker compose build
@@ -51,7 +57,7 @@ docker compose build
 
 ### 4. Скачивание исходной модели (s2-pro)
 
-Модель **s2-pro** нужна для получения кодека `codec.pth` и весов текстовой модели (которую мы потом квантуем). Скачайте её через `huggingface-cli` (можно запустить из временного контейнера):
+Модель **s2-pro** содержит кодек `codec.pth` и веса текстовой модели (которые мы потом квантуем). Скачайте через `huggingface-cli` (запуск из временного контейнера):
 
 ```bash
 mkdir -p checkpoints/s2-pro
@@ -63,7 +69,7 @@ docker run --rm -v "$PWD":/workspace -w /workspace \
 
 ### 5. Квантизация текстовой модели в int8
 
-Для RTX 5090 настоятельно рекомендуется использовать **int8 weight‑only** квантизацию. Она заметно снижает потребление VRAM. Запустите скрипт `tools/llama/quantize.py` внутри контейнера:
+Для RTX 5090 настоятельно рекомендуется **int8 weight‑only** квантизация – она сильно снижает потребление VRAM.
 
 ```bash
 docker run --rm --user root -v "$PWD":/workspace -w /workspace \
@@ -77,26 +83,26 @@ docker run --rm --user root -v "$PWD":/workspace -w /workspace \
 sudo chown -R $USER:$USER checkpoints/fs-1.2-int8-s2-pro-int8
 ```
 
-После этого в `checkpoints/fs-1.2-int8-s2-pro-int8` появится `model.pth` (квантованные веса).
+Результат: `checkpoints/fs-1.2-int8-s2-pro-int8/model.pth`.
 
 ### 6. Подготовка референсного голоса
 
-Поместите ваш образец речи (один голос, 5–15 секунд, без шумов, моно 44100 Гц) в папку `input_ref` вместе с текстовой расшифровкой:
+Положите образец речи (5–15 секунд, моно, 44100 Гц, без шумов) в папку `input_ref` вместе с текстовой расшифровкой:
 
 ```bash
 mkdir -p input_ref
-# положите voice.wav и voice.lab (текст)
+# voice.wav и voice.lab
 ```
 
-Если исходный файл не WAV или длиннее 15 секунд, приведите к нужному формату через `ffmpeg`:
+Если исходный файл не WAV или длиннее 15 секунд, приведите к формату:
 
 ```bash
 ffmpeg -i my_voice.mp3 -ac 1 -ar 44100 -c:a pcm_s16le -ss 0 -t 15 input_ref/voice.wav
 ```
 
-### 7. Предварительное кодирование референса в `.codes.pt`
+### 7. Предварительное кодирование референса (`.codes.pt`)
 
-Чтобы сервер не кодировал референс при каждом запуске, переведите его в готовые токены:
+Чтобы сервер не тратил время на кодирование при каждом запуске:
 
 ```bash
 docker run --rm -v "$PWD":/workspace -w /workspace --user root \
@@ -109,108 +115,144 @@ docker run --rm -v "$PWD":/workspace -w /workspace --user root \
     --device cpu
 ```
 
-В результате появится папка `references/voice` с файлами `voice.codes.pt` и `voice.lab`.
+Появится папка `references/voice` с `voice.codes.pt` и `voice.lab`.
 
 ### 8. Настройка конфигурации
 
-Отредактируйте `config/runtime.json` под свои предпочтения. **Важные параметры для RTX 5090**:
+Отредактируйте `config/runtime.json`. **Важные параметры для RTX 5090**:
 
-- `model.compile = false` (для стабильности и быстрого старта; если очень нужна компиляция, включите, но увеличьте `healthcheck.start_period` до 600 с)
+- `model.compile`: `true` – включает JIT‑компиляцию (ускоряет инференс, но первый запуск может длиться 10–15 минут).  
+  `false` – быстрый старт, чуть ниже производительность.
 - `model.precision = "bfloat16"`
 - `model.cache_max_seq_len = 768`
-- `playback.target_emit_bytes = 6144`, `start_buffer_ms = 120`
-- `commit.first.*` и `commit.next.*` – настройки, уменьшающие рваную интонацию
-
-**Прокси** читает `frontend_overrides.allowed_paths`. Чтобы избежать ошибок 400 при работе WebUI, либо добавьте в `allowed_paths` все поля из конфига WebUI, либо просто отключите проверку: `"enabled": false`. Мы рекомендуем отключить проверку для простоты.
+- `playback.target_emit_bytes = 6144`, `playback.start_buffer_ms = 120`
+- `frontend_overrides.enabled = false` – отключает проверку полей (избавляет от ошибок 400 при работе WebUI). Рекомендуется.
 
 ### 9. Запуск всех сервисов
 
-```bash
-docker compose up -d
-```
-
-Скрипт ожидания готовности (опционально) можно использовать из `scripts/start_services.sh` (он последовательно проверяет health каждого сервиса). Убедитесь, что файл исполняемый:
+Используйте **умный скрипт запуска**, который ждёт реальной готовности (особенно важно при `compile: true`):
 
 ```bash
 chmod +x scripts/start_services.sh
 ./scripts/start_services.sh
 ```
 
-### 10. Проверка
+Скрипт:
+- запускает сервер, читает его логи и ждёт строк `Application startup complete` или `Warmup done`
+- затем проверяет health endpoint
+- после этого запускает прокси и WebUI
+
+Если вы предпочитаете ручной запуск (без ожидания компиляции):
 
 ```bash
-curl http://localhost:8080/v1/health        # должен вернуть {"status":"ok"}
+docker compose up -d
+```
+
+### 10. Проверка работоспособности
+
+```bash
+curl http://localhost:8080/v1/health        # {"status":"ok"}
 curl http://localhost:9000/health           # {"ok":true,...}
 curl http://localhost:9001/health           # {"status":"ok","service":"web-ui"}
 ```
 
-Откройте в браузере `http://ваш-сервер:9001`. Там можно открыть сессию, ввести текст, запустить стриминг и услышать синтезированную речь.
+Откройте в браузере `http://<IP-сервера>:9001` – появится интерфейс для ввода текста и потокового синтеза.
 
 ---
 
 ## Управление сервисами
 
-- Останов: `docker compose down`
-- Перезапуск: `docker compose restart`
-- Просмотр логов: `docker compose logs -f [service]`
+- `docker compose down` – остановка всех
+- `docker compose restart [service]` – перезапуск
+- `docker compose logs -f [service]` – просмотр логов
 
-Если вы меняете `config/runtime.json` на хосте, перезапустите прокси и сервер, чтобы изменения вступили в силу (благодаря монтированию тома `./config:/app/config`).
+**Изменение конфигурации:**  
+Благодаря тому, что в `compose.yml` добавлен volume `./config:/app/config`, вы можете править `config/runtime.json` на хосте, а затем перезапустить контейнеры – изменения вступят в силу без пересборки образов.
+
+```bash
+docker compose restart server proxy
+```
 
 ---
 
 ## Устранение типичных проблем
 
-### 1. Сервер не отвечает, контейнер не healthy
+### 1. Сервер не становится healthy при `compile: true`
 
-- Проверьте логи: `docker compose logs server --tail 50`
-- Убедитесь, что `checkpoints/fs-1.2-int8-s2-pro-int8/model.pth` и `checkpoints/s2-pro/codec.pth` существуют.
-- Если включена компиляция (`COMPILE=1`), увеличьте `start_period` в `healthcheck` до 600 с или отключите компиляцию.
+- Используйте `scripts/start_services.sh` – он ждёт завершения компиляции по логам, а не по таймауту healthcheck.
+- Убедитесь, что контейнеру выделено достаточно памяти: в `docker-compose.override.yml` можно задать `mem_limit: 32g` и `shm_size: 8g`.
+- Если компиляция падает с ошибками подпроцессов, добавьте `environment: TORCHINDUCTOR_COMPILE_THREADS: 1` (уже есть в `compose.yml`).
 
 ### 2. Прокси падает с `ModuleNotFoundError: No module named 'fish_speech'`
 
-Образ прокси должен включать установку основного пакета `fish-speech`. Исправленный `docker/Dockerfile.proxy` приведён в репозитории. Пересоберите его:
+Образ прокси собирается с установкой основного пакета `fish-speech`. Проверьте, что `docker/Dockerfile.proxy` содержит строки:
 
-```bash
-docker compose build --no-cache proxy
+```dockerfile
+COPY pyproject.toml .
+COPY fish_speech ./fish_speech
+COPY fish_speech_server ./fish_speech_server
+RUN pip install --no-cache-dir -e .[cpu]
 ```
+
+Пересоберите прокси: `docker compose build --no-cache proxy`.
 
 ### 3. WebUI возвращает 400 при открытии сессии (disallowed paths)
 
-Либо отключите проверку в `config/runtime.json`: `"frontend_overrides": { "enabled": false }`, либо добавьте недостающие пути в `allowed_paths`. После изменения перезапустите прокси.
+Отключите проверку полей в `config/runtime.json`:
 
-### 4. Порты 9000 или 8080 уже заняты
+```json
+"frontend_overrides": {
+  "enabled": false,
+  ...
+}
+```
 
-Найдите и убейте процесс, занимающий порт, или измените маппинг портов в `compose.yml`.
+Затем перезапустите прокси: `docker compose restart proxy`.
 
----
+### 4. Порты 8080/9000/9001 уже заняты
 
-## Структура проекта (важные файлы)
-
-- `compose.yml` – основной файл оркестрации Docker.
-- `docker/Dockerfile.server`, `Dockerfile.proxy`, `Dockerfile.webui` – образы сервисов.
-- `config/runtime.json` – единая конфигурация для сервера и прокси (монтируется в контейнеры).
-- `checkpoints/` – модели (монтируются).
-- `references/` – референсные голоса (монтируются).
-- `tools/` – утилиты для квантизации, предкодирования, тестовый клиент.
-- `scripts/start_services.sh` – пошаговый запуск с ожиданием health.
+Найдите и убейте процесс, занимающий порт, либо измените маппинг в `compose.yml` (например, `"8081:8080"`).
 
 ---
 
-## Требования к RTX 5090 (и другим GPU)
+## Структура проекта (основные файлы)
 
-- **VRAM**: ~8–10 ГБ для int8‑квантованной модели + кодек. При 24 ГБ (5090) работает без проблем.
-- **RAM хоста**: 32 ГБ рекомендуется для компиляции (если она включена). При `COMPILE=0` достаточно 16 ГБ.
+```
+.
+├── compose.yml                     # оркестрация Docker
+├── docker/
+│   ├── Dockerfile.server           # образ сервера TTS
+│   ├── Dockerfile.proxy            # образ прокси
+│   └── Dockerfile.webui            # образ WebUI
+├── config/
+│   └── runtime.json                # единый конфиг (монтируется)
+├── checkpoints/                    # модели (монтируются)
+├── references/                     # референсные голоса (монтируются)
+├── tools/                          # утилиты (квантизация, preencode)
+├── scripts/
+│   └── start_services.sh           # умный запуск с ожиданием
+└── fish_speech_server/             # исходный код TTS сервера
+```
+
+---
+
+## Требования к оборудованию
+
+- **VRAM**: ~8–10 ГБ для int8‑квантованной модели + кодек. На RTX 5090 (24 ГБ) работает отлично.
+- **RAM хоста**: 16 ГБ при `compile: false`, 32 ГБ рекомендуется при `compile: true`.
 - **Драйверы NVIDIA**: версия 545+.
+- **Docker**: с поддержкой GPU (NVIDIA Container Toolkit).
 
 ---
 
 ## Заключение
 
-Проект полностью работоспособен и готов к использованию. Основные рекомендации:
+Проект полностью работоспособен. Рекомендации:
 
-- Используйте **int8** квантизацию.
-- Отключайте компиляцию (`COMPILE=0`), если не нужна максимальная скорость после прогрева.
-- Монтируйте `config` для быстрой смены параметров.
-- Пользуйтесь WebUI для удобного тестирования стриминга.
+- **Используйте int8 квантизацию** – экономит VRAM.
+- **Для быстрого старта отключайте компиляцию** (`compile: false`).
+- **Для максимальной производительности** включайте компиляцию и запускайте через `start_services.sh`.
+- **Монтирование `config`** позволяет легко менять параметры без пересборки.
+- **WebUI** удобен для тестирования стриминга и сессий.
 
-При возникновении проблем сверяйтесь с логами и проверяйте пути к моделям и референсам.
+При возникновении проблем сверяйтесь с логами (`docker compose logs`) и проверяйте пути к моделям и референсам.

@@ -30,6 +30,7 @@ dependencies = [
     "resampy>=0.4.0",
     "lightning-utilities",
     "descript-audio-codec>=1.0.0",
+    "loralib",
 ]
 
 [project.optional-dependencies]

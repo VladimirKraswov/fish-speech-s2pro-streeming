@@ -32,11 +32,57 @@ models() {
   fi
 }
 
+setup_env() {
+  VENV_DIR="$ROOT/.venv"
+
+  if [[ ! -d "$VENV_DIR" ]]; then
+    echo "Creating virtual environment in $VENV_DIR..."
+    if command -v uv &> /dev/null; then
+      uv venv "$VENV_DIR"
+    else
+      python3 -m venv "$VENV_DIR"
+    fi
+  fi
+
+  # Upgrade pip and install dependencies
+  if command -v uv &> /dev/null; then
+    uv pip install pip
+    "$VENV_DIR/bin/python" -m pip install --upgrade pip
+  else
+    "$VENV_DIR/bin/python" -m pip install --upgrade pip
+  fi
+
+  # Detect UV_EXTRA
+  if [[ -z "${UV_EXTRA:-}" ]]; then
+    if command -v nvidia-smi &> /dev/null; then
+      UV_EXTRA="cu129"
+    else
+      UV_EXTRA="cpu"
+    fi
+  fi
+
+  echo "Installing dependencies with UV_EXTRA=$UV_EXTRA..."
+  if command -v uv &> /dev/null; then
+    uv pip install -e ".[$UV_EXTRA]"
+  else
+    "$VENV_DIR/bin/python" -m pip install -e ".[$UV_EXTRA]"
+  fi
+
+  # Download models
+  models
+}
+
 case "$cmd" in
   install)
     models
     $COMPOSE build
     $COMPOSE up -d
+    ;;
+  setup)
+    setup_env
+    ;;
+  verify)
+    bash scripts/verify_env.sh
     ;;
   models)
     models
@@ -71,7 +117,7 @@ case "$cmd" in
     docker builder prune -f
     ;;
   *)
-    echo "Usage: $0 {install|models|build|up|down|restart|logs|status|clean}"
+    echo "Usage: $0 {setup|verify|install|models|build|up|down|restart|logs|status|clean}"
     exit 1
     ;;
 esac

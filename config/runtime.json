@@ -20,7 +20,7 @@
   "model": {
     "device": "cuda",
     "precision": "bfloat16",
-    "compile": false,
+    "compile": true,
     "cache_max_seq_len": 768,
     "max_new_tokens_cap": 160,
     "sdpa_math": false,

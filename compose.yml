@@ -57,6 +57,8 @@ services:
       context: .
       dockerfile: docker/Dockerfile.webui
     image: fish-speech-webui:latest
+    volumes:
+      - ./config:/app/config
     ports:
       - "9001:9001"
     depends_on:

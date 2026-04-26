@@ -2,13 +2,14 @@ FROM python:3.12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends curl libsox-dev ffmpeg && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
-# Копируем всё необходимое для установки пакета fish-speech
+# Копируем необходимые файлы проекта
 COPY pyproject.toml .
 COPY fish_speech ./fish_speech
 COPY fish_speech_server ./fish_speech_server
+COPY config ./config
 
-# Устанавливаем основной пакет с CPU-версией torch (прокси не использует GPU)
-RUN pip install --no-cache-dir .[cpu]
+# Устанавливаем основной пакет в режиме editable (чтобы подхватывались зависимости)
+RUN pip install --no-cache-dir -e .[cpu]
 
 # Устанавливаем дополнительные зависимости прокси
 COPY fish_speech_server/proxy/requirements.txt .

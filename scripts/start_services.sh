@@ -4,79 +4,94 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-# Цвета для логов
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-log_info() {
-    echo -e "${GREEN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
-}
-
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1" >&2
-}
-
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
-}
-
-# Функция ожидания HTTP-эндпоинта
-wait_for_http() {
-    local url="$1"
-    local service_name="$2"
-    local max_attempts="${3:-60}"      # по умолчанию 60 попыток
-    local delay="${4:-5}"              # пауза между попытками 5 секунд
-
-    log_info "Ожидание готовности сервиса $service_name (URL: $url)"
-    local attempt=1
-    while [ $attempt -le $max_attempts ]; do
-        if curl -sf "$url" >/dev/null 2>&1; then
-            log_info "Сервис $service_name готов (ответ на $url)"
-            return 0
-        fi
-        log_warn "Сервис $service_name ещё не готов, попытка $attempt из $max_attempts"
-        sleep "$delay"
-        ((attempt++))
-    done
-    log_error "Сервис $service_name не ответил за $((max_attempts * delay)) секунд"
-    exit 1
-}
+log_info() { echo -e "${GREEN}[INFO]${NC} $(date '+%H:%M:%S') - $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $(date '+%H:%M:%S') - $1" >&2; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $(date '+%H:%M:%S') - $1"; }
 
 # Остановка всех сервисов при ошибке
 stop_services() {
     log_info "Остановка всех сервисов..."
     docker compose down --remove-orphans
 }
-
-# Перехват сигналов для корректной остановки
 trap stop_services EXIT INT TERM
 
-# 1. Запуск сервера (основная модель)
-log_info "=== ШАГ 1: Запуск сервера (fish-speech-server) ==="
+# --------------------------------------------
+# 1. Запуск сервера с умным ожиданием по логам
+# --------------------------------------------
+log_info "=== Запуск сервера (fish-speech-server) ==="
 docker compose up -d server
-log_info "Ожидание полной инициализации сервера (включая возможную компиляцию и прогрев)..."
-wait_for_http "http://localhost:8080/v1/health" "Fish-Speech Server" 120 5
-log_info "Сервер здоров и готов принимать запросы."
 
-# 2. Запуск прокси (зависит от сервера)
-log_info "=== ШАГ 2: Запуск прокси (fish-speech-proxy) ==="
+log_info "Ожидание готовности сервера (читаем логи, ищем 'Application startup complete' или 'Warmup done')..."
+# Таймаут 30 минут (1800 секунд) – запас под компиляцию
+timeout 1800 docker compose logs -f server 2>&1 | grep -q -E "Application startup complete|Warmup done"
+
+if [ $? -eq 0 ]; then
+    log_info "Сервер завершил инициализацию (компиляция/прогрев выполнены)."
+else
+    log_error "Сервер не завершил инициализацию за 30 минут. Проверьте логи."
+    exit 1
+fi
+
+# Даём пару секунд на появление health-эндпоинта
+sleep 5
+
+# Финальная проверка health
+log_info "Проверка HTTP health..."
+for i in {1..30}; do
+    if curl -sf http://localhost:8080/v1/health > /dev/null; then
+        log_info "Сервер здоров и готов принимать запросы."
+        break
+    fi
+    if [ $i -eq 30 ]; then
+        log_error "Сервер не отвечает на health запрос после инициализации."
+        exit 1
+    fi
+    sleep 2
+done
+
+# --------------------------------------------
+# 2. Запуск прокси
+# --------------------------------------------
+log_info "=== Запуск прокси (fish-speech-proxy) ==="
 docker compose up -d proxy
-log_info "Ожидание готовности прокси..."
-wait_for_http "http://localhost:9000/health" "Fish-Speech Proxy" 30 3
-log_info "Прокси здоров и готов."
 
+log_info "Ожидание готовности прокси (healthcheck)..."
+for i in {1..20}; do
+    if curl -sf http://localhost:9000/health > /dev/null; then
+        log_info "Прокси здоров и готов."
+        break
+    fi
+    if [ $i -eq 20 ]; then
+        log_error "Прокси не стал здоровым за 40 секунд."
+        exit 1
+    fi
+    sleep 2
+done
+
+# --------------------------------------------
 # 3. Запуск WebUI
-log_info "=== ШАГ 3: Запуск WebUI (fish-speech-webui) ==="
+# --------------------------------------------
+log_info "=== Запуск WebUI (fish-speech-webui) ==="
 docker compose up -d webui
+
 log_info "Ожидание готовности WebUI..."
-wait_for_http "http://localhost:9001/health" "Fish-Speech WebUI" 30 3
-log_info "WebUI здоров и доступен по адресу http://localhost:9001"
+for i in {1..20}; do
+    if curl -sf http://localhost:9001/health > /dev/null; then
+        log_info "WebUI здоров и доступен на http://localhost:9001"
+        break
+    fi
+    if [ $i -eq 20 ]; then
+        log_error "WebUI не стал здоровым."
+        exit 1
+    fi
+    sleep 2
+done
 
 log_info "=== ВСЕ СЕРВИСЫ УСПЕШНО ЗАПУЩЕНЫ ==="
-log_info "Проверка статуса:"
 docker compose ps
-
-# Отключаем trap, чтобы при выходе не останавливать сервисы (они должны работать)
 trap - EXIT INT TERM

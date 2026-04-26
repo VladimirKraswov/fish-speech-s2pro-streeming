@@ -1,39 +1,29 @@
-import { useState, useEffect, useRef } from 'preact/hooks';
-import { Dashboard } from './components/Dashboard';
-import { SessionManager } from './components/SessionManager';
-import { Streamer } from './components/Streamer';
-import { EventLog } from './components/EventLog';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { FishProxyClient } from './api/client';
 import { AudioEngine } from './audio/engine';
-import { LLMSimulator } from './lib/simulator';
-import type { StreamEvent, CommittedItem } from './types';
+import { LLMSimulator, type ChunkMode } from './lib/simulator';
+import type { CommittedItem, StreamEvent } from './types';
 import './app.css';
 
 const PROXY_URL = `http://${window.location.hostname}:9000`;
 const SERVER_URL = `http://${window.location.hostname}:8080`;
 
-const DEFAULT_CONFIG = {
-    commit: {
-        first: {
-            min_chars: 40,
-            target_chars: 58,
-            max_chars: 84,
-            max_wait_ms: 150,
-            allow_partial_after_ms: 240
-        },
-        next: {
-            min_chars: 120,
-            target_chars: 160,
-            max_chars: 240,
-            max_wait_ms: 340,
-            allow_partial_after_ms: 600
-        },
+const DEFAULT_TEXT =
+  'Встретил он по дороге Зайчика, Волка и Медведя, спел им свою песенку и убежал от них. Катился дальше Колобок и повстречалась ему Лисичка. Она и говорит: Колобок, Колобок, какая у тебя красивая песенка.';
+
+const PRESETS = {
+  balanced: {
+    title: 'Balanced',
+    config: {
+      commit: {
+        first: { min_chars: 40, target_chars: 58, max_chars: 84, max_wait_ms: 150, allow_partial_after_ms: 240 },
+        next: { min_chars: 120, target_chars: 160, max_chars: 240, max_wait_ms: 340, allow_partial_after_ms: 600 },
         flush_on_sentence_punctuation: true,
         flush_on_clause_punctuation: true,
         flush_on_newline: true,
         carry_incomplete_tail: true
-    },
-    tts: {
+      },
+      tts: {
         reference_id: 'voice',
         max_new_tokens: 160,
         chunk_length: 160,
@@ -42,220 +32,436 @@ const DEFAULT_CONFIG = {
         temperature: 0.7,
         initial_stream_chunk_size: 10,
         stream_chunk_size: 8
-    },
-    playback: {
-        target_emit_bytes: 6144,
-        start_buffer_ms: 120,
-        stop_grace_ms: 60
-    },
-    session: {
-        max_buffer_chars: 4000,
-        auto_close_on_finish: false
+      },
+      playback: { target_emit_bytes: 6144, start_buffer_ms: 120, stop_grace_ms: 60 },
+      session: { max_buffer_chars: 4000, auto_close_on_finish: false }
     }
+  },
+  lowLatency: {
+    title: 'Low latency',
+    config: {
+      commit: {
+        first: { min_chars: 24, target_chars: 42, max_chars: 68, max_wait_ms: 100, allow_partial_after_ms: 170 },
+        next: { min_chars: 70, target_chars: 110, max_chars: 170, max_wait_ms: 240, allow_partial_after_ms: 420 },
+        flush_on_sentence_punctuation: true,
+        flush_on_clause_punctuation: true,
+        flush_on_newline: true,
+        carry_incomplete_tail: true
+      },
+      tts: {
+        reference_id: 'voice',
+        max_new_tokens: 128,
+        chunk_length: 140,
+        top_p: 0.78,
+        repetition_penalty: 1.12,
+        temperature: 0.7,
+        initial_stream_chunk_size: 8,
+        stream_chunk_size: 6
+      },
+      playback: { target_emit_bytes: 4096, start_buffer_ms: 80, stop_grace_ms: 40 },
+      session: { max_buffer_chars: 4000, auto_close_on_finish: false }
+    }
+  },
+  stable: {
+    title: 'Stable',
+    config: {
+      commit: {
+        first: { min_chars: 60, target_chars: 90, max_chars: 130, max_wait_ms: 250, allow_partial_after_ms: 420 },
+        next: { min_chars: 150, target_chars: 220, max_chars: 300, max_wait_ms: 520, allow_partial_after_ms: 900 },
+        flush_on_sentence_punctuation: true,
+        flush_on_clause_punctuation: true,
+        flush_on_newline: true,
+        carry_incomplete_tail: true
+      },
+      tts: {
+        reference_id: 'voice',
+        max_new_tokens: 180,
+        chunk_length: 180,
+        top_p: 0.78,
+        repetition_penalty: 1.12,
+        temperature: 0.7,
+        initial_stream_chunk_size: 12,
+        stream_chunk_size: 10
+      },
+      playback: { target_emit_bytes: 8192, start_buffer_ms: 180, stop_grace_ms: 80 },
+      session: { max_buffer_chars: 4000, auto_close_on_finish: false }
+    }
+  }
 };
 
+type Health = any;
+
+function jsonPretty(value: unknown) {
+  return JSON.stringify(value, null, 2);
+}
+
+function StatusPill({ label, health }: { label: string; health: Health }) {
+  const ok = health && (health.ok || health.status === 'ok');
+  const loading = health === null;
+  return (
+    <div class={`status-pill ${ok ? 'ok' : loading ? 'loading' : 'bad'}`}>
+      <span class="dot" />
+      <span>{label}</span>
+      <b>{loading ? 'checking' : ok ? 'online' : 'offline'}</b>
+    </div>
+  );
+}
+
 export function App() {
-    const [proxyHealth, setProxyHealth] = useState<any>(null);
-    const [serverHealth, setServerHealth] = useState<any>(null);
-    const [webUiHealth, setWebUiHealth] = useState<any>(null);
-    const [audioStatus, setAudioStatus] = useState('idle');
-    const [sessionId, setSessionId] = useState<string | null>(null);
-    const [sessionStatus, setSessionStatus] = useState('idle');
-    const [configText, setConfigText] = useState(JSON.stringify(DEFAULT_CONFIG, null, 2));
-    const [logs, setLogs] = useState<string[]>([]);
-    const [isStreaming, setIsStreaming] = useState(false);
-    const [committedItems, setCommittedItems] = useState<CommittedItem[]>([]);
+  const [proxyHealth, setProxyHealth] = useState<Health>(null);
+  const [serverHealth, setServerHealth] = useState<Health>(null);
+  const [webUiHealth, setWebUiHealth] = useState<Health>(null);
 
-    const client = useRef(new FishProxyClient(PROXY_URL));
-    const audioEngine = useRef(new AudioEngine(setAudioStatus, (event) => handleStreamEvent(event)));
-    const simulator = useRef<LLMSimulator | null>(null);
-    const abortController = useRef<AbortController | null>(null);
+  const [preset, setPreset] = useState<keyof typeof PRESETS>('balanced');
+  const [configText, setConfigText] = useState(jsonPretty(PRESETS.balanced.config));
+  const [text, setText] = useState(DEFAULT_TEXT);
+  const [mode, setMode] = useState<ChunkMode>('words');
+  const [minSize, setMinSize] = useState(3);
+  const [maxSize, setMaxSize] = useState(8);
+  const [intervalMs, setIntervalMs] = useState(100);
 
-    const log = (msg: string) => {
-        const time = new Date().toLocaleTimeString();
-        setLogs(prev => [...prev, `[${time}] ${msg}`]);
-    };
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessionStatus, setSessionStatus] = useState('idle');
+  const [audioStatus, setAudioStatus] = useState('idle');
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [committed, setCommitted] = useState<CommittedItem[]>([]);
+  const [activeCommit, setActiveCommit] = useState<string>('');
+  const [logs, setLogs] = useState<string[]>([]);
 
-    const handleStreamEvent = (event: StreamEvent) => {
-        if (event.type === 'commit_start') {
-            log(`TTS Commit Start: ${event.text.slice(0, 30)}...`);
-        } else if (event.type === 'commit_done') {
-            log(`TTS Commit Done: #${event.commit_seq}`);
-        } else if (event.type === 'error') {
-            log(`Stream error: ${event.message}`);
-        }
-    };
+  const client = useRef(new FishProxyClient(PROXY_URL));
+  const abortController = useRef<AbortController | null>(null);
+  const simulator = useRef<LLMSimulator | null>(null);
 
-    const refreshHealth = async () => {
-        try {
-            const ph = await client.current.getHealth();
-            setProxyHealth(ph);
-        } catch { setProxyHealth({ ok: false }); }
+  const log = (message: string) => {
+    const time = new Date().toLocaleTimeString();
+    setLogs((prev) => [...prev.slice(-160), `[${time}] ${message}`]);
+  };
 
-        try {
-            const sh = await fetch(`${SERVER_URL}/v1/health`).then(r => r.json());
-            setServerHealth(sh);
-        } catch { setServerHealth({ ok: false }); }
+  const onStreamEvent = (event: StreamEvent) => {
+    if (event.type === 'commit_start') {
+      setActiveCommit(event.text || '');
+      log(`commit #${event.commit_seq} started`);
+    }
+    if (event.type === 'commit_done') {
+      setActiveCommit('');
+      log(`commit #${event.commit_seq} done`);
+    }
+    if (event.type === 'error') {
+      log(`stream error: ${event.message}`);
+    }
+    if (event.type === 'session_done') {
+      setSessionStatus('finished');
+      setIsStreaming(false);
+      log('session done');
+    }
+  };
 
-        try {
-            const wh = await fetch('/health').then(r => r.json());
-            setWebUiHealth(wh);
-        } catch { setWebUiHealth({ ok: false }); }
-    };
+  const audioEngine = useRef(new AudioEngine(setAudioStatus, onStreamEvent));
 
-    useEffect(() => {
-        refreshHealth();
-        const timer = setInterval(refreshHealth, 5000);
-        return () => clearInterval(timer);
-    }, []);
+  const configError = useMemo(() => {
+    try {
+      JSON.parse(configText);
+      return '';
+    } catch (error) {
+      return error instanceof Error ? error.message : 'Invalid JSON';
+    }
+  }, [configText]);
 
-    const onOpenSession = async () => {
-        try {
-            setSessionStatus('opening');
-            log('Opening session...');
-            const data = await client.current.openSession(configText);
-            setSessionId(data.session_id);
-            setSessionStatus('open');
-            log(`Session opened: ${data.session_id}`);
+  const refreshHealth = async () => {
+    try {
+      setProxyHealth(await client.current.getHealth());
+    } catch {
+      setProxyHealth({ ok: false });
+    }
 
-            abortController.current = new AbortController();
-            audioEngine.current.connectStream(
-                client.current.getStreamUrl(data.session_id),
-                abortController.current.signal
-            ).catch(e => {
-                if (e.name !== 'AbortError') log(`Audio stream error: ${e.message}`);
-            });
-        } catch (e: any) {
-            setSessionStatus('idle');
-            log(`Failed to open session: ${e.message}`);
-        }
-    };
+    try {
+      setServerHealth(await fetch(`${SERVER_URL}/v1/health`).then((r) => r.json()));
+    } catch {
+      setServerHealth({ ok: false });
+    }
 
-    const onFinishSession = async () => {
-        if (!sessionId) return;
-        try {
-            log('Finishing input...');
-            await client.current.finishSession(sessionId);
-            setSessionStatus('finishing');
-        } catch (e: any) {
-            log(`Failed to finish session: ${e.message}`);
-        }
-    };
+    try {
+      setWebUiHealth(await fetch('/health').then((r) => r.json()));
+    } catch {
+      setWebUiHealth({ ok: false });
+    }
+  };
 
-    const onCloseSession = async () => {
-        if (!sessionId) return;
-        try {
-            log('Closing session...');
-            if (abortController.current) abortController.current.abort();
-            audioEngine.current.reset();
-            await client.current.closeSession(sessionId);
-            setSessionId(null);
-            setSessionStatus('idle');
-            setCommittedItems([]);
-            log('Session closed.');
-        } catch (e: any) {
-            log(`Failed to close session: ${e.message}`);
-        }
-    };
+  useEffect(() => {
+    refreshHealth();
+    const timer = window.setInterval(refreshHealth, 5000);
+    return () => window.clearInterval(timer);
+  }, []);
 
-    const onStartStreaming = (text: string, options: any) => {
-        if (!sessionId) return;
-        setIsStreaming(true);
-        log('Starting LLM simulation...');
-        simulator.current = new LLMSimulator({
-            ...options,
-            onChunk: async (chunk: string) => {
-                try {
-                    const data = await client.current.appendText(sessionId, chunk);
-                    if (data.committed && data.committed.length > 0) {
-                        setCommittedItems(prev => [...data.committed, ...prev]);
-                    }
-                    return true;
-                } catch (e: any) {
-                    log(`Append error: ${e.message}`);
-                    return false;
-                }
-            },
-            onFinish: async () => {
-                log('Simulation finished.');
-                setIsStreaming(false);
-                await onFinishSession();
-            }
+  const applyPreset = (value: keyof typeof PRESETS) => {
+    setPreset(value);
+    setConfigText(jsonPretty(PRESETS[value].config));
+    log(`preset selected: ${PRESETS[value].title}`);
+  };
+
+  const openSession = async () => {
+    if (configError) {
+      log(`config error: ${configError}`);
+      return;
+    }
+
+    setSessionStatus('opening');
+    setCommitted([]);
+    setActiveCommit('');
+
+    try {
+      const data = await client.current.openSession(configText);
+      setSessionId(data.session_id);
+      setSessionStatus('open');
+      log(`session opened: ${data.session_id.slice(0, 8)}`);
+
+      abortController.current = new AbortController();
+      audioEngine.current
+        .connectStream(client.current.getStreamUrl(data.session_id), abortController.current.signal)
+        .catch((error) => {
+          if (error?.name !== 'AbortError') log(`audio error: ${error.message}`);
         });
-        simulator.current.start(text);
-    };
+    } catch (error) {
+      setSessionStatus('idle');
+      log(`open failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
 
-    const onStopStreaming = () => {
-        if (simulator.current) {
-            simulator.current.stop();
-            setIsStreaming(false);
-            log('Simulation stopped.');
-        }
-    };
+  const finishSession = async () => {
+    if (!sessionId) return;
+    setSessionStatus('finishing');
+    await client.current.finishSession(sessionId).catch((error) => log(`finish failed: ${error.message}`));
+  };
 
-    const onFlush = async () => {
-        if (!sessionId) return;
+  const closeSession = async () => {
+    if (!sessionId) return;
+
+    simulator.current?.stop();
+    abortController.current?.abort();
+    audioEngine.current.reset();
+
+    await client.current.closeSession(sessionId).catch((error) => log(`close failed: ${error.message}`));
+
+    setSessionId(null);
+    setSessionStatus('idle');
+    setIsStreaming(false);
+    setCommitted([]);
+    setActiveCommit('');
+    log('session closed');
+  };
+
+  const startTextStream = () => {
+    if (!sessionId || isStreaming) return;
+
+    setIsStreaming(true);
+    log('text stream started');
+
+    simulator.current = new LLMSimulator({
+      mode,
+      minSize,
+      maxSize,
+      interval: intervalMs,
+      onChunk: async (chunk) => {
         try {
-            const data = await client.current.flushSession(sessionId);
-            if (data.committed && data.committed.length > 0) {
-                setCommittedItems(prev => [...data.committed, ...prev]);
-            }
-            log('Manual flush requested.');
-        } catch (e: any) {
-            log(`Flush error: ${e.message}`);
+          const data = await client.current.appendText(sessionId, chunk);
+          if (data.committed?.length) {
+            setCommitted((prev) => [...data.committed, ...prev].slice(0, 80));
+          }
+          return true;
+        } catch (error) {
+          log(`append failed: ${error instanceof Error ? error.message : String(error)}`);
+          setIsStreaming(false);
+          return false;
         }
-    };
+      },
+      onFinish: async () => {
+        setIsStreaming(false);
+        log('text stream finished');
+        await finishSession();
+      }
+    });
 
-    return (
-        <div class="container">
-            <h1>Fish Speech — Session Stream</h1>
-            <Dashboard
-                proxyHealth={proxyHealth}
-                serverHealth={serverHealth}
-                webUiHealth={webUiHealth}
-                audioStatus={audioStatus}
-            />
+    simulator.current.start(text);
+  };
 
-            <div class="grid">
-                <SessionManager
-                    sessionId={sessionId}
-                    status={sessionStatus}
-                    configText={configText}
-                    onConfigChange={setConfigText}
-                    onOpen={onOpenSession}
-                    onFinish={onFinishSession}
-                    onClose={onCloseSession}
-                />
-                <Streamer
-                    sessionOpen={sessionStatus === 'open'}
-                    onStart={onStartStreaming}
-                    onStop={onStopStreaming}
-                    onFlush={onFlush}
-                    isStreaming={isStreaming}
-                />
-            </div>
+  const stopTextStream = () => {
+    simulator.current?.stop();
+    setIsStreaming(false);
+    log('text stream stopped');
+  };
 
-            <div class="grid">
-                <div class="card">
-                    <h3>3. Status Details</h3>
-                    <div class="small">Session: {sessionStatus}</div>
-                    <div class="small">Audio: {audioStatus}</div>
-                    {sessionId && <div class="small mono">ID: {sessionId}</div>}
-                </div>
-                <div class="card">
-                    <h3>4. Committed Segments</h3>
-                    <div class="committed-list">
-                        {committedItems.map(item => (
-                            <div key={item.seq} class="chunk">
-                                <div class="meta">#{item.seq} • {item.reason}</div>
-                                <div>{item.text}</div>
-                            </div>
-                        ))}
-                    </div>
-                </div>
-            </div>
+  const flush = async () => {
+    if (!sessionId) return;
+    try {
+      const data = await client.current.flushSession(sessionId);
+      if (data.committed?.length) {
+        setCommitted((prev) => [...data.committed, ...prev].slice(0, 80));
+      }
+      log('manual flush');
+    } catch (error) {
+      log(`flush failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
 
-            <EventLog logs={logs} />
+  return (
+    <main class="app-shell">
+      <section class="hero">
+        <div>
+          <div class="eyebrow">Fish Speech S2 Pro Streaming</div>
+          <h1>Realtime voice session console</h1>
+          <p>Управление сессией, LLM-потоком, PCM playback и диагностикой в одном нормальном интерфейсе.</p>
         </div>
-    );
+
+        <div class="hero-actions">
+          <button class="ghost" onClick={refreshHealth}>Refresh</button>
+          {!sessionId ? (
+            <button class="primary" onClick={openSession} disabled={sessionStatus === 'opening' || !!configError}>
+              Open session
+            </button>
+          ) : (
+            <button class="danger" onClick={closeSession}>Close session</button>
+          )}
+        </div>
+      </section>
+
+      <section class="status-grid">
+        <StatusPill label="Server" health={serverHealth} />
+        <StatusPill label="Proxy" health={proxyHealth} />
+        <StatusPill label="Web UI" health={webUiHealth} />
+        <div class="status-pill audio">
+          <span class="dot" />
+          <span>Audio</span>
+          <b>{audioStatus}</b>
+        </div>
+      </section>
+
+      <section class="main-grid">
+        <div class="panel composer">
+          <div class="panel-head">
+            <div>
+              <h2>Text stream</h2>
+              <p>Имитация входящего LLM текста с постепенной отправкой в proxy.</p>
+            </div>
+            <span class={`session-badge ${sessionId ? 'on' : ''}`}>{sessionStatus}</span>
+          </div>
+
+          <textarea class="text-input" value={text} onInput={(e) => setText((e.currentTarget as HTMLTextAreaElement).value)} />
+
+          <div class="controls-grid">
+            <label>
+              Mode
+              <select value={mode} onChange={(e) => setMode((e.currentTarget as HTMLSelectElement).value as ChunkMode)}>
+                <option value="chars">Chars</option>
+                <option value="words">Words</option>
+                <option value="sentences">Sentences</option>
+              </select>
+            </label>
+
+            <label>
+              Min
+              <input type="number" value={minSize} min="1" onInput={(e) => setMinSize(Number((e.currentTarget as HTMLInputElement).value))} />
+            </label>
+
+            <label>
+              Max
+              <input type="number" value={maxSize} min="1" onInput={(e) => setMaxSize(Number((e.currentTarget as HTMLInputElement).value))} />
+            </label>
+
+            <label>
+              Interval ms
+              <input type="number" value={intervalMs} min="10" onInput={(e) => setIntervalMs(Number((e.currentTarget as HTMLInputElement).value))} />
+            </label>
+          </div>
+
+          <div class="button-row">
+            <button class="primary" onClick={startTextStream} disabled={!sessionId || isStreaming}>
+              Start streaming
+            </button>
+            <button onClick={stopTextStream} disabled={!isStreaming}>Stop</button>
+            <button onClick={flush} disabled={!sessionId}>Force flush</button>
+            <button onClick={finishSession} disabled={!sessionId || sessionStatus !== 'open'}>Finish input</button>
+          </div>
+        </div>
+
+        <div class="panel config-panel">
+          <div class="panel-head">
+            <div>
+              <h2>Runtime preset</h2>
+              <p>JSON override для proxy session.</p>
+            </div>
+          </div>
+
+          <div class="preset-row">
+            {Object.entries(PRESETS).map(([key, value]) => (
+              <button
+                key={key}
+                class={preset === key ? 'selected' : ''}
+                onClick={() => applyPreset(key as keyof typeof PRESETS)}
+                disabled={!!sessionId}
+              >
+                {value.title}
+              </button>
+            ))}
+          </div>
+
+          {configError && <div class="error-box">{configError}</div>}
+
+          <textarea
+            class="config-input"
+            value={configText}
+            spellcheck={false}
+            onInput={(e) => setConfigText((e.currentTarget as HTMLTextAreaElement).value)}
+            disabled={!!sessionId}
+          />
+        </div>
+      </section>
+
+      <section class="main-grid lower">
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Committed segments</h2>
+              <p>Фразы, которые proxy уже отправил в TTS.</p>
+            </div>
+            <b>{committed.length}</b>
+          </div>
+
+          {activeCommit && (
+            <div class="active-commit">
+              <span>Now generating</span>
+              <p>{activeCommit}</p>
+            </div>
+          )}
+
+          <div class="timeline">
+            {committed.length === 0 && <div class="empty">Пока нет committed сегментов.</div>}
+            {committed.map((item) => (
+              <article class="timeline-item" key={item.seq}>
+                <div class="timeline-dot">#{item.seq}</div>
+                <div>
+                  <div class="timeline-meta">{item.reason}</div>
+                  <p>{item.text}</p>
+                </div>
+              </article>
+            ))}
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Event log</h2>
+              <p>Последние события UI/proxy/audio.</p>
+            </div>
+          </div>
+
+          <div class="log-box">
+            {logs.map((item, index) => (
+              <div key={index}>{item}</div>
+            ))}
+          </div>
+        </div>
+      </section>
+    </main>
+  );
 }

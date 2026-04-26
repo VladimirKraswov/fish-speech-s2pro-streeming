@@ -1,0 +1,133 @@
+.codebundleignore
+bundle-code.js
+fish_speech_web_ui/
+fish_speech/
+fish_speech_server/
+input_ref/
+
+
+
+# VCS / IDE
+.git/
+.github/
+.gitlab/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+.llm-lab/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# JS / frontend
+node_modules/
+dist/
+build/
+.next/
+.nuxt/
+.svelte-kit/
+.vite/
+coverage/
+public/
+assets/
+
+# Logs / temp / generated
+logs/
+log/
+tmp/
+temp/
+results/
+datasets/
+cache/
+codebundle.txt
+
+# Locks
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+uv.lock
+
+# Local/generated tools
+.project-root
+
+# Runtime / ML artifacts
+*.pkl
+*.pt
+*.pth
+*.onnx
+*.ckpt
+*.weights
+checkpoint.json
+best_genome.pkl
+neat-checkpoint-*
+
+# Archives / binaries
+*.zip
+*.rar
+*.7z
+*.tar
+*.gz
+*.bz2
+*.xz
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Media
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.ico
+*.mp4
+*.mp3
+*.wav
+*.mov
+*.avi
+
+# Fonts
+*.woff
+*.woff2
+*.ttf
+*.eot
+*.otf
+
+# Docs / noisy files
+*.pdf
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.ppt
+*.pptx
+*.txt
+
+# Optional: обычно шумно для анализа логики
+*.css
+*.scss
+*.sass
+*.less
+*.html
+
+# Markdown: README оставляем
+*.md
+# !README.md
+# !readme.md
+
+# Project specific
+fish_speech/i18n/

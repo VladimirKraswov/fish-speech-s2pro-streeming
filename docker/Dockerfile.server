@@ -1,7 +1,6 @@
 ARG CUDA_VER=12.6.0
 ARG UBUNTU_VER=24.04
 ARG UV_EXTRA=cu126
-ARG UV_VERSION=0.8.15
 ARG PY_VER=3.12
 
 FROM ghcr.io/astral-sh/uv:0.8.15 AS uv-bin
@@ -31,3 +30,60 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=uv-bin /uv /uvx /bin/
+
+WORKDIR /app
+
+COPY pyproject.toml README.md ./
+COPY uv.lock* ./
+
+RUN --mount=type=cache,target=/tmp/uv-cache \
+    uv python pin ${PY_VER} \
+    && if [ -f uv.lock ]; then \
+         uv sync --extra ${UV_EXTRA} --frozen --no-install-project; \
+       else \
+         uv sync --extra ${UV_EXTRA} --no-install-project; \
+       fi
+
+COPY . .
+
+RUN --mount=type=cache,target=/tmp/uv-cache \
+    if [ -f uv.lock ]; then \
+      uv sync --extra ${UV_EXTRA} --frozen; \
+    else \
+      uv sync --extra ${UV_EXTRA}; \
+    fi
+
+RUN mkdir -p /app/.torchinductor /app/checkpoints /app/references
+
+RUN cat > /app/start_server.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ARGS=(
+  uv run python -m fish_speech_server.app
+  --listen "${API_SERVER_NAME:-0.0.0.0}:${API_SERVER_PORT:-8080}"
+  --llama-checkpoint-path "${LLAMA_CHECKPOINT_PATH:-/app/checkpoints/fs-1.2-int8-s2-pro-int8}"
+  --decoder-checkpoint-path "${DECODER_CHECKPOINT_PATH:-/app/checkpoints/s2-pro/codec.pth}"
+  --decoder-config-name "${DECODER_CONFIG_NAME:-modded_dac_vq}"
+)
+
+if [[ "${COMPILE:-0}" == "1" || "${COMPILE:-false}" == "true" ]]; then
+  ARGS+=(--compile)
+fi
+
+if [[ "${BACKEND:-cuda}" == "cpu" ]]; then
+  ARGS+=(--device cpu)
+fi
+
+echo "[server] COMPILE=${COMPILE:-0}"
+echo "[server] BACKEND=${BACKEND:-cuda}"
+echo "[server] UV_EXTRA=${UV_EXTRA:-}"
+echo "[server] CMD=${ARGS[*]}"
+
+exec "${ARGS[@]}"
+EOF
+
+RUN chmod +x /app/start_server.sh
+
+EXPOSE 8080
+ENTRYPOINT ["/app/start_server.sh"]

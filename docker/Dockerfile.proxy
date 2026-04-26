@@ -1,10 +1,18 @@
 FROM python:3.12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends curl libsox-dev ffmpeg && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
+
+# Копируем всё необходимое для установки пакета fish-speech
+COPY pyproject.toml .
+COPY fish_speech ./fish_speech
+COPY fish_speech_server ./fish_speech_server
+
+# Устанавливаем основной пакет с CPU-версией torch (прокси не использует GPU)
+RUN pip install --no-cache-dir .[cpu]
+
+# Устанавливаем дополнительные зависимости прокси
 COPY fish_speech_server/proxy/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-# Явно устанавливаем ormsgpack, так как он часто пропускается
-RUN pip install --no-cache-dir ormsgpack
-COPY fish_speech_server fish_speech_server
+
 ENV FISH_UPSTREAM_TTS_URL=http://server:8080/v1/tts
 CMD ["uvicorn", "fish_speech_server.proxy.pcm:app", "--host", "0.0.0.0", "--port", "9000"]

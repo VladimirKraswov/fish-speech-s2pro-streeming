@@ -21,7 +21,7 @@ COPY . .
 RUN python3.11 -m venv /app/venv \
     && /app/venv/bin/pip install --no-cache-dir -U pip \
     && /app/venv/bin/pip install --no-cache-dir -e ".[${UV_EXTRA}]" --extra-index-url https://download.pytorch.org/whl/${UV_EXTRA} \
-    && /app/venv/bin/pip install --no-cache-dir lightning-utilities
+    && /app/venv/bin/pip install --no-cache-dir lightning-utilities loralib
 
 EXPOSE 8080
 

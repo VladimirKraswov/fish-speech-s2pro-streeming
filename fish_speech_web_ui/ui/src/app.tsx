@@ -264,9 +264,9 @@ export function App() {
       onChunk: async (chunk) => {
         try {
           const data = await client.current.appendText(sessionId, chunk);
-          if (data.committed?.length) {
-            setCommitted((prev) => [...data.committed, ...prev].slice(0, 80));
-          }
+            if (data.committed?.length) {
+            setCommitted((prev) => [...(data.committed ?? []), ...prev].slice(0, 80));
+            }
           return true;
         } catch (error) {
           log(`append failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -294,9 +294,9 @@ export function App() {
     if (!sessionId) return;
     try {
       const data = await client.current.flushSession(sessionId);
-      if (data.committed?.length) {
-        setCommitted((prev) => [...data.committed, ...prev].slice(0, 80));
-      }
+        if (data.committed?.length) {
+        setCommitted((prev) => [...(data.committed ?? []), ...prev].slice(0, 80));
+        }
       log('manual flush');
     } catch (error) {
       log(`flush failed: ${error instanceof Error ? error.message : String(error)}`);

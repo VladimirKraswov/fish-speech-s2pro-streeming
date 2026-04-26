@@ -14,11 +14,16 @@ export class AudioEngine {
   private started = false;
   private pendingBuffers: Float32Array[] = [];
   private pendingSamplesCount = 0;
+  private onStatusChange: (status: string) => void;
+  private onEvent: (event: StreamEvent) => void;
 
   constructor(
-    private onStatusChange: (status: string) => void,
-    private onEvent: (event: StreamEvent) => void
-  ) {}
+    onStatusChange: (status: string) => void,
+    onEvent: (event: StreamEvent) => void
+  ) {
+    this.onStatusChange = onStatusChange;
+    this.onEvent = onEvent;
+  }
 
   async init() {
     if (!this.ctx) {

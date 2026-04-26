@@ -12,8 +12,8 @@ services:
       - ./checkpoints:/app/checkpoints
       - ./references:/app/references
     environment:
-      COMPILE: ${COMPILE:-0}
-      BACKEND: ${BACKEND:-cuda}
+      COMPILE: "0"
+      BACKEND: cuda
     deploy:
       resources:
         reservations:

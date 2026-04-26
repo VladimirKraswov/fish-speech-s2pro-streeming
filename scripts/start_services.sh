@@ -13,27 +13,71 @@ log_info() { echo -e "${GREEN}[INFO]${NC} $(date '+%H:%M:%S') - $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $(date '+%H:%M:%S') - $1" >&2; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $(date '+%H:%M:%S') - $1"; }
 
-# Остановка всех сервисов при ошибке
 stop_services() {
     log_info "Остановка всех сервисов..."
     docker compose down --remove-orphans
 }
 trap stop_services EXIT INT TERM
 
-# --------------------------------------------
-# 1. Запуск сервера с умным ожиданием по логам
-# --------------------------------------------
+# --------------------------------------------------
+# Запуск сервера с умным ожиданием по логам
+# --------------------------------------------------
 log_info "=== Запуск сервера (fish-speech-server) ==="
 docker compose up -d server
 
-log_info "Ожидание готовности сервера (читаем логи, ищем 'Application startup complete' или 'Warmup done')..."
-# Таймаут 30 минут (1800 секунд) – запас под компиляцию
-timeout 1800 docker compose logs -f server 2>&1 | grep -q -E "Application startup complete|Warmup done"
+# Убедимся, что контейнер вообще запустился
+sleep 2
+if ! docker ps --filter "name=fish-speech-server" --format "{{.Names}}" | grep -q "fish-speech-server"; then
+    log_error "Контейнер server не запустился."
+    exit 1
+fi
 
-if [ $? -eq 0 ]; then
+log_info "Ожидание готовности сервера (ищем 'Application startup complete' или 'Warmup done', таймаут 30 минут)..."
+
+# Функция для чтения логов и поиска нужной строки
+wait_for_server() {
+    local timeout=1800   # 30 минут
+    local start_time=$(date +%s)
+    local log_pid=""
+
+    # Запускаем чтение логов в фоне
+    docker compose logs -f server 2>&1 | while read line; do
+        echo "$line"
+        if [[ "$line" == *"Application startup complete"* ]] || [[ "$line" == *"Warmup done"* ]]; then
+            log_info "Найдена строка готовности: $line"
+            # Убиваем процесс docker compose logs (он в подпроцессе)
+            pkill -P $$ docker compose logs 2>/dev/null || true
+            return 0
+        fi
+    done &
+    log_pid=$!
+
+    # Ждём, пока либо найдём строку, либо истечёт таймаут
+    while true; do
+        if ! ps -p $log_pid > /dev/null 2>&1; then
+            # Потомок завершился, проверяем, успешно ли
+            wait $log_pid
+            local exit_code=$?
+            if [ $exit_code -eq 0 ]; then
+                return 0
+            else
+                return 1
+            fi
+        fi
+        local now=$(date +%s)
+        if (( now - start_time > timeout )); then
+            log_error "Таймаут: сервер не завершил инициализацию за ${timeout} секунд."
+            kill $log_pid 2>/dev/null || true
+            return 1
+        fi
+        sleep 2
+    done
+}
+
+if wait_for_server; then
     log_info "Сервер завершил инициализацию (компиляция/прогрев выполнены)."
 else
-    log_error "Сервер не завершил инициализацию за 30 минут. Проверьте логи."
+    log_error "Не удалось дождаться готовности сервера."
     exit 1
 fi
 
@@ -54,9 +98,9 @@ for i in {1..30}; do
     sleep 2
 done
 
-# --------------------------------------------
-# 2. Запуск прокси
-# --------------------------------------------
+# --------------------------------------------------
+# Запуск прокси
+# --------------------------------------------------
 log_info "=== Запуск прокси (fish-speech-proxy) ==="
 docker compose up -d proxy
 
@@ -73,9 +117,9 @@ for i in {1..20}; do
     sleep 2
 done
 
-# --------------------------------------------
-# 3. Запуск WebUI
-# --------------------------------------------
+# --------------------------------------------------
+# Запуск WebUI
+# --------------------------------------------------
 log_info "=== Запуск WebUI (fish-speech-webui) ==="
 docker compose up -d webui
 

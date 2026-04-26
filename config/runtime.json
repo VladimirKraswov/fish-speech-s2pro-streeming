@@ -108,6 +108,10 @@
       "commit.next.max_chars",
       "commit.next.max_wait_ms",
       "commit.next.allow_partial_after_ms",
+      "commit.carry_incomplete_tail",
+      "commit.flush_on_sentence_punctuation",
+      "commit.flush_on_clause_punctuation",
+      "commit.flush_on_newline",
       "tts.reference_id",
       "tts.max_new_tokens",
       "tts.chunk_length",
@@ -118,7 +122,9 @@
       "tts.stream_chunk_size",
       "playback.target_emit_bytes",
       "playback.start_buffer_ms",
-      "playback.stop_grace_ms"
+      "playback.stop_grace_ms",
+      "session.max_buffer_chars",
+      "session.auto_close_on_finish"
     ]
   }
 }

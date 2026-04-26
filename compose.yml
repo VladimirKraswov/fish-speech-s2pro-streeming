@@ -11,6 +11,7 @@ services:
     volumes:
       - ./checkpoints:/app/checkpoints
       - ./references:/app/references
+      - ./config:/app/config
     environment:
       COMPILE: "0"
       BACKEND: cuda
@@ -35,6 +36,8 @@ services:
       context: .
       dockerfile: docker/Dockerfile.proxy
     image: fish-speech-proxy:latest
+    volumes:
+      - ./config:/app/config
     ports:
       - "9000:9000"
     environment:

@@ -1,0 +1,7 @@
+services:
+  server:
+    mem_limit: 64g
+    shm_size: 8g
+    environment:
+      - TORCHINDUCTOR_COMPILE_THREADS=1
+      - TORCHDYNAMO_VERBOSE=1

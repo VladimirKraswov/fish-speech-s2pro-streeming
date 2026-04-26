@@ -5,8 +5,8 @@ services:
       context: .
       dockerfile: docker/Dockerfile.server
       args:
-        CUDA_VER: ${CUDA_VER:-12.9.0}
-        UV_EXTRA: ${UV_EXTRA:-cu129}
+        CUDA_VER: 12.9.0
+        UV_EXTRA: cu129
     image: fish-speech-server:latest
     volumes:
       - ./checkpoints:/app/checkpoints
@@ -22,12 +22,13 @@ services:
               count: all
               capabilities: [gpu]
     ports:
-      - "${API_PORT:-8080}:8080"
+      - "8080:8080"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/v1/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
 
   proxy:
     build:
@@ -35,7 +36,7 @@ services:
       dockerfile: docker/Dockerfile.proxy
     image: fish-speech-proxy:latest
     ports:
-      - "${PROXY_PORT:-9000}:9000"
+      - "9000:9000"
     environment:
       FISH_UPSTREAM_TTS_URL: http://server:8080/v1/tts
     depends_on:
@@ -43,9 +44,10 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
   webui:
     build:
@@ -53,12 +55,13 @@ services:
       dockerfile: docker/Dockerfile.webui
     image: fish-speech-webui:latest
     ports:
-      - "${WEBUI_PORT:-9001}:9001"
+      - "9001:9001"
     depends_on:
       proxy:
         condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s

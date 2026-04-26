@@ -6,9 +6,12 @@ services:
       context: .
       dockerfile: docker/Dockerfile.server
       args:
-        CUDA_VER: 12.8.1
-        UV_EXTRA: cu128
-    image: fish-speech-server:latest
+        CUDA_VER: 12.6.0
+        UBUNTU_VER: 24.04
+        UV_EXTRA: cu126
+        UV_VERSION: 0.8.15
+        PY_VER: 3.12
+    image: fish-speech-server:cuda
     volumes:
       - ./checkpoints:/app/checkpoints
       - ./references:/app/references
@@ -17,10 +20,15 @@ services:
     environment:
       COMPILE: "1"
       BACKEND: cuda
+      API_SERVER_NAME: 0.0.0.0
+      API_SERVER_PORT: "8080"
+      LLAMA_CHECKPOINT_PATH: /app/checkpoints/fs-1.2-int8-s2-pro-int8
+      DECODER_CHECKPOINT_PATH: /app/checkpoints/s2-pro/codec.pth
+      DECODER_CONFIG_NAME: modded_dac_vq
       TORCHINDUCTOR_CACHE_DIR: /app/.torchinductor
       TORCHINDUCTOR_COMPILE_THREADS: "1"
-      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
       CUDA_MODULE_LOADING: LAZY
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
     deploy:
       resources:
         reservations:

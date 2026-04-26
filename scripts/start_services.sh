@@ -13,108 +13,63 @@ log_info() { echo -e "${GREEN}[INFO]${NC} $(date '+%H:%M:%S') - $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $(date '+%H:%M:%S') - $1" >&2; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $(date '+%H:%M:%S') - $1"; }
 
-stop_services() {
-    log_info "Остановка всех сервисов..."
-    docker compose down --remove-orphans
-}
-trap stop_services EXIT INT TERM
+wait_http() {
+  local url="$1"
+  local timeout="${2:-1800}"
+  local step="${3:-5}"
+  local start
+  start="$(date +%s)"
 
-# --------------------------------------------------
-log_info "=== Запуск сервера (fish-speech-server) ==="
+  while true; do
+    if curl -sf "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+
+    if (( $(date +%s) - start > timeout )); then
+      return 1
+    fi
+
+    sleep "$step"
+  done
+}
+
+log_info "=== Запуск server ==="
 docker compose up -d server
 
-sleep 2
-if ! docker ps --filter "name=fish-speech-server" --format "{{.Names}}" | grep -q "fish-speech-server"; then
-    log_error "Контейнер server не запустился."
-    exit 1
+log_info "Ожидание server health до 30 минут..."
+if ! wait_http "http://127.0.0.1:8080/v1/health" 1800 5; then
+  log_error "Server не стал healthy"
+  docker compose logs --tail=200 server
+  exit 1
 fi
 
-log_info "Ожидание готовности сервера (ищем 'Application startup complete' или 'Warmup done', таймаут 30 минут)..."
+log_info "Server здоров."
 
-wait_for_server() {
-    local timeout=1800
-    local start_time=$(date +%s)
-    
-    docker compose logs -f server 2>&1 | while read line; do
-        echo "$line"
-        if [[ "$line" == *"Application startup complete"* ]] || [[ "$line" == *"Warmup done"* ]]; then
-            log_info "Готовность обнаружена"
-            pkill -P $$ docker compose logs 2>/dev/null || true
-            return 0
-        fi
-        if [[ "$line" == *"Application startup failed"* ]] || [[ "$line" == *"exited with code"* ]]; then
-            log_error "Ошибка запуска: $line"
-            pkill -P $$ docker compose logs 2>/dev/null || true
-            return 1
-        fi
-    done &
-    local log_pid=$!
-    
-    while true; do
-        if ! ps -p $log_pid > /dev/null 2>&1; then
-            wait $log_pid
-            return $?
-        fi
-        if (( $(date +%s) - start_time > timeout )); then
-            log_error "Таймаут ожидания готовности сервера"
-            kill $log_pid 2>/dev/null || true
-            return 1
-        fi
-        sleep 2
-    done
-}
-
-if wait_for_server; then
-    log_info "Сервер завершил инициализацию."
-else
-    log_error "Сервер не запустился корректно."
-    exit 1
-fi
-
-sleep 5
-log_info "Проверка health endpoint..."
-for i in {1..30}; do
-    if curl -sf http://localhost:8080/v1/health > /dev/null; then
-        log_info "Сервер здоров."
-        break
-    fi
-    if [ $i -eq 30 ]; then
-        log_error "Health check провален."
-        exit 1
-    fi
-    sleep 2
-done
-
-# --------------------------------------------------
-log_info "=== Запуск прокси ==="
+log_info "=== Запуск proxy ==="
 docker compose up -d proxy
-for i in {1..20}; do
-    if curl -sf http://localhost:9000/health > /dev/null; then
-        log_info "Прокси здоров."
-        break
-    fi
-    if [ $i -eq 20 ]; then
-        log_error "Прокси не стал здоровым."
-        exit 1
-    fi
-    sleep 2
-done
 
-# --------------------------------------------------
-log_info "=== Запуск WebUI ==="
+if ! wait_http "http://127.0.0.1:9000/health" 300 3; then
+  log_error "Proxy не стал healthy"
+  docker compose logs --tail=200 proxy
+  exit 1
+fi
+
+log_info "Proxy здоров."
+
+log_info "=== Запуск webui ==="
 docker compose up -d webui
-for i in {1..20}; do
-    if curl -sf http://localhost:9001/health > /dev/null; then
-        log_info "WebUI доступен на http://localhost:9001"
-        break
-    fi
-    if [ $i -eq 20 ]; then
-        log_error "WebUI не стал здоровым."
-        exit 1
-    fi
-    sleep 2
-done
 
-log_info "=== ВСЕ СЕРВИСЫ УСПЕШНО ЗАПУЩЕНЫ ==="
+if ! wait_http "http://127.0.0.1:9001/health" 300 3; then
+  log_warn "WebUI не стал healthy. Показываю логи, но server/proxy не останавливаю."
+  docker compose logs --tail=200 webui || true
+else
+  log_info "WebUI здоров."
+fi
+
+log_info "=== ГОТОВО ==="
 docker compose ps
-trap - EXIT INT TERM
+
+echo
+echo "API:   http://127.0.0.1:8080"
+echo "Proxy: http://127.0.0.1:9000"
+echo "WebUI: http://127.0.0.1:9001"

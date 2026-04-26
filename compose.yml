@@ -6,9 +6,9 @@ services:
       context: .
       dockerfile: docker/Dockerfile.server
       args:
-        CUDA_VER: 12.6.0
+        CUDA_VER: 12.8.1
         UBUNTU_VER: 24.04
-        UV_EXTRA: cu126
+        UV_EXTRA: cu128
         UV_VERSION: 0.8.15
         PY_VER: 3.12
     image: fish-speech-server:cuda

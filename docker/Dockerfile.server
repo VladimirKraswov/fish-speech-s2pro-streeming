@@ -1,12 +1,14 @@
-ARG CUDA_VER=12.9.0
+ARG CUDA_VER=12.8.1
 FROM nvidia/cuda:${CUDA_VER}-cudnn-runtime-ubuntu22.04
 
-ARG UV_EXTRA=cu129
+ARG UV_EXTRA=cu128
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PATH="/app/venv/bin:$PATH"
+    PATH="/app/venv/bin:$PATH" \
+    TORCHINDUCTOR_CACHE_DIR="/app/.torchinductor" \
+    CUDA_MODULE_LOADING=LAZY
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.11 python3.11-dev python3.11-venv python3-pip \
@@ -20,13 +22,36 @@ COPY . .
 
 RUN python3.11 -m venv /app/venv \
     && /app/venv/bin/pip install --no-cache-dir -U pip \
-    && /app/venv/bin/pip install --no-cache-dir -e ".[${UV_EXTRA}]" --extra-index-url https://download.pytorch.org/whl/${UV_EXTRA} \
+    && /app/venv/bin/pip install --no-cache-dir -e ".[${UV_EXTRA}]" \
+       --extra-index-url https://download.pytorch.org/whl/${UV_EXTRA} \
     && /app/venv/bin/pip install --no-cache-dir lightning-utilities loralib
 
-EXPOSE 8080
+RUN mkdir -p /app/.torchinductor
 
-CMD ["python", "-m", "fish_speech_server.app", \
-    "--listen", "0.0.0.0:8080", \
-    "--llama-checkpoint-path", "/app/checkpoints/fs-1.2-int8-s2-pro-int8", \
-    "--decoder-checkpoint-path", "/app/checkpoints/s2-pro/codec.pth", \
-    "--decoder-config-name", "modded_dac_vq"]
+RUN cat > /app/start_server.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ARGS=(
+  python -m fish_speech_server.app
+  --listen 0.0.0.0:8080
+  --llama-checkpoint-path /app/checkpoints/fs-1.2-int8-s2-pro-int8
+  --decoder-checkpoint-path /app/checkpoints/s2-pro/codec.pth
+  --decoder-config-name modded_dac_vq
+)
+
+if [[ "${COMPILE:-0}" == "1" || "${COMPILE:-false}" == "true" ]]; then
+  ARGS+=(--compile)
+fi
+
+if [[ "${BACKEND:-cuda}" == "cpu" ]]; then
+  ARGS+=(--device cpu)
+fi
+
+exec "${ARGS[@]}"
+EOF
+
+RUN chmod +x /app/start_server.sh
+
+EXPOSE 8080
+CMD ["/app/start_server.sh"]

@@ -1,58 +1,128 @@
+.codebundleignore
+bundle-code.js
+fish_speech_web_ui/
+
+# VCS / IDE
+.git/
+.github/
+.gitlab/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+.llm-lab/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# JS / frontend
 node_modules/
 dist/
 build/
-.git/
 .next/
-.llm-lab
+.nuxt/
+.svelte-kit/
+.vite/
 coverage/
 public/
-libs/
-web/
-datasets/
-smoke-test/
-fish_speech/
-fish_speech/i18n/
+assets/
+
+# Logs / temp / generated
+logs/
+log/
+tmp/
 temp/
 results/
-fish_speech/i18n/
-logs/
-ish_speech_web_ui/static
-fish_speech_web_ui/ui/public
-fish_speech_server/
-fish_speech_web_ui/
+datasets/
+cache/
+codebundle.txt
 
+# Locks
 package-lock.json
 yarn.lock
 pnpm-lock.yaml
-bundle-code.js
 uv.lock
+
+# Local/generated tools
 .project-root
-codebundle.txt
 
+# Runtime / ML artifacts
+*.pkl
+*.pt
+*.pth
+*.onnx
+*.ckpt
+*.weights
+checkpoint.json
+best_genome.pkl
+neat-checkpoint-*
 
+# Archives / binaries
+*.zip
+*.rar
+*.7z
+*.tar
+*.gz
+*.bz2
+*.xz
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Media
 *.png
 *.jpg
 *.jpeg
 *.gif
 *.webp
 *.ico
-*.pdf
-*.zip
-*.rar
-*.7z
-*.exe
-*.dll
-*.so
-*.dylib
+*.mp4
+*.mp3
+*.wav
+*.mov
+*.avi
+
+# Fonts
 *.woff
 *.woff2
 *.ttf
 *.eot
-*.mp4
-*.mp3
-*.wav
+*.otf
+
+# Docs / noisy files
+*.pdf
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.ppt
+*.pptx
+*.txt
+
+# Optional: обычно шумно для анализа логики
 *.css
 *.scss
-*.md
+*.sass
+*.less
 *.html
-*.txt
+
+# Markdown: README оставляем
+*.md
+# !README.md
+# !readme.md
+
+# Project specific
+fish_speech/i18n/

@@ -125,3 +125,4 @@ codebundle.txt
 bundle-code.js
 node_modules/
 results/
+.venv-tools

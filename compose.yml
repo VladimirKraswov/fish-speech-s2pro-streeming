@@ -7,7 +7,7 @@ services:
       args:
         CUDA_VER: ${CUDA_VER:-12.9.0}
         UV_EXTRA: ${UV_EXTRA:-cu129}
-    image: fish-speech-server:${TAG:-latest}
+    image: fish-speech-server:latest
     volumes:
       - ./checkpoints:/app/checkpoints
       - ./references:/app/references
@@ -33,9 +33,11 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.proxy
-    image: fish-speech-proxy:${TAG:-latest}
+    image: fish-speech-proxy:latest
     ports:
       - "${PROXY_PORT:-9000}:9000"
+    environment:
+      FISH_UPSTREAM_TTS_URL: http://server:8080/v1/tts
     depends_on:
       server:
         condition: service_healthy
@@ -49,7 +51,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.webui
-    image: fish-speech-webui:${TAG:-latest}
+    image: fish-speech-webui:latest
     ports:
       - "${WEBUI_PORT:-9001}:9001"
     depends_on:

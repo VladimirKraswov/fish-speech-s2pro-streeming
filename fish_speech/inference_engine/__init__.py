@@ -138,15 +138,28 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         try:
             ref_id = req.reference_id
             prompt_tokens, prompt_texts = [], []
-            if ref_id is not None:
-                prompt_tokens, prompt_texts = self.load_by_id(
-                    ref_id, req.use_memory_cache
+
+            # Add continuation prompt from history if provided
+            if req.prompt_tokens and req.prompt_text:
+                prompt_tokens.extend(req.prompt_tokens)
+                prompt_texts.extend(req.prompt_text)
+                logger.info(
+                    "continuation: added history to prompt turns={} chars={}",
+                    len(req.prompt_text),
+                    sum(len(t) for t in req.prompt_text),
                 )
+
+            if ref_id is not None:
+                new_tokens, new_texts = self.load_by_id(ref_id, req.use_memory_cache)
+                prompt_tokens.extend(new_tokens)
+                prompt_texts.extend(new_texts)
                 _mark("ref_loaded", mode="id")
             elif req.references:
-                prompt_tokens, prompt_texts = self.load_by_hash(
+                new_tokens, new_texts = self.load_by_hash(
                     req.references, req.use_memory_cache
                 )
+                prompt_tokens.extend(new_tokens)
+                prompt_texts.extend(new_texts)
                 _mark("ref_loaded", mode="hash", refs=len(req.references))
 
             if req.seed is not None:

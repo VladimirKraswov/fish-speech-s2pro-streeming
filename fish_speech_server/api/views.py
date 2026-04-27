@@ -51,6 +51,11 @@ from fish_speech_server.api.utils import (
     get_content_type,
     inference_async,
 )
+from fish_speech_server.services.continuation import build_continuation_debug_summary
+from fish_speech_server.services.adapter import (
+    api_tts_to_driver_request,
+    stateful_tts_to_driver_request,
+)
 from fish_speech_server.services.stateful_inference import stateful_inference_async
 from fish_speech_server.services.model_manager import ModelManager
 from fish_speech_server.services.model_utils import (
@@ -713,8 +718,21 @@ async def stateful_synthesize(req: Annotated[StatefulTTSRequest, Body(exclusive=
                 content="Streaming only supports WAV format",
             )
 
+        # Build stateful request with continuation history
+        stateful_req = stateful_tts_to_driver_request(req, ctx)
+
+        # Logging diagnostics
+        summary = build_continuation_debug_summary(ctx)
+        logger.info(
+            f"Stateful synthesize session={req.synthesis_session_id[:8]} "
+            f"history_turns={summary['selected_turns']} history_chars={summary['selected_chars']}"
+        )
+
+        # We need to pass the original request info (commit_seq etc) for session tracking
+        # even if stateful_req is a DriverSynthesisRequest.
+        # Let's adjust stateful_inference_async to take both.
         return StreamResponse(
-            iterable=stateful_inference_async(req, driver, ctx),
+            iterable=stateful_inference_async(stateful_req, driver, ctx, original_req=req),
             headers={
                 "Content-Disposition": f"attachment; filename=audio.{req.format}",
             },

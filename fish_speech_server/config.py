@@ -77,6 +77,8 @@ class ProxyTTSConfig(BaseModel):
     stream_tokens: bool = True
     initial_stream_chunk_size: int = Field(8, ge=1, le=200)
     stream_chunk_size: int = Field(8, ge=1, le=200)
+    stateful_synthesis: bool = False
+    stateful_fallback_to_stateless: bool = True
 
     @field_validator("format")
     @classmethod

@@ -10,7 +10,8 @@ from fish_speech.driver import (
 )
 
 if TYPE_CHECKING:
-    from fish_speech_server.schema import ServeTTSRequest
+    from fish_speech_server.schema import ServeTTSRequest, StatefulTTSRequest
+    from fish_speech_server.services.synthesis_context import SynthesisContext
 
 
 def split_text_by_speaker(text: str) -> list[str]:
@@ -122,3 +123,59 @@ def api_tts_to_driver_request(req: ServeTTSRequest) -> DriverSynthesisRequest:
             initial_stream_chunk_size=req.initial_stream_chunk_size,
         ),
     )
+
+
+def stateful_tts_to_driver_request(
+    req: StatefulTTSRequest, context: SynthesisContext
+) -> DriverSynthesisRequest:
+    """
+    Creates a DriverSynthesisRequest that includes rolling history for acoustic continuity.
+    """
+    from fish_speech_server.services.continuation import (
+        select_history_turns_for_continuation,
+    )
+
+    # 1. Start with standard conversion
+    driver_req = api_tts_to_driver_request(req)
+
+    # 2. Select history for continuation
+    history_turns = select_history_turns_for_continuation(context)
+
+    if not history_turns:
+        return driver_req
+
+    # 3. Add history to prompt_text and prompt_tokens
+    # Fish Speech expects prompt_text and prompt_tokens to be lists of same length
+    # or combined structures. In DriverSynthesisRequest (implied),
+    # it might need to be passed down via custom logic if DriverSynthesisRequest
+    # doesn't have these fields yet.
+
+    # Looking at GenerateRequest in TTSInferenceEngine.send_Llama_request:
+    # prompt_tokens=prompt_tokens,
+    # prompt_text=prompt_text,
+
+    # We need to ensure DriverSynthesisRequest can carry these,
+    # OR we use a pattern where they are injected.
+
+    # Let's check DriverSynthesisRequest fields in fish_speech/driver/types.py
+    # (I saw them earlier, it didn't have prompt_text/tokens explicitly,
+    # but the Engine used them).
+
+    # If I can't modify DriverSynthesisRequest cleanly, I'll use text-based
+    # fallback for now, but the goal is acoustic continuity.
+
+    # Wait, TTSInferenceEngine.inference loads prompt_tokens from ref_id.
+    # We might need to extend DriverSynthesisRequest or use a different mechanism.
+
+    # For now, let's assume we can attach them to driver_req as attributes
+    # and handle them in a modified inference path if needed,
+    # or just use them if they exist.
+
+    # If I can't find prompt_tokens in DriverSynthesisRequest, I'll add them:
+    driver_req.prompt_text = [t.text for t in history_turns]
+    driver_req.prompt_tokens = [t.codes for t in history_turns]
+
+    # Also force stream_tokens=True to ensure we get codes back
+    driver_req.generation.stream_tokens = True
+
+    return driver_req

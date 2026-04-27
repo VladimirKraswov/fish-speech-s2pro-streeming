@@ -1,5 +1,7 @@
 from http import HTTPStatus
 
+from typing import Any
+
 import numpy as np
 from kui.asgi import HTTPException
 
@@ -7,6 +9,8 @@ from fish_speech import (
     DriverAudioChunkEvent,
     DriverErrorEvent,
     DriverFinalAudioEvent,
+    DriverSynthesisRequest,
+    DriverTokenChunkEvent,
     FishSpeechDriver,
 )
 from fish_speech_server.services.adapter import api_tts_to_driver_request
@@ -17,13 +21,17 @@ from fish_speech_server.schema import ServeTTSRequest
 AMPLITUDE = 32768
 
 
-def inference_wrapper(req: ServeTTSRequest, driver: FishSpeechDriver):
+def inference_wrapper(req: ServeTTSRequest | Any, driver: FishSpeechDriver):
     """
     Wrapper for the inference function.
     Used in the API server.
     """
     count = 0
-    driver_req = api_tts_to_driver_request(req)
+
+    if isinstance(req, DriverSynthesisRequest):
+        driver_req = req
+    else:
+        driver_req = api_tts_to_driver_request(req)
 
     if req.streaming:
         yield wav_chunk_header(sample_rate=driver.sample_rate)
@@ -39,6 +47,10 @@ def inference_wrapper(req: ServeTTSRequest, driver: FishSpeechDriver):
             case DriverAudioChunkEvent():
                 count += 1
                 yield (event.audio * AMPLITUDE).astype(np.int16).tobytes()
+
+            case DriverTokenChunkEvent():
+                # Propagate codes for stateful session tracking
+                yield event
 
             case DriverFinalAudioEvent():
                 # В streaming-режиме final содержит полную собранную дорожку.

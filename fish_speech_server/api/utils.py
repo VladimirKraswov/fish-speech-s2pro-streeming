@@ -88,10 +88,18 @@ class MsgPackRequest(HttpRequest):
         )
 
 
-async def inference_async(req: ServeTTSRequest, driver: FishSpeechDriver):
+async def inference_async(
+    req: ServeTTSRequest | Any, driver: FishSpeechDriver, yield_tokens: bool = False
+):
+    """
+    Asynchronous generator that wraps the inference function.
+    If yield_tokens is True, it will also yield DriverTokenChunkEvent objects.
+    Otherwise, it only yields bytes (audio chunks) for compatibility with HTTP responses.
+    """
     for chunk in inference(req, driver):
-        print("Got chunk")
         if isinstance(chunk, bytes):
+            yield chunk
+        elif yield_tokens and isinstance(chunk, DriverTokenChunkEvent):
             yield chunk
 
 

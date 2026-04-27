@@ -83,7 +83,9 @@
       "temperature": 0.7,
       "stream_tokens": true,
       "initial_stream_chunk_size": 10,
-      "stream_chunk_size": 8
+      "stream_chunk_size": 8,
+      "stateful_synthesis": false,
+      "stateful_fallback_to_stateless": true
     },
     "playback": {
       "target_emit_bytes": 6144,
@@ -124,7 +126,9 @@
       "playback.start_buffer_ms",
       "playback.stop_grace_ms",
       "session.max_buffer_chars",
-      "session.auto_close_on_finish"
+      "session.auto_close_on_finish",
+      "tts.stateful_synthesis",
+      "tts.stateful_fallback_to_stateless"
     ]
   }
 }

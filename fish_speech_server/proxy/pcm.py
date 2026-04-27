@@ -100,6 +100,7 @@ class SessionRecord:
     next_pcm_seq: int = 1
     buffer_text: str = ""
     input_closed: bool = False
+    synthesis_session_id: str | None = None
     audio_meta: dict[str, Any] | None = None
     stream_started: bool = False
     stream_finished: bool = False
@@ -235,7 +236,9 @@ def normalize_config(config_text: str) -> ProxyConfig:
         raise HTTPException(400, detail=str(exc)) from exc
 
 
-def build_upstream_payload(text: str, config: ProxyConfig) -> dict[str, Any]:
+def build_upstream_payload(
+    text: str, config: ProxyConfig, rec: SessionRecord | None = None
+) -> dict[str, Any]:
     tts = config.tts
     reference_id = tts.reference_id.strip() or config.default_reference_id
 
@@ -258,6 +261,16 @@ def build_upstream_payload(text: str, config: ProxyConfig) -> dict[str, Any]:
 
     if tts.seed is not None:
         payload["seed"] = tts.seed
+
+    if (
+        rec
+        and rec.synthesis_session_id
+        and tts.stateful_synthesis
+        and UPSTREAM_TTS_URL.endswith("/v1/tts")
+    ):
+        payload["synthesis_session_id"] = rec.synthesis_session_id
+        payload["commit_seq"] = rec.next_commit_seq - 1
+        payload["commit_reason"] = "proxy_commit"
 
     return payload
 
@@ -551,6 +564,26 @@ async def session_open(req: SessionOpenRequest) -> JSONResponse:
     config = normalize_config(req.config_text)
     rec = await session_store.create(config.model_dump(mode="python"), req.config_text)
 
+    if config.tts.stateful_synthesis:
+        try:
+            async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
+                resp = await client.post(
+                    UPSTREAM_TTS_URL.replace("/v1/tts", "/v1/synthesis/sessions/open"),
+                    json={
+                        "reference_id": config.tts.reference_id or config.default_reference_id,
+                    },
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    rec.synthesis_session_id = data.get("synthesis_session_id")
+                    logger.info(
+                        "proxy session %s linked to upstream synthesis session %s",
+                        rec.session_id[:8],
+                        rec.synthesis_session_id[:8] if rec.synthesis_session_id else "none",
+                    )
+        except Exception as e:
+            logger.warning("failed to open upstream synthesis session: %s", e)
+
     logger.info(
         "session open id=%s ref=%s emit_bytes=%s",
         rec.session_id[:8],
@@ -761,7 +794,11 @@ async def session_pcm_stream(session_id: str):
         req_id: str,
         commit_item: dict[str, Any],
     ) -> AsyncGenerator[bytes, None]:
-        payload = build_upstream_payload(text=commit_item["text"], config=config)
+        payload = build_upstream_payload(text=commit_item["text"], config=config, rec=rec)
+
+        url = UPSTREAM_TTS_URL
+        if rec.synthesis_session_id and config.tts.stateful_synthesis:
+            url = url.replace("/v1/tts", "/v1/synthesis/synthesize")
 
         header_buffer = bytearray()
         pending_pcm = bytearray()
@@ -828,14 +865,15 @@ async def session_pcm_stream(session_id: str):
 
         async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
             logger.info(
-                "REQ %s commit_seq=%s upstream start text_len=%s ref=%s",
+                "REQ %s commit_seq=%s upstream start text_len=%s ref=%s url=%s",
                 req_id,
                 commit_item["seq"],
                 len(commit_item["text"]),
                 payload["reference_id"],
+                url,
             )
 
-            async with client.stream("POST", UPSTREAM_TTS_URL, json=payload) as upstream:
+            async with client.stream("POST", url, json=payload) as upstream:
                 if upstream.status_code != 200:
                     text_body = await upstream.aread()
                     msg = text_body.decode("utf-8", errors="replace")

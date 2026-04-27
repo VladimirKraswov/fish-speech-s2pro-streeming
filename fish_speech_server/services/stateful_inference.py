@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, AsyncGenerator
+from typing import TYPE_CHECKING, Any, AsyncGenerator
 
-from fish_speech import FishSpeechDriver
+import torch
+from loguru import logger
+
+from fish_speech import DriverSynthesisRequest, DriverTokenChunkEvent, FishSpeechDriver
 from fish_speech_server.api.utils import inference_async
-from fish_speech_server.services.synthesis_context import SynthesisTurn
+from fish_speech_server.services.synthesis_context import (
+    SynthesisTurn,
+    estimate_code_frames,
+)
 
 if TYPE_CHECKING:
     from fish_speech_server.schema import StatefulTTSRequest
@@ -13,9 +19,10 @@ if TYPE_CHECKING:
 
 
 async def stateful_inference_async(
-    req: StatefulTTSRequest,
+    req: DriverSynthesisRequest | StatefulTTSRequest,
     driver: FishSpeechDriver,
     context: SynthesisContext,
+    original_req: StatefulTTSRequest | None = None,
 ) -> AsyncGenerator[bytes, None]:
     """
     A wrapper around inference_async that updates the synthesis context history
@@ -23,18 +30,20 @@ async def stateful_inference_async(
     """
 
     pcm_bytes = 0
+    collected_codes: list[Any] = []
     created_at = time.time()
 
     # We yield chunks from the underlying inference engine
-    async for chunk in inference_async(req, driver):
-        if chunk:
-            # We skip the WAV header if it's the first chunk of a WAV stream
-            # but for simplicity in counting PCM bytes, let's just count everything yielded
-            # for now, or we could be more precise.
-            # In fish-speech-server, inference_async(req, driver) yields
-            # wav_chunk_header(...) first if req.streaming and req.format == 'wav'.
-            pcm_bytes += len(chunk)
-            yield chunk
+    async for event in inference_async(req, driver, yield_tokens=True):
+        if isinstance(event, bytes):
+            pcm_bytes += len(event)
+            yield event
+        elif isinstance(event, DriverTokenChunkEvent):
+            if event.codes is not None:
+                collected_codes.append(event.codes)
+        else:
+            # Skip or handle other non-bytes, non-token events if any
+            pass
 
     # If we reached here, the generation finished successfully.
     # Note: inference_async might raise HTTPException or other errors,
@@ -42,17 +51,38 @@ async def stateful_inference_async(
 
     completed_at = time.time()
 
+    # Use original_req if provided for metadata
+    meta_req = original_req if original_req is not None else req
+
+    # Concatenate collected codes if any
+    final_codes = None
+    code_frames = 0
+    if collected_codes:
+        try:
+            # In real environment, collected_codes is a list of torch.Tensors
+            # with shape (codebooks, frames)
+            if all(hasattr(c, "shape") for c in collected_codes):
+                final_codes = torch.cat(collected_codes, dim=1)
+                code_frames = estimate_code_frames(final_codes)
+            else:
+                # Fallback or mixed types (unlikely in practice)
+                final_codes = collected_codes
+                code_frames = sum(estimate_code_frames(c) for c in collected_codes)
+        except Exception as e:
+            logger.warning(f"Failed to concatenate collected codes: {e}")
+            final_codes = None
+            code_frames = 0
+
     # Create a new turn for the history
     turn = SynthesisTurn(
-        commit_seq=req.commit_seq,
-        text=req.text,
-        reason=req.commit_reason,
+        commit_seq=getattr(meta_req, "commit_seq", 0),
+        text=meta_req.text,
+        reason=getattr(meta_req, "commit_reason", "unknown"),
         created_at=created_at,
         completed_at=completed_at,
         pcm_bytes=pcm_bytes,
-        # codes=None for now as per Step 2 instructions
-        codes=None,
-        code_frames=0,
+        codes=final_codes,
+        code_frames=code_frames,
     )
 
     context.append_turn(turn)

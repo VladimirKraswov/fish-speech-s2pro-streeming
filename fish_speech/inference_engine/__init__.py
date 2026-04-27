@@ -170,10 +170,6 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                     sum(len(t) for t in history_texts),
                 )
 
-            # Keep prompt_tokens/texts as combined for backward compatibility
-            prompt_tokens = list(ref_tokens) + list(history_tokens)
-            prompt_texts = list(ref_texts) + list(history_texts)
-
             if req.seed is not None:
                 set_seed(req.seed)
                 logger.warning(f"set seed: {req.seed}")

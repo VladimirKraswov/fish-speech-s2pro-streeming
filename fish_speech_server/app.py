@@ -22,6 +22,7 @@ from typing_extensions import Annotated
 
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
+from fish_speech.driver.config import load_runtime_config
 from fish_speech_server.api.utils import MsgPackRequest, parse_args
 from fish_speech_server.api.exception_handler import ExceptionHandler
 from fish_speech_server.services.model_manager import ModelManager
@@ -83,9 +84,10 @@ class API(ExceptionHandler):
 
     async def initialize_app(self, app: Kui):
         # Initialize the synthesis session store
+        cfg = load_runtime_config()
         app.state.synthesis_session_store = SynthesisSessionStore(
-            ttl_sec=self.args.session_ttl_sec if hasattr(self.args, "session_ttl_sec") else 1800,
-            max_sessions=self.args.session_max_count if hasattr(self.args, "session_max_count") else 128,
+            ttl_sec=cfg.proxy.session_ttl_sec,
+            max_sessions=cfg.proxy.session_max_count,
         )
 
         # Make the ModelManager available to the views

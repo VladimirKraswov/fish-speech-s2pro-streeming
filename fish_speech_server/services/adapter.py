@@ -149,8 +149,4 @@ def stateful_tts_to_driver_request(
     driver_req.continuation_text = [t.text for t in history_turns]
     driver_req.continuation_tokens = [t.codes for t in history_turns]
 
-    # Legacy fallback for older components if any
-    driver_req.prompt_text = driver_req.continuation_text
-    driver_req.prompt_tokens = driver_req.continuation_tokens
-
     return driver_req

@@ -31,13 +31,18 @@ from fish_speech_server.schema import (
     AddEncodedReferenceResponse,
     AddReferenceRequest,
     AddReferenceResponse,
+    CloseSynthesisSessionResponse,
     DeleteReferenceResponse,
     ListReferencesResponse,
+    OpenSynthesisSessionRequest,
+    OpenSynthesisSessionResponse,
     ServeTTSRequest,
     ServeVQGANDecodeRequest,
     ServeVQGANDecodeResponse,
     ServeVQGANEncodeRequest,
     ServeVQGANEncodeResponse,
+    StatefulTTSRequest,
+    SynthesisSessionInfoResponse,
     UpdateReferenceResponse,
 )
 from fish_speech_server.api.utils import (
@@ -46,6 +51,7 @@ from fish_speech_server.api.utils import (
     get_content_type,
     inference_async,
 )
+from fish_speech_server.services.stateful_inference import stateful_inference_async
 from fish_speech_server.services.model_manager import ModelManager
 from fish_speech_server.services.model_utils import (
     batch_vqgan_decode,
@@ -591,6 +597,137 @@ async def delete_reference(reference_id: str = Body(...)):
             reference_id=reference_id,
         )
         return format_response(response, status_code=500)
+
+
+# =============================================================================
+# Stateful Synthesis Sessions (Управление сессиями синтеза)
+# =============================================================================
+
+
+@routes.http.post("/v1/synthesis/sessions/open")
+async def open_synthesis_session(
+    req: Annotated[OpenSynthesisSessionRequest, Body(exclusive=True)]
+):
+    """
+    POST /v1/synthesis/sessions/open — создает новую сессию синтеза.
+    Обеспечивает сохранение контекста (истории) между запросами.
+    """
+    try:
+        store = request.app.state.synthesis_session_store
+        ctx = await store.create(
+            reference_id=req.reference_id,
+            max_history_turns=req.max_history_turns,
+            max_history_chars=req.max_history_chars,
+            max_history_code_frames=req.max_history_code_frames,
+        )
+
+        return format_response(
+            OpenSynthesisSessionResponse(
+                ok=True,
+                synthesis_session_id=ctx.synthesis_session_id,
+                reference_id=ctx.reference_id,
+                context=ctx.to_public_dict(),
+            )
+        )
+    except ValueError as e:
+        raise HTTPException(HTTPStatus.BAD_REQUEST, content=str(e))
+    except Exception as e:
+        logger.error(f"Error opening synthesis session: {e}", exc_info=True)
+        raise HTTPException(
+            HTTPStatus.INTERNAL_SERVER_ERROR, content="Failed to open synthesis session"
+        )
+
+
+@routes.http.get("/v1/synthesis/sessions/{synthesis_session_id}")
+async def get_synthesis_session(synthesis_session_id: str):
+    """
+    GET /v1/synthesis/sessions/{id} — возвращает информацию о сессии и её историю.
+    """
+    store = request.app.state.synthesis_session_store
+    ctx = await store.get(synthesis_session_id, touch=True)
+
+    if ctx is None:
+        raise HTTPException(HTTPStatus.NOT_FOUND, content="Synthesis session not found")
+
+    return format_response(
+        SynthesisSessionInfoResponse(
+            ok=True,
+            synthesis_session_id=ctx.synthesis_session_id,
+            context=ctx.to_public_dict(),
+        )
+    )
+
+
+@routes.http.post("/v1/synthesis/sessions/close")
+async def close_synthesis_session(synthesis_session_id: str = Body(...)):
+    """
+    POST /v1/synthesis/sessions/close — закрывает сессию.
+    """
+    store = request.app.state.synthesis_session_store
+    closed = await store.close(synthesis_session_id)
+
+    return format_response(
+        CloseSynthesisSessionResponse(
+            ok=True,
+            closed=closed,
+            synthesis_session_id=synthesis_session_id,
+        )
+    )
+
+
+@routes.http.post("/v1/synthesis/synthesize")
+async def stateful_synthesize(req: Annotated[StatefulTTSRequest, Body(exclusive=True)]):
+    """
+    POST /v1/synthesis/synthesize — stateful синтез речи.
+    Автоматически обновляет историю сессии после завершения генерации.
+    """
+    try:
+        app_state = request.app.state
+        model_manager: ModelManager = app_state.model_manager
+        driver = model_manager.driver
+        store = app_state.synthesis_session_store
+
+        ctx = await store.get(req.synthesis_session_id, touch=True)
+        if ctx is None:
+            raise HTTPException(
+                HTTPStatus.NOT_FOUND, content="Synthesis session not found"
+            )
+
+        # Проверка длины текста (как в обычном /v1/tts)
+        if app_state.max_text_length > 0 and len(req.text) > app_state.max_text_length:
+            raise HTTPException(
+                HTTPStatus.BAD_REQUEST,
+                content=f"Text is too long, max length is {app_state.max_text_length}",
+            )
+
+        # Пока поддерживаем только streaming=True для stateful
+        if not req.streaming:
+            raise HTTPException(
+                HTTPStatus.BAD_REQUEST,
+                content="Stateful synthesis currently only supports streaming=True",
+            )
+
+        if req.format != "wav":
+            raise HTTPException(
+                HTTPStatus.BAD_REQUEST,
+                content="Streaming only supports WAV format",
+            )
+
+        return StreamResponse(
+            iterable=stateful_inference_async(req, driver, ctx),
+            headers={
+                "Content-Disposition": f"attachment; filename=audio.{req.format}",
+            },
+            content_type=get_content_type(req.format),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in stateful synthesis: {e}", exc_info=True)
+        raise HTTPException(
+            HTTPStatus.INTERNAL_SERVER_ERROR, content="Failed to generate speech"
+        )
 
 
 # 5. Переименование референса (старый ID -> новый ID)

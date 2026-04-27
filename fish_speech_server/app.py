@@ -25,6 +25,7 @@ pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 from fish_speech_server.api.utils import MsgPackRequest, parse_args
 from fish_speech_server.api.exception_handler import ExceptionHandler
 from fish_speech_server.services.model_manager import ModelManager
+from fish_speech_server.services.synthesis_store import SynthesisSessionStore
 from fish_speech_server.api.views import routes
 
 
@@ -81,6 +82,12 @@ class API(ExceptionHandler):
         self.app.on_startup(self.initialize_app)
 
     async def initialize_app(self, app: Kui):
+        # Initialize the synthesis session store
+        app.state.synthesis_session_store = SynthesisSessionStore(
+            ttl_sec=self.args.session_ttl_sec if hasattr(self.args, "session_ttl_sec") else 1800,
+            max_sessions=self.args.session_max_count if hasattr(self.args, "session_max_count") else 128,
+        )
+
         # Make the ModelManager available to the views
         app.state.model_manager = ModelManager(
             mode=self.args.mode,

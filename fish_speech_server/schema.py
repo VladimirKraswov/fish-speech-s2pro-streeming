@@ -124,3 +124,35 @@ class UpdateReferenceResponse(BaseModel):
     message: str
     old_reference_id: str
     new_reference_id: str
+
+
+class OpenSynthesisSessionRequest(BaseModel):
+    reference_id: str = Field(..., min_length=1)
+    max_history_turns: Annotated[int, conint(ge=1)] = 4
+    max_history_chars: Annotated[int, conint(ge=1)] = 500
+    max_history_code_frames: Annotated[int, conint(ge=0)] = 2000
+
+
+class OpenSynthesisSessionResponse(BaseModel):
+    ok: bool
+    synthesis_session_id: str
+    reference_id: str
+    context: dict | None = None
+
+
+class CloseSynthesisSessionResponse(BaseModel):
+    ok: bool
+    closed: bool
+    synthesis_session_id: str
+
+
+class SynthesisSessionInfoResponse(BaseModel):
+    ok: bool
+    synthesis_session_id: str
+    context: dict
+
+
+class StatefulTTSRequest(ServeTTSRequest):
+    synthesis_session_id: str
+    commit_seq: int
+    commit_reason: str = "unknown"

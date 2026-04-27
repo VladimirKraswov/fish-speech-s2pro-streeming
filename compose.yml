@@ -86,3 +86,6 @@ services:
       timeout: 10s
       retries: 5
       start_period: 30s
+
+volumes:
+  webui_node_modules:

@@ -1,14 +1,35 @@
+# syntax=docker/dockerfile:1.7
+
 FROM node:22-slim AS builder
+
 WORKDIR /app
+
 COPY fish_speech_web_ui/ui/package.json fish_speech_web_ui/ui/package-lock.json* ./
-RUN npm ci
+
+RUN --mount=type=cache,target=/root/.npm \
+    if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
 COPY fish_speech_web_ui/ui .
+
 RUN npm run build
 
+
 FROM python:3.12-slim
-RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends curl
+
 WORKDIR /app
+
 COPY --from=builder /app/dist ./static
 COPY fish_speech_web_ui/server.py .
-RUN pip install fastapi uvicorn
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install fastapi uvicorn
+
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "9001"]

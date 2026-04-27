@@ -1,0 +1,60 @@
+services:
+  server:
+    volumes:
+      - ./checkpoints:/app/checkpoints
+      - ./references:/app/references
+      - ./config:/app/config
+      - ./.torchinductor:/app/.torchinductor
+      - ./fish_speech:/app/fish_speech
+      - ./fish_speech_server:/app/fish_speech_server
+      - ./pyproject.toml:/app/pyproject.toml:ro
+    environment:
+      COMPILE: "${COMPILE:-0}"
+
+  proxy:
+    volumes:
+      - ./config:/app/config
+      - ./fish_speech:/app/fish_speech
+      - ./fish_speech_server:/app/fish_speech_server
+      - ./pyproject.toml:/app/pyproject.toml:ro
+    command:
+      [
+        "uvicorn",
+        "fish_speech_server.proxy.pcm:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "9000",
+        "--reload",
+        "--reload-dir",
+        "/app/fish_speech_server",
+        "--reload-dir",
+        "/app/config"
+      ]
+
+  webui:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.webui.dev
+    image: fish-speech-webui:dev
+    volumes:
+      - ./fish_speech_web_ui/ui:/app
+      - webui_node_modules:/app/node_modules
+    command:
+      [
+        "sh",
+        "-lc",
+        "if [ ! -d node_modules/preact ]; then npm install; fi; npm run dev -- --host 0.0.0.0 --port 9001"
+      ]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://localhost:9001').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s

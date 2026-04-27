@@ -256,3 +256,7 @@ RUN pip install --no-cache-dir -e .[cpu]
 - **WebUI** удобен для тестирования стриминга и сессий.
 
 При возникновении проблем сверяйтесь с логами (`docker compose logs`) и проверяйте пути к моделям и референсам.
+
+
+docker compose build proxy
+docker compose build 

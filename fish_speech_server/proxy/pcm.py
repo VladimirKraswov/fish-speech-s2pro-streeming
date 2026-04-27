@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import re
 import struct
 import time
@@ -24,18 +25,22 @@ from fish_speech_server.config import (
     merge_frontend_proxy_override,
 )
 
-import os
 _RUNTIME = load_runtime_config()
 UPSTREAM_TTS_URL = os.getenv("FISH_UPSTREAM_TTS_URL", _RUNTIME.network.upstream_tts_url)
+
 # Backward compatibility for the audit requested env name
 if os.getenv("UPSTREAM_TTS_URL"):
     UPSTREAM_TTS_URL = os.getenv("UPSTREAM_TTS_URL")
+
 UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=None)
 DEFAULT_REFERENCE_ID = _RUNTIME.proxy.default_reference_id
 SESSION_TTL_SEC = _RUNTIME.proxy.session_ttl_sec
 SESSION_MAX_COUNT = _RUNTIME.proxy.session_max_count
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
 logger = logging.getLogger("fish-proxy")
 
 app = FastAPI(title="Fish Speech PCM Proxy", version="2.0.0")
@@ -50,6 +55,7 @@ app.add_middleware(
 SENTENCE_BOUNDARY_RE = re.compile(r'.+?[.!?…](?:["»”)\]]+)?(?:\s+|$)', re.S)
 CLAUSE_BOUNDARY_RE = re.compile(r'.+?[,:;—\-](?:\s+|$)', re.S)
 
+SHORT_COMPLETE_SENTENCE_MIN_CHARS = 24
 
 DEFAULT_SESSION_CONFIG = _RUNTIME.proxy.model_dump(mode="python")
 
@@ -118,16 +124,24 @@ class SessionStore:
                     expired.append(sid)
                 elif rec.expires_at <= now and rec.stream_finished:
                     expired.append(sid)
+
             for sid in expired:
                 self._items.pop(sid, None)
+
             if expired:
                 logger.info("session cleanup removed=%s", len(expired))
 
-    async def create(self, config: dict[str, Any], raw_config_text: str) -> SessionRecord:
+    async def create(
+        self,
+        config: dict[str, Any],
+        raw_config_text: str,
+    ) -> SessionRecord:
         await self.cleanup()
+
         async with self._lock:
             if len(self._items) >= SESSION_MAX_COUNT:
                 raise HTTPException(429, detail="too many active sessions")
+
             now = time.time()
             session_id = uuid.uuid4().hex
             rec = SessionRecord(
@@ -143,30 +157,38 @@ class SessionStore:
 
     async def get(self, session_id: str, touch: bool = True) -> SessionRecord | None:
         await self.cleanup()
+
         async with self._lock:
             rec = self._items.get(session_id)
             if rec is None:
                 return None
+
             if touch:
                 now = time.time()
                 rec.updated_at = now
                 rec.expires_at = now + SESSION_TTL_SEC
+
             return rec
 
     async def close(self, session_id: str) -> bool:
         async with self._lock:
             rec = self._items.pop(session_id, None)
+
         if rec is None:
             return False
+
         rec.closed = True
+
         try:
             rec.commit_queue.put_nowait({"type": "abort"})
         except Exception:
             pass
+
         return True
 
     async def stats(self) -> dict[str, Any]:
         await self.cleanup()
+
         async with self._lock:
             now = time.time()
             return {
@@ -197,13 +219,16 @@ def _parse_config_text(config_text: str) -> dict[str, Any]:
         payload = json.loads(config_text)
     except json.JSONDecodeError as exc:
         raise HTTPException(400, detail=f"invalid config json: {exc}") from exc
+
     if not isinstance(payload, dict):
         raise HTTPException(400, detail="config json must be an object")
+
     return payload
 
 
 def normalize_config(config_text: str) -> ProxyConfig:
     payload = _parse_config_text(config_text)
+
     try:
         return merge_frontend_proxy_override(payload, runtime=load_runtime_config())
     except Exception as exc:
@@ -213,6 +238,7 @@ def normalize_config(config_text: str) -> ProxyConfig:
 def build_upstream_payload(text: str, config: ProxyConfig) -> dict[str, Any]:
     tts = config.tts
     reference_id = tts.reference_id.strip() or config.default_reference_id
+
     payload = {
         "text": text,
         "streaming": True,
@@ -229,14 +255,17 @@ def build_upstream_payload(text: str, config: ProxyConfig) -> dict[str, Any]:
         "repetition_penalty": tts.repetition_penalty,
         "temperature": tts.temperature,
     }
+
     if tts.seed is not None:
         payload["seed"] = tts.seed
+
     return payload
 
 
 def _parse_wav_header(buf: bytes) -> Optional[Tuple[int, int, int, int]]:
     if len(buf) < 12:
         return None
+
     if buf[0:4] != b"RIFF" or buf[8:12] != b"WAVE":
         raise ValueError("upstream did not return a RIFF/WAVE stream")
 
@@ -248,7 +277,8 @@ def _parse_wav_header(buf: bytes) -> Optional[Tuple[int, int, int, int]]:
     while True:
         if len(buf) < pos + 8:
             return None
-        chunk_id = buf[pos:pos + 4]
+
+        chunk_id = buf[pos : pos + 4]
         chunk_size = struct.unpack_from("<I", buf, pos + 4)[0]
         chunk_data_start = pos + 8
 
@@ -256,23 +286,37 @@ def _parse_wav_header(buf: bytes) -> Optional[Tuple[int, int, int, int]]:
             needed = chunk_data_start + chunk_size + (chunk_size % 2)
             if len(buf) < needed:
                 return None
+
             if chunk_size < 16:
                 raise ValueError("invalid WAV fmt chunk")
-            audio_format, channels, sample_rate = struct.unpack_from("<HHI", buf, chunk_data_start)
-            bits_per_sample = struct.unpack_from("<H", buf, chunk_data_start + 14)[0]
+
+            audio_format, channels, sample_rate = struct.unpack_from(
+                "<HHI",
+                buf,
+                chunk_data_start,
+            )
+            bits_per_sample = struct.unpack_from(
+                "<H",
+                buf,
+                chunk_data_start + 14,
+            )[0]
+
             if audio_format != 1:
                 raise ValueError(f"only PCM WAV is supported, got format={audio_format}")
+
             pos = needed
             continue
 
         if chunk_id == b"data":
             if channels is None or sample_rate is None or bits_per_sample is None:
                 raise ValueError("WAV data chunk arrived before fmt chunk")
+
             return sample_rate, channels, bits_per_sample, chunk_data_start
 
         needed = chunk_data_start + chunk_size + (chunk_size % 2)
         if len(buf) < needed:
             return None
+
         pos = needed
 
 
@@ -292,10 +336,13 @@ def _pcm_bytes_for_duration_ms(
 ) -> int:
     if duration_ms <= 0:
         return 0
+
     bytes_per_second = sample_rate * channels * (bits_per_sample // 8)
     raw = int(bytes_per_second * (duration_ms / 1000.0))
+
     if raw % 2 != 0:
         raw += 1
+
     return raw
 
 
@@ -325,13 +372,16 @@ def _last_boundary_before(
             idx = text.find("\n", idx)
             if idx == -1:
                 break
+
             end = idx + 1
             if end <= limit:
                 candidates.append((end, "newline"))
+
             idx = end
 
     if not candidates:
         return None
+
     candidates.sort(key=lambda x: x[0])
     return candidates[-1]
 
@@ -348,6 +398,7 @@ def _extract_commits(
 
     while True:
         text_len = len(text)
+
         if text_len == 0:
             break
 
@@ -357,8 +408,32 @@ def _extract_commits(
             piece = _right_trim_committed(text)
             if piece:
                 commits.append((piece, "force"))
+
             text = ""
             break
+
+        # Commit a short complete sentence even if it is shorter than stage.min_chars.
+        # This prevents final short tails from getting stuck, but avoids micro-commits
+        # like "Да." and avoids committing a huge buffer before max_chars logic.
+        if (
+            cfg.flush_on_sentence_punctuation
+            and text_len < stage.min_chars
+            and text_len >= SHORT_COMPLETE_SENTENCE_MIN_CHARS
+        ):
+            sentence_boundary = _last_boundary_before(
+                text,
+                text_len,
+                include_clause=False,
+                include_newline=cfg.flush_on_newline,
+            )
+
+            if sentence_boundary and sentence_boundary[0] == text_len:
+                piece = _right_trim_committed(text)
+                if piece:
+                    commits.append((piece, "sentence"))
+
+                text = ""
+                break
 
         if text_len < stage.min_chars:
             break
@@ -372,6 +447,7 @@ def _extract_commits(
             include_clause=False,
             include_newline=cfg.flush_on_newline,
         )
+
         if sentence_boundary and cfg.flush_on_sentence_punctuation:
             end, reason = sentence_boundary
 
@@ -382,6 +458,7 @@ def _extract_commits(
                 include_clause=cfg.flush_on_clause_punctuation,
                 include_newline=cfg.flush_on_newline,
             )
+
             if any_boundary:
                 end, reason = any_boundary
 
@@ -392,6 +469,7 @@ def _extract_commits(
                 include_clause=cfg.flush_on_clause_punctuation,
                 include_newline=cfg.flush_on_newline,
             )
+
             if hard_boundary:
                 end, reason = hard_boundary
             else:
@@ -402,6 +480,7 @@ def _extract_commits(
 
         piece = _right_trim_committed(text[:end])
         text = _normalize_tail_after_commit(text[end:])
+
         if piece:
             commits.append((piece, reason or "unknown"))
         else:
@@ -422,19 +501,31 @@ async def _queue_commits(
 ) -> list[dict[str, Any]]:
     items = []
     now = time.time()
+
     for text, reason in commits:
         seq = rec.next_commit_seq
         rec.next_commit_seq += 1
         rec.commit_chars += len(text)
+
         item = {
             "seq": seq,
             "text": text,
             "reason": reason,
             "created_at": now,
         }
+
         rec.commit_history.append(item)
         await rec.commit_queue.put({"type": "commit", **item})
         items.append(item)
+
+        logger.info(
+            "commit queued session=%s seq=%s reason=%s text_len=%s",
+            rec.session_id[:8],
+            seq,
+            reason,
+            len(text),
+        )
+
     return items
 
 
@@ -459,12 +550,14 @@ async def health() -> dict[str, Any]:
 async def session_open(req: SessionOpenRequest) -> JSONResponse:
     config = normalize_config(req.config_text)
     rec = await session_store.create(config.model_dump(mode="python"), req.config_text)
+
     logger.info(
         "session open id=%s ref=%s emit_bytes=%s",
         rec.session_id[:8],
         config.tts.reference_id,
         config.playback.target_emit_bytes,
     )
+
     return JSONResponse(
         {
             "ok": True,
@@ -478,8 +571,10 @@ async def session_open(req: SessionOpenRequest) -> JSONResponse:
 @app.get("/session/{session_id}")
 async def session_get(session_id: str) -> JSONResponse:
     rec = await session_store.get(session_id, touch=False)
+
     if rec is None:
         raise HTTPException(404, detail="session not found")
+
     return JSONResponse(
         {
             "ok": True,
@@ -503,26 +598,32 @@ async def session_get(session_id: str) -> JSONResponse:
 @app.post("/session/{session_id}/append")
 async def session_append(session_id: str, req: SessionAppendRequest) -> JSONResponse:
     rec = await session_store.get(session_id, touch=True)
+
     if rec is None:
         raise HTTPException(404, detail="session not found")
 
     config = ProxyConfig.model_validate(rec.config)
+
     if len(req.text) + len(rec.buffer_text) > config.session.max_buffer_chars:
         raise HTTPException(400, detail="session buffer limit exceeded")
 
     async with rec.lock:
         if rec.input_closed:
             raise HTTPException(409, detail="session input already finished")
+
         rec.append_chars += len(req.text)
         rec.buffer_text += req.text
+
         commits, remainder = _extract_commits(
             rec.buffer_text,
             config.commit,
             next_commit_seq=rec.next_commit_seq,
             force=False,
         )
+
         rec.buffer_text = remainder
         queued = await _queue_commits(rec, commits)
+
         await _touch_session(rec)
 
     return JSONResponse(
@@ -541,15 +642,25 @@ async def session_append(session_id: str, req: SessionAppendRequest) -> JSONResp
 @app.post("/session/{session_id}/flush")
 async def session_flush(session_id: str, req: SessionFlushRequest) -> JSONResponse:
     rec = await session_store.get(session_id, touch=True)
+
     if rec is None:
         raise HTTPException(404, detail="session not found")
 
     async with rec.lock:
         queued = []
+
         if rec.buffer_text.strip():
             queued = await _queue_commits(rec, [(rec.buffer_text.strip(), req.reason)])
             rec.buffer_text = ""
+
         await _touch_session(rec)
+
+    logger.info(
+        "session flush id=%s committed=%s input_closed=%s",
+        rec.session_id[:8],
+        len(queued),
+        rec.input_closed,
+    )
 
     return JSONResponse(
         {
@@ -566,10 +677,12 @@ async def session_flush(session_id: str, req: SessionFlushRequest) -> JSONRespon
 @app.post("/session/{session_id}/finish")
 async def session_finish(session_id: str, req: SessionFinishRequest) -> JSONResponse:
     rec = await session_store.get(session_id, touch=True)
+
     if rec is None:
         raise HTTPException(404, detail="session not found")
 
     config = ProxyConfig.model_validate(rec.config)
+
     async with rec.lock:
         if rec.input_closed:
             return JSONResponse(
@@ -581,13 +694,24 @@ async def session_finish(session_id: str, req: SessionFinishRequest) -> JSONResp
                     "committed": [],
                 }
             )
+
         rec.input_closed = True
         queued = []
+
         if rec.buffer_text.strip():
             queued = await _queue_commits(rec, [(rec.buffer_text.strip(), req.reason)])
             rec.buffer_text = ""
+
         await rec.commit_queue.put({"type": "eof"})
         await _touch_session(rec)
+
+    logger.info(
+        "session finish id=%s committed=%s buffer_chars=%s input_closed=%s",
+        rec.session_id[:8],
+        len(queued),
+        len(rec.buffer_text),
+        rec.input_closed,
+    )
 
     if config.session.auto_close_on_finish:
         logger.info("session %s marked auto-close-on-finish", rec.session_id[:8])
@@ -607,14 +731,23 @@ async def session_finish(session_id: str, req: SessionFinishRequest) -> JSONResp
 @app.post("/session/close")
 async def session_close(req: SessionCloseRequest) -> JSONResponse:
     removed = await session_store.close(req.session_id)
-    return JSONResponse({"ok": True, "closed": removed, "session_id": req.session_id})
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "closed": removed,
+            "session_id": req.session_id,
+        }
+    )
 
 
 @app.get("/session/{session_id}/pcm-stream")
 async def session_pcm_stream(session_id: str):
     rec = await session_store.get(session_id, touch=True)
+
     if rec is None:
         raise HTTPException(404, detail="session not found")
+
     if rec.stream_lock.locked():
         raise HTTPException(409, detail="session audio stream already opened")
 
@@ -629,20 +762,29 @@ async def session_pcm_stream(session_id: str):
         commit_item: dict[str, Any],
     ) -> AsyncGenerator[bytes, None]:
         payload = build_upstream_payload(text=commit_item["text"], config=config)
+
         header_buffer = bytearray()
         pending_pcm = bytearray()
-        header_sent = rec.audio_meta is not None
+
+        # Important:
+        # Every upstream /v1/tts response is a fresh WAV stream with its own RIFF header.
+        # We must parse and strip the header for every commit, even if rec.audio_meta
+        # is already known from a previous commit.
+        header_sent = False
+
         upstream_bytes = 0
         first_emit_done = False
         start_buffer_bytes = 0
 
         async def flush_pending(force: bool = False) -> AsyncGenerator[bytes, None]:
             nonlocal first_emit_done
+
             while True:
                 if not pending_pcm:
                     return
 
                 threshold = target_emit_bytes
+
                 if not first_emit_done:
                     threshold = max(target_emit_bytes, start_buffer_bytes)
 
@@ -659,6 +801,7 @@ async def session_pcm_stream(session_id: str):
                 pcm_seq = rec.next_pcm_seq
                 rec.next_pcm_seq += 1
                 first_emit_done = True
+
                 yield await emit(
                     {
                         "type": "pcm",
@@ -669,6 +812,7 @@ async def session_pcm_stream(session_id: str):
                         "data": base64.b64encode(out).decode("ascii"),
                     }
                 )
+
                 await asyncio.sleep(0)
 
         yield await emit(
@@ -690,6 +834,7 @@ async def session_pcm_stream(session_id: str):
                 len(commit_item["text"]),
                 payload["reference_id"],
             )
+
             async with client.stream("POST", UPSTREAM_TTS_URL, json=payload) as upstream:
                 if upstream.status_code != 200:
                     text_body = await upstream.aread()
@@ -699,50 +844,72 @@ async def session_pcm_stream(session_id: str):
                 async for chunk in upstream.aiter_raw(1024):
                     if not chunk:
                         continue
+
                     upstream_bytes += len(chunk)
 
                     if not header_sent:
                         header_buffer.extend(chunk)
                         parsed = _parse_wav_header(header_buffer)
+
                         if parsed is None:
                             continue
 
                         sample_rate, channels, bits_per_sample, data_offset = parsed
-                        if bits_per_sample != 16:
-                            raise RuntimeError(f"unsupported bits_per_sample={bits_per_sample}")
 
-                        rec.audio_meta = {
+                        if bits_per_sample != 16:
+                            raise RuntimeError(
+                                f"unsupported bits_per_sample={bits_per_sample}"
+                            )
+
+                        current_audio_meta = {
                             "sample_rate": sample_rate,
                             "channels": channels,
                             "sample_width": bits_per_sample // 8,
                         }
+
                         start_buffer_bytes = _pcm_bytes_for_duration_ms(
                             sample_rate,
                             channels,
                             bits_per_sample,
                             config.playback.start_buffer_ms,
                         )
+
                         if start_buffer_bytes % 2 != 0:
                             start_buffer_bytes += 1
+
                         header_sent = True
-                        yield await emit(
-                            {
-                                "type": "meta",
-                                "session_id": rec.session_id,
-                                "commit_seq": commit_item["seq"],
-                                **rec.audio_meta,
-                            }
-                        )
-                        await asyncio.sleep(0)
+
+                        if rec.audio_meta is None:
+                            rec.audio_meta = current_audio_meta
+
+                            yield await emit(
+                                {
+                                    "type": "meta",
+                                    "session_id": rec.session_id,
+                                    "commit_seq": commit_item["seq"],
+                                    **rec.audio_meta,
+                                }
+                            )
+                            await asyncio.sleep(0)
+
+                        elif rec.audio_meta != current_audio_meta:
+                            raise RuntimeError(
+                                "upstream WAV format changed between commits: "
+                                f"was={rec.audio_meta}, now={current_audio_meta}"
+                            )
 
                         pcm = bytes(header_buffer[data_offset:])
                         header_buffer.clear()
+
                         if pcm:
                             pending_pcm.extend(pcm)
+
                             async for event in flush_pending(force=False):
                                 yield event
+
                     else:
                         pending_pcm.extend(chunk)
+
                         async for event in flush_pending(force=False):
                             yield event
 
@@ -763,6 +930,7 @@ async def session_pcm_stream(session_id: str):
 
     async def body_iter() -> AsyncGenerator[bytes, None]:
         req_id = uuid.uuid4().hex[:8]
+
         async with rec.stream_lock:
             rec.stream_started = True
             await _touch_session(rec)
@@ -784,6 +952,7 @@ async def session_pcm_stream(session_id: str):
                     if item["type"] == "commit":
                         async for event in stream_one_commit(req_id, item):
                             yield event
+
                         await _touch_session(rec)
                         continue
 
@@ -803,8 +972,14 @@ async def session_pcm_stream(session_id: str):
             except asyncio.CancelledError:
                 logger.warning("session stream cancelled id=%s", rec.session_id[:8])
                 raise
+
             except Exception as exc:
-                logger.exception("session stream failed id=%s: %s", rec.session_id[:8], exc)
+                logger.exception(
+                    "session stream failed id=%s: %s",
+                    rec.session_id[:8],
+                    exc,
+                )
+
                 yield await emit(
                     {
                         "type": "error",
@@ -814,6 +989,7 @@ async def session_pcm_stream(session_id: str):
                     }
                 )
                 return
+
             finally:
                 rec.stream_finished = True
                 await _touch_session(rec)
@@ -833,7 +1009,10 @@ async def session_pcm_stream(session_id: str):
     return StreamingResponse(
         body_iter(),
         media_type="application/x-ndjson",
-        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        headers={
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
@@ -857,20 +1036,26 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
 
         async def flush_pending(force: bool = False) -> AsyncGenerator[bytes, None]:
             nonlocal pcm_seq, first_emit_done
+
             while True:
                 if not pending_pcm:
                     return
+
                 threshold = target_emit_bytes
+
                 if not first_emit_done:
                     threshold = max(target_emit_bytes, start_buffer_bytes)
+
                 if not force and len(pending_pcm) < threshold:
                     return
+
                 if len(pending_pcm) >= threshold:
                     out = bytes(pending_pcm[:threshold])
                     del pending_pcm[:threshold]
                 else:
                     out = bytes(pending_pcm)
                     pending_pcm.clear()
+
                 yield await emit(
                     {
                         "type": "pcm",
@@ -879,25 +1064,44 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
                         "data": base64.b64encode(out).decode("ascii"),
                     }
                 )
+
                 pcm_seq += 1
                 first_emit_done = True
 
-        yield await emit({"type": "proxy_start", "req_id": req_id, "mode": "stateless"})
+        yield await emit(
+            {
+                "type": "proxy_start",
+                "req_id": req_id,
+                "mode": "stateless",
+            }
+        )
+
         async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
             async with client.stream("POST", UPSTREAM_TTS_URL, json=payload) as upstream:
                 if upstream.status_code != 200:
                     msg = (await upstream.aread()).decode("utf-8", errors="replace")
-                    yield await emit({"type": "error", "req_id": req_id, "message": msg})
+                    yield await emit(
+                        {
+                            "type": "error",
+                            "req_id": req_id,
+                            "message": msg,
+                        }
+                    )
                     return
+
                 async for chunk in upstream.aiter_raw(1024):
                     if not chunk:
                         continue
+
                     if not header_sent:
                         header_buffer.extend(chunk)
                         parsed = _parse_wav_header(header_buffer)
+
                         if parsed is None:
                             continue
+
                         sample_rate, channels, bits_per_sample, data_offset = parsed
+
                         header_sent = True
                         start_buffer_bytes = _pcm_bytes_for_duration_ms(
                             sample_rate,
@@ -905,8 +1109,10 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
                             bits_per_sample,
                             config.playback.start_buffer_ms,
                         )
+
                         if start_buffer_bytes % 2 != 0:
                             start_buffer_bytes += 1
+
                         yield await emit(
                             {
                                 "type": "meta",
@@ -916,25 +1122,40 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
                                 "sample_width": bits_per_sample // 8,
                             }
                         )
+
                         pcm = bytes(header_buffer[data_offset:])
                         header_buffer.clear()
+
                         if pcm:
                             pending_pcm.extend(pcm)
+
                             async for event in flush_pending():
                                 yield event
+
                     else:
                         pending_pcm.extend(chunk)
+
                         async for event in flush_pending():
                             yield event
 
         if config.playback.stop_grace_ms > 0:
             await asyncio.sleep(config.playback.stop_grace_ms / 1000.0)
+
         async for event in flush_pending(force=True):
             yield event
-        yield await emit({"type": "done", "req_id": req_id})
+
+        yield await emit(
+            {
+                "type": "done",
+                "req_id": req_id,
+            }
+        )
 
     return StreamingResponse(
         body_iter(),
         media_type="application/x-ndjson",
-        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        headers={
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
+        },
     )

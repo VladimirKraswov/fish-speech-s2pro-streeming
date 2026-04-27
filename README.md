@@ -1,262 +1,942 @@
 # Fish Speech S2 Pro — стриминговая TTS на RTX 5090
 
 Репозиторий содержит полный стек для запуска **Fish Speech** в стриминговом режиме:
-- сервер синтеза речи (FastAPI + PyTorch)
-- прокси для управления сессиями и PCM‑стриминга
-- веб‑интерфейс для интерактивного тестирования
 
-Всё работает через **Docker Compose** и оптимизировано для **NVIDIA RTX 5090** (но подойдёт для любых GPU с достаточным объёмом VRAM).
+- **server** — сервер синтеза речи: FastAPI + PyTorch + Fish Speech
+- **proxy** — session API, commit logic и PCM/NDJSON streaming
+- **webui** — веб-интерфейс для интерактивного тестирования
+
+Проект запускается через **Docker Compose** и поддерживает два режима:
+
+- **prod** — собранные Docker images, без монтирования исходников
+- **dev** — исходники монтируются в контейнеры, правки Python/Frontend подхватываются без полной пересборки
+
+Оптимизировано под **NVIDIA RTX 5090**, но подойдёт для любых GPU с достаточным объёмом VRAM.
 
 ---
 
-## Быстрый старт (если модели и референс уже подготовлены)
+## Структура сервисов
 
-Если у вас уже есть:
-- `checkpoints/fs-1.2-int8-s2-pro-int8/model.pth` (int8‑квантованная модель)
-- `checkpoints/s2-pro/codec.pth`
-- `references/voice/voice.codes.pt` и `references/voice/voice.lab`
+| Сервис | Порт | Назначение |
+|---|---:|---|
+| `server` | `8080` | TTS inference server |
+| `proxy` | `9000` | Stateful session proxy + PCM stream |
+| `webui` | `9001` | Browser UI для тестирования |
 
-то запуск одной командой:
+Health endpoints:
+
+```bash
+curl http://localhost:8080/v1/health
+curl http://localhost:9000/health
+curl http://localhost:9001/health
+```
+
+---
+
+## Быстрый старт, если модели и референс уже подготовлены
+
+Нужны файлы:
+
+```text
+checkpoints/fs-1.2-int8-s2-pro-int8/model.pth
+checkpoints/s2-pro/codec.pth
+references/voice/voice.codes.pt
+references/voice/voice.lab
+```
+
+Запуск production-стека:
 
 ```bash
 git clone <url-репозитория>
 cd fish-speech-s2pro-streeming
-docker compose up -d
+
+docker compose up -d --build
 ```
 
-Через 1–2 минуты сервисы будут доступны:
-- TTS сервер: `http://localhost:8080`
-- Прокси: `http://localhost:9000`
-- WebUI: `http://localhost:9001`
+Или через `Makefile`:
+
+```bash
+make prod-up
+```
+
+После запуска:
+
+- TTS server: http://localhost:8080
+- Proxy: http://localhost:9000
+- WebUI: http://localhost:9001
 
 ---
 
-## Полная установка с нуля
+# Режимы запуска
 
-### 1. Требования
+## Production mode
 
-- **Linux** (Ubuntu 22.04 / 24.04)
-- **Docker** и **Docker Compose** (плагин)
-- **NVIDIA Container Toolkit** (для GPU)
-- **Python 3.10+** и **uv** (для вспомогательных скриптов)
-- **ffmpeg** (для конвертации аудио)
+Production использует основной `compose.yml`.
 
-### 2. Клонирование и локальные зависимости
+```bash
+docker compose up -d --build
+```
+
+Через `Makefile`:
+
+```bash
+make prod-up
+```
+
+Остановка:
+
+```bash
+make prod-down
+```
+
+Логи:
+
+```bash
+make prod-logs
+make prod-logs SERVICE=server
+make prod-logs SERVICE=proxy
+make prod-logs SERVICE=webui
+```
+
+Production подходит для стабильного запуска, где код не меняется на лету.
+
+---
+
+## Development mode
+
+Development использует overlay-файл:
+
+```text
+compose.dev.yml
+```
+
+В dev-режиме:
+
+- `fish_speech/` монтируется в контейнер
+- `fish_speech_server/` монтируется в контейнер
+- `config/` монтируется в контейнер
+- proxy запускается через `uvicorn --reload`
+- webui запускается через Vite dev server
+- после правок `pcm.py` обычно не нужна пересборка
+- после правок proxy часто не нужен даже restart, потому что работает reload
+
+Запуск dev-стека:
+
+```bash
+docker compose -f compose.yml -f compose.dev.yml up -d
+```
+
+Через `Makefile`:
+
+```bash
+make dev-up
+```
+
+Запуск с пересборкой:
+
+```bash
+make dev-build-up
+```
+
+Запуск только конкретных сервисов:
+
+```bash
+make dev-up SERVICES="proxy webui"
+make dev-up SERVICES="server"
+```
+
+Перезапуск одного сервиса:
+
+```bash
+make restart SERVICE=proxy
+make restart SERVICE=server
+make restart SERVICE=webui
+```
+
+Пересборка одного сервиса:
+
+```bash
+make build SERVICE=proxy
+make build SERVICE=server
+make build SERVICE=webui
+```
+
+Полная пересборка одного сервиса без cache:
+
+```bash
+make rebuild SERVICE=proxy
+```
+
+Поднять один сервис без зависимостей:
+
+```bash
+make up SERVICE=proxy
+```
+
+Логи одного сервиса:
+
+```bash
+make dev-logs SERVICE=proxy
+```
+
+---
+
+# Почему proxy больше не должен скачивать torch
+
+Proxy — это транспортный/session слой. Ему не нужен PyTorch и не нужен полный `fish-speech[cu128]`.
+
+В dev/prod Dockerfile для proxy должны ставиться только лёгкие зависимости:
+
+```text
+fastapi
+httpx
+uvicorn
+pydantic
+loguru
+```
+
+Это важно, потому что иначе при каждом изменении Python-кода Docker может заново качать:
+
+```text
+torch-2.8.0
+torchaudio
+descript-audio-codec
+librosa
+transformers
+...
+```
+
+Правильный dev-cycle для proxy:
+
+```bash
+# один раз
+make build SERVICE=proxy
+
+# после правок Python-кода
+make restart SERVICE=proxy
+```
+
+В dev-режиме из-за `uvicorn --reload` часто достаточно просто сохранить файл.
+
+---
+
+# Полная установка с нуля
+
+## 1. Требования
+
+- Linux: Ubuntu 22.04 / 24.04
+- Docker
+- Docker Compose plugin
+- NVIDIA Container Toolkit
+- Python 3.10+
+- `uv`
+- `ffmpeg`
+- GPU с достаточным объёмом VRAM
+
+Проверка GPU в Docker:
+
+```bash
+docker run --rm --gpus all nvidia/cuda:12.8.1-base-ubuntu24.04 nvidia-smi
+```
+
+---
+
+## 2. Клонирование
 
 ```bash
 git clone <url>
 cd fish-speech-s2pro-streeming
-uv sync --extra cu129   # или python -m venv .venv && source .venv/bin/activate && pip install -e .[cu129]
 ```
 
-### 3. Сборка Docker‑образов
+Локальные Python-зависимости нужны только для вспомогательных скриптов вне Docker:
+
+```bash
+uv sync --extra cu128
+```
+
+или:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[cu128]"
+```
+
+---
+
+## 3. Сборка Docker-образов
+
+Production:
+
+```bash
+make prod-up
+```
+
+Development:
+
+```bash
+make dev-build-up
+```
+
+Или напрямую:
 
 ```bash
 docker compose build
 ```
 
-### 4. Скачивание исходной модели (s2-pro)
+---
 
-Модель **s2-pro** содержит кодек `codec.pth` и веса текстовой модели (которые мы потом квантуем). Скачайте через `huggingface-cli` (запуск из временного контейнера):
+## 4. Скачивание модели s2-pro
+
+Скачайте модель `fishaudio/s2-pro`:
 
 ```bash
 mkdir -p checkpoints/s2-pro
+
 docker run --rm -v "$PWD":/workspace -w /workspace \
-  --entrypoint /app/venv/bin/huggingface-cli \
-  fish-speech-server:latest \
-  download fishaudio/s2-pro --local-dir checkpoints/s2-pro
+  --entrypoint uv \
+  fish-speech-server:cuda \
+  run huggingface-cli download fishaudio/s2-pro --local-dir checkpoints/s2-pro
 ```
 
-### 5. Квантизация текстовой модели в int8
-
-Для RTX 5090 настоятельно рекомендуется **int8 weight‑only** квантизация – она сильно снижает потребление VRAM.
+Если `huggingface-cli` недоступен внутри образа, можно поставить локально:
 
 ```bash
-docker run --rm --user root -v "$PWD":/workspace -w /workspace \
-  --entrypoint /app/venv/bin/python \
-  fish-speech-server:latest \
-  tools/llama/quantize.py \
+uv pip install huggingface_hub
+uv run huggingface-cli download fishaudio/s2-pro --local-dir checkpoints/s2-pro
+```
+
+---
+
+## 5. Квантизация модели в int8
+
+Для RTX 5090 рекомендуется **int8 weight-only** квантизация.
+
+```bash
+docker run --rm --gpus all --user root \
+  -v "$PWD":/workspace -w /workspace \
+  --entrypoint uv \
+  fish-speech-server:cuda \
+  run python tools/llama/quantize.py \
     --checkpoint-path checkpoints/s2-pro \
     --mode int8 \
     --timestamp s2-pro-int8
-
-sudo chown -R $USER:$USER checkpoints/fs-1.2-int8-s2-pro-int8
 ```
 
-Результат: `checkpoints/fs-1.2-int8-s2-pro-int8/model.pth`.
+После этого должен появиться файл:
 
-### 6. Подготовка референсного голоса
+```text
+checkpoints/fs-1.2-int8-s2-pro-int8/model.pth
+```
 
-Положите образец речи (5–15 секунд, моно, 44100 Гц, без шумов) в папку `input_ref` вместе с текстовой расшифровкой:
+Если файлы созданы от root:
+
+```bash
+sudo chown -R "$USER:$USER" checkpoints/fs-1.2-int8-s2-pro-int8
+```
+
+---
+
+## 6. Подготовка референсного голоса
+
+Создайте папку:
 
 ```bash
 mkdir -p input_ref
-# voice.wav и voice.lab
 ```
 
-Если исходный файл не WAV или длиннее 15 секунд, приведите к формату:
+Положите туда:
 
-```bash
-ffmpeg -i my_voice.mp3 -ac 1 -ar 44100 -c:a pcm_s16le -ss 0 -t 15 input_ref/voice.wav
+```text
+input_ref/voice.wav
+input_ref/voice.lab
 ```
 
-### 7. Предварительное кодирование референса (`.codes.pt`)
+Требования к `voice.wav`:
 
-Чтобы сервер не тратил время на кодирование при каждом запуске:
+- 5–15 секунд
+- моно
+- 44100 Hz
+- без музыки и сильного шума
+
+Конвертация:
 
 ```bash
-docker run --rm -v "$PWD":/workspace -w /workspace --user root \
-  --entrypoint /app/venv/bin/python \
-  fish-speech-server:latest \
-  tools/preencode_references.py \
+ffmpeg -i my_voice.mp3 \
+  -ac 1 \
+  -ar 44100 \
+  -c:a pcm_s16le \
+  -ss 0 \
+  -t 15 \
+  input_ref/voice.wav
+```
+
+`voice.lab` должен содержать точный текст, произнесённый в `voice.wav`.
+
+---
+
+## 7. Предварительное кодирование референса
+
+```bash
+docker run --rm --user root \
+  -v "$PWD":/workspace -w /workspace \
+  --entrypoint uv \
+  fish-speech-server:cuda \
+  run python tools/preencode_references.py \
     -i input_ref \
     --ref-id voice \
     --checkpoint-path checkpoints/s2-pro/codec.pth \
     --device cpu
 ```
 
-Появится папка `references/voice` с `voice.codes.pt` и `voice.lab`.
+Результат:
 
-### 8. Настройка конфигурации
-
-Отредактируйте `config/runtime.json`. **Важные параметры для RTX 5090**:
-
-- `model.compile`: `true` – включает JIT‑компиляцию (ускоряет инференс, но первый запуск может длиться 10–15 минут).  
-  `false` – быстрый старт, чуть ниже производительность.
-- `model.precision = "bfloat16"`
-- `model.cache_max_seq_len = 768`
-- `playback.target_emit_bytes = 6144`, `playback.start_buffer_ms = 120`
-- `frontend_overrides.enabled = false` – отключает проверку полей (избавляет от ошибок 400 при работе WebUI). Рекомендуется.
-
-### 9. Запуск всех сервисов
-
-Используйте **умный скрипт запуска**, который ждёт реальной готовности (особенно важно при `compile: true`):
-
-```bash
-chmod +x scripts/start_services.sh
-./scripts/start_services.sh
-```
-
-Скрипт:
-- запускает сервер, читает его логи и ждёт строк `Application startup complete` или `Warmup done`
-- затем проверяет health endpoint
-- после этого запускает прокси и WebUI
-
-Если вы предпочитаете ручной запуск (без ожидания компиляции):
-
-```bash
-docker compose up -d
-```
-
-### 10. Проверка работоспособности
-
-```bash
-curl http://localhost:8080/v1/health        # {"status":"ok"}
-curl http://localhost:9000/health           # {"ok":true,...}
-curl http://localhost:9001/health           # {"status":"ok","service":"web-ui"}
-```
-
-Откройте в браузере `http://<IP-сервера>:9001` – появится интерфейс для ввода текста и потокового синтеза.
-
----
-
-## Управление сервисами
-
-- `docker compose down` – остановка всех
-- `docker compose restart [service]` – перезапуск
-- `docker compose logs -f [service]` – просмотр логов
-
-**Изменение конфигурации:**  
-Благодаря тому, что в `compose.yml` добавлен volume `./config:/app/config`, вы можете править `config/runtime.json` на хосте, а затем перезапустить контейнеры – изменения вступят в силу без пересборки образов.
-
-```bash
-docker compose restart server proxy
+```text
+references/voice/voice.codes.pt
+references/voice/voice.lab
 ```
 
 ---
 
-## Устранение типичных проблем
+# Конфигурация
 
-### 1. Сервер не становится healthy при `compile: true`
+Основной конфиг:
 
-- Используйте `scripts/start_services.sh` – он ждёт завершения компиляции по логам, а не по таймауту healthcheck.
-- Убедитесь, что контейнеру выделено достаточно памяти: в `docker-compose.override.yml` можно задать `mem_limit: 32g` и `shm_size: 8g`.
-- Если компиляция падает с ошибками подпроцессов, добавьте `environment: TORCHINDUCTOR_COMPILE_THREADS: 1` (уже есть в `compose.yml`).
-
-### 2. Прокси падает с `ModuleNotFoundError: No module named 'fish_speech'`
-
-Образ прокси собирается с установкой основного пакета `fish-speech`. Проверьте, что `docker/Dockerfile.proxy` содержит строки:
-
-```dockerfile
-COPY pyproject.toml .
-COPY fish_speech ./fish_speech
-COPY fish_speech_server ./fish_speech_server
-RUN pip install --no-cache-dir -e .[cpu]
+```text
+config/runtime.json
 ```
 
-Пересоберите прокси: `docker compose build --no-cache proxy`.
+Он монтируется в контейнеры:
 
-### 3. WebUI возвращает 400 при открытии сессии (disallowed paths)
+```yaml
+./config:/app/config
+```
 
-Отключите проверку полей в `config/runtime.json`:
+Поэтому после изменения `runtime.json` обычно достаточно перезапустить нужный сервис.
+
+Для server:
+
+```bash
+make restart SERVICE=server
+```
+
+Для proxy:
+
+```bash
+make restart SERVICE=proxy
+```
+
+---
+
+## Важные параметры для RTX 5090
 
 ```json
-"frontend_overrides": {
-  "enabled": false,
-  ...
+"model": {
+  "device": "cuda",
+  "precision": "bfloat16",
+  "compile": true,
+  "cache_max_seq_len": 768
 }
 ```
 
-Затем перезапустите прокси: `docker compose restart proxy`.
+Рекомендации:
 
-### 4. Порты 8080/9000/9001 уже заняты
+- `compile: true` — лучше performance, но первый запуск может быть долгим
+- `compile: false` — быстрее старт, удобнее для разработки
+- `cache_max_seq_len: 768` — безопасный стартовый budget
+- `cleanup_after_request: false` — меньше overhead между запросами
+- `empty_cache_per_stream_chunk: false` — важно для streaming latency
 
-Найдите и убейте процесс, занимающий порт, либо измените маппинг в `compose.yml` (например, `"8081:8080"`).
+Для dev можно запускать без compile:
 
----
-
-## Структура проекта (основные файлы)
-
-```
-.
-├── compose.yml                     # оркестрация Docker
-├── docker/
-│   ├── Dockerfile.server           # образ сервера TTS
-│   ├── Dockerfile.proxy            # образ прокси
-│   └── Dockerfile.webui            # образ WebUI
-├── config/
-│   └── runtime.json                # единый конфиг (монтируется)
-├── checkpoints/                    # модели (монтируются)
-├── references/                     # референсные голоса (монтируются)
-├── tools/                          # утилиты (квантизация, preencode)
-├── scripts/
-│   └── start_services.sh           # умный запуск с ожиданием
-└── fish_speech_server/             # исходный код TTS сервера
+```bash
+COMPILE=0 make dev-up
 ```
 
 ---
 
-## Требования к оборудованию
+## Proxy commit policy
 
-- **VRAM**: ~8–10 ГБ для int8‑квантованной модели + кодек. На RTX 5090 (24 ГБ) работает отлично.
-- **RAM хоста**: 16 ГБ при `compile: false`, 32 ГБ рекомендуется при `compile: true`.
-- **Драйверы NVIDIA**: версия 545+.
-- **Docker**: с поддержкой GPU (NVIDIA Container Toolkit).
+Настройки proxy находятся в:
+
+```json
+"proxy": {
+  "commit": {
+    "first": {
+      "min_chars": 40,
+      "target_chars": 58,
+      "max_chars": 84
+    },
+    "next": {
+      "min_chars": 120,
+      "target_chars": 160,
+      "max_chars": 240
+    }
+  }
+}
+```
+
+Идея:
+
+- первый commit меньше — чтобы быстрее услышать первый звук
+- следующие commit крупнее — чтобы меньше рвать интонацию
+- короткий финальный хвост должен уходить через `/finish` или short sentence commit logic
 
 ---
 
-## Заключение
+## Frontend overrides
 
-Проект полностью работоспособен. Рекомендации:
+`frontend_overrides` ограничивает, какие поля WebUI может менять при открытии session.
 
-- **Используйте int8 квантизацию** – экономит VRAM.
-- **Для быстрого старта отключайте компиляцию** (`compile: false`).
-- **Для максимальной производительности** включайте компиляцию и запускайте через `start_services.sh`.
-- **Монтирование `config`** позволяет легко менять параметры без пересборки.
-- **WebUI** удобен для тестирования стриминга и сессий.
+Если WebUI возвращает `400 disallowed paths`, лучше добавить нужные поля в:
 
-При возникновении проблем сверяйтесь с логами (`docker compose logs`) и проверяйте пути к моделям и референсам.
+```json
+"frontend_overrides": {
+  "allowed_paths": []
+}
+```
 
+На время разработки можно отключить проверку:
 
+```json
+"frontend_overrides": {
+  "enabled": false
+}
+```
+
+Но для стабильного режима лучше оставить `enabled: true`.
+
+---
+
+# Makefile команды
+
+## Production
+
+```bash
+make prod-up
+make prod-down
+make prod-logs
+make prod-logs SERVICE=server
+```
+
+## Development
+
+```bash
+make dev-up
+make dev-build-up
+make dev-down
+make dev-logs
+make dev-logs SERVICE=proxy
+```
+
+## Работа с отдельными сервисами
+
+```bash
+make build SERVICE=proxy
+make rebuild SERVICE=proxy
+make restart SERVICE=proxy
+make up SERVICE=proxy
+make stop SERVICE=proxy
+```
+
+## Проверка
+
+```bash
+make ps
+make health
+```
+
+---
+
+# Docker Compose напрямую
+
+Если не используете `Makefile`.
+
+## Production
+
+```bash
+docker compose up -d --build
+docker compose logs -f proxy
+docker compose restart proxy
+docker compose down
+```
+
+## Development
+
+```bash
+docker compose -f compose.yml -f compose.dev.yml up -d
+docker compose -f compose.yml -f compose.dev.yml up -d --build proxy
+docker compose -f compose.yml -f compose.dev.yml restart proxy
+docker compose -f compose.yml -f compose.dev.yml logs -f proxy
+docker compose -f compose.yml -f compose.dev.yml down
+```
+
+---
+
+# Частые сценарии разработки
+
+## Я поправил `fish_speech_server/proxy/pcm.py`
+
+В dev-режиме обычно ничего делать не надо — `uvicorn --reload` перезапустится сам.
+
+Если нужно руками:
+
+```bash
+make restart SERVICE=proxy
+```
+
+Не нужно:
+
+```bash
 docker compose build proxy
-docker compose build 
+```
+
+## Я поправил frontend
+
+В dev-режиме Vite сам подхватит изменения.
+
+Если нужно:
+
+```bash
+make restart SERVICE=webui
+```
+
+## Я поменял `requirements.txt` proxy
+
+Нужна пересборка proxy:
+
+```bash
+make build SERVICE=proxy
+make up SERVICE=proxy
+```
+
+## Я поменял `pyproject.toml`
+
+Для server:
+
+```bash
+make build SERVICE=server
+make up SERVICE=server
+```
+
+Для proxy пересборка нужна только если proxy действительно зависит от новых Python-пакетов.
+
+## Я поменял `Dockerfile.proxy`
+
+```bash
+make build SERVICE=proxy
+make up SERVICE=proxy
+```
+
+## Я поменял модель или reference
+
+Если файлы лежат в `checkpoints/` или `references/`, пересборка не нужна, потому что они монтируются volume’ами.
+
+Нужен restart server:
+
+```bash
+make restart SERVICE=server
+```
+
+---
+
+# API proxy
+
+## Открыть session
+
+```bash
+curl -s http://localhost:9000/session/open \
+  -H "Content-Type: application/json" \
+  -d '{"config_text":"{}"}'
+```
+
+Обычно WebUI отправляет полный config override.
+
+## Append text
+
+```bash
+curl -s http://localhost:9000/session/<SESSION_ID>/append \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Привет, это тест."}'
+```
+
+## Finish
+
+```bash
+curl -s http://localhost:9000/session/<SESSION_ID>/finish \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"input_finished"}'
+```
+
+## Stream
+
+```bash
+curl -N http://localhost:9000/session/<SESSION_ID>/pcm-stream
+```
+
+События идут как NDJSON:
+
+```json
+{"type":"session_start"}
+{"type":"commit_start","commit_seq":1}
+{"type":"meta","sample_rate":44100,"channels":1,"sample_width":2}
+{"type":"pcm","seq":1,"data":"...base64..."}
+{"type":"commit_done","commit_seq":1}
+{"type":"session_done"}
+```
+
+---
+
+# Проверка полного сценария
+
+1. Запустить dev:
+
+```bash
+make dev-up
+```
+
+2. Открыть WebUI:
+
+```text
+http://localhost:9001
+```
+
+3. Нажать `Open session`
+
+4. Нажать `Start streaming`
+
+5. Проверить логи proxy:
+
+```bash
+make dev-logs SERVICE=proxy
+```
+
+Ожидаемые признаки:
+
+```text
+session open id=...
+commit queued session=... seq=1 reason=...
+REQ ... commit_seq=1 upstream start ...
+commit queued session=... seq=2 reason=...
+REQ ... commit_seq=2 upstream start ...
+session finish id=... committed=...
+```
+
+---
+
+# Устранение типичных проблем
+
+## 1. Каждый build proxy снова скачивает torch
+
+Proxy не должен устанавливать `fish-speech[сpu]` и не должен скачивать `torch`.
+
+Проверь `docker/Dockerfile.proxy`.
+
+Неправильно:
+
+```dockerfile
+RUN pip install -e .[cpu]
+```
+
+Правильно:
+
+```dockerfile
+COPY fish_speech_server/proxy/requirements.txt /tmp/proxy-requirements.txt
+RUN pip install -r /tmp/proxy-requirements.txt
+```
+
+После этого proxy rebuild будет быстрым.
+
+---
+
+## 2. Изменил Python-код, но ничего не поменялось
+
+В prod-режиме исходники не монтируются. Нужно пересобрать образ:
+
+```bash
+make build SERVICE=proxy
+make up SERVICE=proxy
+```
+
+В dev-режиме исходники монтируются. Достаточно:
+
+```bash
+make restart SERVICE=proxy
+```
+
+или дождаться `uvicorn --reload`.
+
+---
+
+## 3. Proxy падает с `ModuleNotFoundError`
+
+Проверь, что в `Dockerfile.proxy` есть:
+
+```dockerfile
+ENV PYTHONPATH=/app
+COPY fish_speech ./fish_speech
+COPY fish_speech_server ./fish_speech_server
+```
+
+В dev-режиме проверь `compose.dev.yml`:
+
+```yaml
+volumes:
+  - ./fish_speech:/app/fish_speech
+  - ./fish_speech_server:/app/fish_speech_server
+```
+
+---
+
+## 4. Server долго не становится healthy
+
+Если включён `compile: true`, первый запуск может быть долгим.
+
+Смотри логи:
+
+```bash
+make dev-logs SERVICE=server
+```
+
+Для разработки можно отключить compile:
+
+```bash
+COMPILE=0 make dev-up
+```
+
+---
+
+## 5. WebUI возвращает 400 при открытии session
+
+Причина обычно в `frontend_overrides.allowed_paths`.
+
+Варианты:
+
+1. Добавить недостающее поле в `allowed_paths`
+2. Временно отключить проверку:
+
+```json
+"frontend_overrides": {
+  "enabled": false
+}
+```
+
+После изменения:
+
+```bash
+make restart SERVICE=proxy
+```
+
+---
+
+## 6. Порты заняты
+
+Проверить:
+
+```bash
+sudo lsof -i :8080
+sudo lsof -i :9000
+sudo lsof -i :9001
+```
+
+Или изменить port mapping в `compose.yml`.
+
+---
+
+# Рекомендуемая структура проекта
+
+```text
+.
+├── compose.yml
+├── compose.dev.yml
+├── Makefile
+├── .dockerignore
+├── docker/
+│   ├── Dockerfile.server
+│   ├── Dockerfile.proxy
+│   ├── Dockerfile.webui
+│   └── Dockerfile.webui.dev
+├── config/
+│   └── runtime.json
+├── checkpoints/
+├── references/
+├── fish_speech/
+├── fish_speech_server/
+│   └── proxy/
+│       ├── pcm.py
+│       └── requirements.txt
+├── fish_speech_web_ui/
+│   ├── server.py
+│   └── ui/
+├── tools/
+└── scripts/
+```
+
+---
+
+# Docker cache рекомендации
+
+В Dockerfiles используется BuildKit cache:
+
+```dockerfile
+RUN --mount=type=cache,target=/root/.cache/pip ...
+RUN --mount=type=cache,target=/tmp/uv-cache ...
+RUN --mount=type=cache,target=/root/.npm ...
+```
+
+Убедись, что BuildKit включён:
+
+```bash
+export DOCKER_BUILDKIT=1
+export COMPOSE_DOCKER_CLI_BUILD=1
+```
+
+В `Makefile` эти переменные уже выставлены.
+
+---
+
+# Требования к оборудованию
+
+Минимально:
+
+- GPU NVIDIA с достаточным VRAM
+- 16 GB RAM
+- Docker с GPU support
+
+Рекомендуется:
+
+- RTX 5090 / 4090 / A-серия
+- 24 GB VRAM
+- 32–64 GB RAM
+- `compile: true` для production
+- `compile: false` для активной разработки
+
+---
+
+# Заключение
+
+Рекомендуемый workflow:
+
+## Для разработки
+
+```bash
+make dev-up
+make dev-logs SERVICE=proxy
+make restart SERVICE=proxy
+```
+
+## Для production
+
+```bash
+make prod-up
+make prod-logs
+```
+
+Главные правила:
+
+- не пересобирать весь проект после каждой правки
+- proxy не должен скачивать torch
+- модели и референсы хранить как mounted volumes
+- для Python-правок использовать dev overlay
+- для frontend-правок использовать Vite dev server
+- пересобирать только тот сервис, где изменились зависимости или Dockerfile

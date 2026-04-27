@@ -227,11 +227,24 @@ export function App() {
     }
   };
 
-  const finishSession = async () => {
+    const finishSession = async () => {
     if (!sessionId) return;
+
     setSessionStatus('finishing');
-    await client.current.finishSession(sessionId).catch((error) => log(`finish failed: ${error.message}`));
-  };
+
+    try {
+        const data = await client.current.finishSession(sessionId);
+
+        if (data.committed?.length) {
+        setCommitted((prev) => [...(data.committed ?? []), ...prev].slice(0, 80));
+        log(`finish committed ${data.committed.length} segment(s)`);
+        } else {
+        log('finish sent, no buffered text');
+        }
+    } catch (error) {
+        log(`finish failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    };
 
   const closeSession = async () => {
     if (!sessionId) return;
@@ -284,11 +297,13 @@ export function App() {
     simulator.current.start(text);
   };
 
-  const stopTextStream = () => {
+    const stopTextStream = async () => {
     simulator.current?.stop();
     setIsStreaming(false);
     log('text stream stopped');
-  };
+
+    await finishSession();
+    };
 
   const flush = async () => {
     if (!sessionId) return;

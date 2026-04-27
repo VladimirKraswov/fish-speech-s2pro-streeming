@@ -62,11 +62,17 @@ async def stateful_inference_async(
             # In real environment, collected_codes is a list of torch.Tensors
             # with shape (codebooks, frames)
             if all(hasattr(c, "shape") for c in collected_codes):
-                final_codes = torch.cat(collected_codes, dim=1)
+                final_codes = torch.cat(collected_codes, dim=1).cpu()
                 code_frames = estimate_code_frames(final_codes)
             else:
                 # Fallback or mixed types (unlikely in practice)
-                final_codes = collected_codes
+                # If they are not tensors, we still try to move them to CPU if they are objects
+                final_codes = []
+                for c in collected_codes:
+                    if hasattr(c, "cpu"):
+                        final_codes.append(c.cpu())
+                    else:
+                        final_codes.append(c)
                 code_frames = sum(estimate_code_frames(c) for c in collected_codes)
         except Exception as e:
             logger.warning(f"Failed to concatenate collected codes: {e}")

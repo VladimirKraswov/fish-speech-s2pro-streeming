@@ -128,9 +128,9 @@ class UpdateReferenceResponse(BaseModel):
 
 class OpenSynthesisSessionRequest(BaseModel):
     reference_id: str = Field(..., min_length=1)
-    max_history_turns: Annotated[int, conint(ge=1)] = 4
-    max_history_chars: Annotated[int, conint(ge=1)] = 500
-    max_history_code_frames: Annotated[int, conint(ge=0)] = 2000
+    max_history_turns: Annotated[int, conint(ge=1)] = 2
+    max_history_chars: Annotated[int, conint(ge=1)] = 220
+    max_history_code_frames: Annotated[int, conint(ge=0)] = 180
 
 
 class OpenSynthesisSessionResponse(BaseModel):

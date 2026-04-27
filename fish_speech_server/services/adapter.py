@@ -175,18 +175,12 @@ def stateful_tts_to_driver_request(
     # and handle them in a modified inference path if needed,
     # or just use them if they exist.
 
-    # NOTE:
-    # This is only a preliminary continuation hook.
-    # It is not guaranteed to affect generation until DriverSynthesisRequest
-    # and the FishSpeechDriver pipeline explicitly consume prompt_text/prompt_tokens.
-    try:
-        driver_req.prompt_text = [t.text for t in history_turns]
-        driver_req.prompt_tokens = [t.codes for t in history_turns]
-    except Exception as e:
-        from loguru import logger
+    # Explicitly populate continuation fields
+    driver_req.continuation_text = [t.text for t in history_turns]
+    driver_req.continuation_tokens = [t.codes for t in history_turns]
 
-        logger.warning(
-            f"Could not attach continuation fields to DriverSynthesisRequest: {e}"
-        )
+    # Legacy fallback for older components if any
+    driver_req.prompt_text = driver_req.continuation_text
+    driver_req.prompt_tokens = driver_req.continuation_tokens
 
     return driver_req

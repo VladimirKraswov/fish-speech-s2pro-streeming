@@ -39,6 +39,8 @@ def generate_committed_segments(
     chunk_length: int = 512,
     prompt_text: Optional[Union[str, list[str]]] = None,
     prompt_tokens: Optional[Union[torch.Tensor, list[torch.Tensor]]] = None,
+    continuation_text: Optional[Union[str, list[str]]] = None,
+    continuation_tokens: Optional[Union[torch.Tensor, list[torch.Tensor]]] = None,
     stream_tokens: bool = False,
     stream_chunk_size: int = 8,
     initial_stream_chunk_size: int = 10,
@@ -51,6 +53,8 @@ def generate_committed_segments(
     assert 0 < temperature < 2, "temperature must be in (0, 2)"
 
     runtime = load_runtime_config()
+
+    # Normalize prompt (reference)
     use_prompt = bool(prompt_text) and bool(prompt_tokens)
     if use_prompt and isinstance(prompt_text, str):
         prompt_text = [prompt_text]
@@ -60,9 +64,19 @@ def generate_committed_segments(
         assert len(prompt_text) == len(
             prompt_tokens
         ), "Prompt text and tokens must have the same length"
-
-    if prompt_tokens:
         prompt_tokens = [i.cpu() for i in prompt_tokens]
+
+    # Normalize continuation
+    use_continuation = bool(continuation_text) and bool(continuation_tokens)
+    if use_continuation and isinstance(continuation_text, str):
+        continuation_text = [continuation_text]
+        continuation_tokens = [continuation_tokens]
+
+    if use_continuation:
+        assert len(continuation_text) == len(
+            continuation_tokens
+        ), "Continuation text and tokens must have the same length"
+        continuation_tokens = [i.cpu() for i in continuation_tokens]
 
     model_size = sum(p.numel() for p in model.parameters() if p.requires_grad)
     tokenizer = model.tokenizer
@@ -103,6 +117,32 @@ def generate_committed_segments(
             add_im_end=True,
         )
     )
+
+    if use_continuation:
+        for old_text, old_codes in zip(continuation_text, continuation_tokens):
+            if not old_text or old_codes is None:
+                continue
+
+            base_conversation.append(
+                Message(
+                    role="user",
+                    parts=[TextPart(text=old_text, cal_loss=False)],
+                    cal_loss=False,
+                    add_im_start=True,
+                    add_im_end=True,
+                )
+            )
+
+            base_conversation.append(
+                Message(
+                    role="assistant",
+                    parts=[VQPart(codes=old_codes.cpu(), cal_loss=False)],
+                    cal_loss=False,
+                    modality="voice",
+                    add_im_start=True,
+                    add_im_end=True,
+                )
+            )
 
     logger.info("Generating {} committed segment(s)", len(committed_segments))
 
@@ -162,6 +202,21 @@ def generate_committed_segments(
                 )
 
             prompt_len = encoded.size(1)
+
+            logger.info(
+                "prompt_budget: prompt_len={} cache={} max_new_tokens={} ref_turns={} continuation_turns={} continuation_frames={}",
+                prompt_len,
+                max_length,
+                max_new_tokens,
+                len(prompt_text or []),
+                len(continuation_text or []),
+                sum(
+                    int(c.shape[-1])
+                    for c in continuation_tokens or []
+                    if hasattr(c, "shape")
+                ),
+            )
+
             if prompt_len > max_length:
                 raise ValueError(
                     f"Prompt length {prompt_len} exceeds KV cache size {max_length}. "
@@ -211,28 +266,33 @@ def generate_committed_segments(
                 codes_list: list[torch.Tensor] = []
                 chunk_idx = 0
                 for chunk in gen:
-                    codes_chunk = chunk[1:, :].clone()
-                    if chunk_idx < 3:
-                        logger.info(
-                            "stream: generate_committed_segments chunk_idx={} chunk.shape={} codes_chunk.shape={}",
-                            chunk_idx,
-                            chunk.shape,
-                            codes_chunk.shape,
-                        )
-                    if (codes_chunk >= 0).all():
+                    main_tokens = chunk[0]
+                    semantic_mask = (
+                        (main_tokens >= tokenizer.semantic_begin_id)
+                        & (main_tokens <= tokenizer.semantic_end_id)
+                    )
+
+                    if semantic_mask.any():
+                        codes_chunk = chunk[1:, semantic_mask].clone()
+                        if chunk_idx < 3:
+                            logger.info(
+                                "stream: generate_committed_segments chunk_idx={} chunk.shape={} codes_chunk.shape={}",
+                                chunk_idx,
+                                chunk.shape,
+                                codes_chunk.shape,
+                            )
                         yield GenerateResponse(
                             action="sample", codes=codes_chunk, text=batch_text
                         )
-                    codes_list.append(chunk)
+                        codes_list.append(codes_chunk.cpu())
                     chunk_idx += 1
+
                 logger.info(
                     "stream: generate_committed_segments finished chunk_idx={} total_chunks={}",
                     chunk_idx,
                     len(codes_list),
                 )
-                codes = (
-                    torch.cat(codes_list, dim=1)[1:, :].clone() if codes_list else None
-                )
+                codes = torch.cat(codes_list, dim=1).clone() if codes_list else None
                 if codes is not None:
                     conversation.append(
                         Message(

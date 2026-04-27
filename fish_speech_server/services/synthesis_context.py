@@ -85,11 +85,16 @@ class SynthesisContext:
         other_turns = self.history[:-1]
 
         # 1. Limit by max_history_turns
+        # We need to keep up to (max_history_turns - 1) other turns, plus the last turn.
+        # If max_history_turns is 1, other_turns will be empty.
         if len(self.history) > self.max_history_turns:
             other_turns = self.history[-(self.max_history_turns) : -1]
+        else:
+            other_turns = self.history[:-1]
 
         # 2. Limit by max_history_chars
-        # We work backwards from the newest 'other' turns
+        # We work backwards from the newest 'other' turns.
+        # Note: We always keep the last turn, even if it exceeds the limit by itself.
         def get_chars(turns):
             return sum(len(t.text) for t in turns) + len(last_turn.text)
 

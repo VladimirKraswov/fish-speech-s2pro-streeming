@@ -139,28 +139,40 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             ref_id = req.reference_id
             prompt_tokens, prompt_texts = [], []
 
-            # Add continuation prompt from history if provided
-            if req.prompt_tokens and req.prompt_text:
-                prompt_tokens.extend(req.prompt_tokens)
-                prompt_texts.extend(req.prompt_text)
-                logger.info(
-                    "continuation: added history to prompt turns={} chars={}",
-                    len(req.prompt_text),
-                    sum(len(t) for t in req.prompt_text),
-                )
+            ref_tokens, ref_texts = [], []
+            history_tokens, history_texts = [], []
 
+            # 1. Load main reference
             if ref_id is not None:
-                new_tokens, new_texts = self.load_by_id(ref_id, req.use_memory_cache)
-                prompt_tokens.extend(new_tokens)
-                prompt_texts.extend(new_texts)
+                ref_tokens, ref_texts = self.load_by_id(ref_id, req.use_memory_cache)
                 _mark("ref_loaded", mode="id")
             elif req.references:
-                new_tokens, new_texts = self.load_by_hash(
+                ref_tokens, ref_texts = self.load_by_hash(
                     req.references, req.use_memory_cache
                 )
-                prompt_tokens.extend(new_tokens)
-                prompt_texts.extend(new_texts)
                 _mark("ref_loaded", mode="hash", refs=len(req.references))
+
+            # 2. Load continuation history
+            if req.continuation_tokens and req.continuation_text:
+                history_tokens = list(req.continuation_tokens)
+                history_texts = list(req.continuation_text)
+                logger.info(
+                    "continuation: added history after reference turns={} chars={}",
+                    len(history_texts),
+                    sum(len(t) for t in history_texts),
+                )
+            elif req.prompt_tokens and req.prompt_text:
+                history_tokens = list(req.prompt_tokens)
+                history_texts = list(req.prompt_text)
+                logger.info(
+                    "continuation: added legacy history after reference turns={} chars={}",
+                    len(history_texts),
+                    sum(len(t) for t in history_texts),
+                )
+
+            # Keep prompt_tokens/texts as combined for backward compatibility
+            prompt_tokens = list(ref_tokens) + list(history_tokens)
+            prompt_texts = list(ref_texts) + list(history_texts)
 
             if req.seed is not None:
                 set_seed(req.seed)
@@ -169,7 +181,13 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             stream_tokens = bool(req.stream_tokens)
             ack_queue = queue.Queue() if stream_tokens else None
             response_queue = self.send_Llama_request(
-                req, prompt_tokens, prompt_texts, req_tag=req_tag, ack_queue=ack_queue
+                req,
+                prompt_tokens=ref_tokens,
+                prompt_text=ref_texts,
+                req_tag=req_tag,
+                ack_queue=ack_queue,
+                continuation_tokens=history_tokens,
+                continuation_text=history_texts,
             )
             _mark("llama_queued")
             if stream_tokens:
@@ -344,6 +362,8 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         prompt_texts: list,
         req_tag: str,
         ack_queue: queue.Queue | None = None,
+        continuation_tokens: list | None = None,
+        continuation_text: list | None = None,
     ) -> queue.Queue:
         """
         Send a request to the LLAMA model to generate the symbolic tokens.
@@ -364,6 +384,8 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             chunk_length=req.chunk_length,
             prompt_tokens=prompt_tokens,
             prompt_text=prompt_texts,
+            continuation_tokens=continuation_tokens,
+            continuation_text=continuation_text,
             stream_tokens=stream_tokens,
             stream_chunk_size=req.stream_chunk_size,
             initial_stream_chunk_size=req.initial_stream_chunk_size,

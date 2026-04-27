@@ -34,6 +34,8 @@ class DriverSynthesisRequest:
     stream_audio: bool = False
     prompt_text: list[str] | None = None
     prompt_tokens: list[Any] | None = None
+    continuation_text: list[str] | None = None
+    continuation_tokens: list[Any] | None = None
     generation: DriverGenerationOptions = field(default_factory=DriverGenerationOptions)
 
     def committed_segments(self) -> list[str]:

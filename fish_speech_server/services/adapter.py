@@ -129,53 +129,23 @@ def stateful_tts_to_driver_request(
     req: StatefulTTSRequest, context: SynthesisContext
 ) -> DriverSynthesisRequest:
     """
-    Creates a DriverSynthesisRequest that includes rolling history for acoustic continuity.
+    Creates a DriverSynthesisRequest that includes rolling acoustic history
+    for continuity while keeping the speaker reference separate.
     """
     from fish_speech_server.services.continuation import (
         select_history_turns_for_continuation,
     )
 
-    # 1. Start with standard conversion
     driver_req = api_tts_to_driver_request(req)
-
-    # Also force stream_tokens=True to ensure we get codes back
-    # from the very first commit in a stateful session.
+    driver_req.reference_id = req.reference_id or context.reference_id
     driver_req.generation.stream_tokens = True
+    driver_req.segments = [req.text] if req.text.strip() else []
 
-    # 2. Select history for continuation
     history_turns = select_history_turns_for_continuation(context)
-
     if not history_turns:
         return driver_req
 
-    # 3. Add history to prompt_text and prompt_tokens
-    # Fish Speech expects prompt_text and prompt_tokens to be lists of same length
-    # or combined structures. In DriverSynthesisRequest (implied),
-    # it might need to be passed down via custom logic if DriverSynthesisRequest
-    # doesn't have these fields yet.
-
-    # Looking at GenerateRequest in TTSInferenceEngine.send_Llama_request:
-    # prompt_tokens=prompt_tokens,
-    # prompt_text=prompt_text,
-
-    # We need to ensure DriverSynthesisRequest can carry these,
-    # OR we use a pattern where they are injected.
-
-    # Let's check DriverSynthesisRequest fields in fish_speech/driver/types.py
-    # (I saw them earlier, it didn't have prompt_text/tokens explicitly,
-    # but the Engine used them).
-
-    # If I can't modify DriverSynthesisRequest cleanly, I'll use text-based
-    # fallback for now, but the goal is acoustic continuity.
-
-    # Wait, TTSInferenceEngine.inference loads prompt_tokens from ref_id.
-    # We might need to extend DriverSynthesisRequest or use a different mechanism.
-
-    # For now, let's assume we can attach them to driver_req as attributes
-    # and handle them in a modified inference path if needed,
-    # or just use them if they exist.
-
-    # Explicitly populate continuation fields
+    # Pass acoustic continuation separately from the speaker reference.
     driver_req.continuation_text = [t.text for t in history_turns]
     driver_req.continuation_tokens = [t.codes for t in history_turns]
 

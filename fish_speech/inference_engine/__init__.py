@@ -183,7 +183,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             response_queue = self.send_Llama_request(
                 req,
                 prompt_tokens=ref_tokens,
-                prompt_text=ref_texts,
+                prompt_texts=ref_texts,
                 req_tag=req_tag,
                 ack_queue=ack_queue,
                 continuation_tokens=history_tokens,

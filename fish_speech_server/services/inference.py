@@ -21,7 +21,9 @@ from fish_speech_server.schema import ServeTTSRequest
 AMPLITUDE = 32768
 
 
-def inference_wrapper(req: ServeTTSRequest | Any, driver: FishSpeechDriver):
+def inference_wrapper(
+    req: ServeTTSRequest | DriverSynthesisRequest | Any, driver: FishSpeechDriver
+):
     """
     Wrapper for the inference function.
     Used in the API server.
@@ -30,10 +32,12 @@ def inference_wrapper(req: ServeTTSRequest | Any, driver: FishSpeechDriver):
 
     if isinstance(req, DriverSynthesisRequest):
         driver_req = req
+        streaming = bool(getattr(driver_req, "stream_audio", False))
     else:
         driver_req = api_tts_to_driver_request(req)
+        streaming = bool(getattr(req, "streaming", False))
 
-    if req.streaming:
+    if streaming:
         yield wav_chunk_header(sample_rate=driver.sample_rate)
 
     for event in driver.synthesize(driver_req):
@@ -58,7 +62,7 @@ def inference_wrapper(req: ServeTTSRequest | Any, driver: FishSpeechDriver):
                 # отдавать повторно. Но и завершать генератор здесь тоже нельзя:
                 # иначе driver inference не успевает выставить finished_normally,
                 # и finally-ветка ошибочно запускает cleanup_on_abort.
-                if req.streaming:
+                if streaming:
                     continue
 
                 count += 1

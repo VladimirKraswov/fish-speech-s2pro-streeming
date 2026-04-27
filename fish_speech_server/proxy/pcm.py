@@ -236,9 +236,7 @@ def normalize_config(config_text: str) -> ProxyConfig:
         raise HTTPException(400, detail=str(exc)) from exc
 
 
-def build_upstream_payload(
-    text: str, config: ProxyConfig, rec: SessionRecord | None = None
-) -> dict[str, Any]:
+def build_upstream_payload(text: str, config: ProxyConfig) -> dict[str, Any]:
     tts = config.tts
     reference_id = tts.reference_id.strip() or config.default_reference_id
 
@@ -261,16 +259,6 @@ def build_upstream_payload(
 
     if tts.seed is not None:
         payload["seed"] = tts.seed
-
-    if (
-        rec
-        and rec.synthesis_session_id
-        and tts.stateful_synthesis
-        and UPSTREAM_TTS_URL.endswith("/v1/tts")
-    ):
-        payload["synthesis_session_id"] = rec.synthesis_session_id
-        payload["commit_seq"] = rec.next_commit_seq - 1
-        payload["commit_reason"] = "proxy_commit"
 
     return payload
 
@@ -570,19 +558,36 @@ async def session_open(req: SessionOpenRequest) -> JSONResponse:
                 resp = await client.post(
                     UPSTREAM_TTS_URL.replace("/v1/tts", "/v1/synthesis/sessions/open"),
                     json={
-                        "reference_id": config.tts.reference_id or config.default_reference_id,
+                        "reference_id": config.tts.reference_id
+                        or config.default_reference_id,
                     },
+                    headers={"Accept": "application/json"},
                 )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    rec.synthesis_session_id = data.get("synthesis_session_id")
-                    logger.info(
-                        "proxy session %s linked to upstream synthesis session %s",
-                        rec.session_id[:8],
-                        rec.synthesis_session_id[:8] if rec.synthesis_session_id else "none",
-                    )
-        except Exception as e:
-            logger.warning("failed to open upstream synthesis session: %s", e)
+                if resp.status_code != 200:
+                    raise RuntimeError(f"upstream status={resp.status_code}")
+
+                data = resp.json()
+                rec.synthesis_session_id = data.get("synthesis_session_id")
+                if not rec.synthesis_session_id:
+                    raise RuntimeError("upstream did not return synthesis_session_id")
+
+                logger.info(
+                    "proxy session %s linked to upstream synthesis session %s",
+                    rec.session_id[:8],
+                    rec.synthesis_session_id[:8],
+                )
+        except Exception as exc:
+            if config.tts.stateful_fallback_to_stateless:
+                logger.warning(
+                    "failed to open upstream synthesis session; falling back to stateless: %s",
+                    exc,
+                )
+                rec.synthesis_session_id = None
+            else:
+                raise HTTPException(
+                    502,
+                    detail=f"failed to open upstream synthesis session: {exc}",
+                )
 
     logger.info(
         "session open id=%s ref=%s emit_bytes=%s",
@@ -608,6 +613,8 @@ async def session_get(session_id: str) -> JSONResponse:
     if rec is None:
         raise HTTPException(404, detail="session not found")
 
+    config = ProxyConfig.model_validate(rec.config)
+
     return JSONResponse(
         {
             "ok": True,
@@ -621,6 +628,8 @@ async def session_get(session_id: str) -> JSONResponse:
             "append_chars": rec.append_chars,
             "commit_chars": rec.commit_chars,
             "input_closed": rec.input_closed,
+            "synthesis_session_id": rec.synthesis_session_id,
+            "stateful_synthesis": config.tts.stateful_synthesis,
             "stream_started": rec.stream_started,
             "stream_finished": rec.stream_finished,
             "commit_history": rec.commit_history[-50:],
@@ -763,6 +772,23 @@ async def session_finish(session_id: str, req: SessionFinishRequest) -> JSONResp
 
 @app.post("/session/close")
 async def session_close(req: SessionCloseRequest) -> JSONResponse:
+    rec = await session_store.get(req.session_id, touch=False)
+
+    if rec and rec.synthesis_session_id:
+        try:
+            async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
+                await client.post(
+                    UPSTREAM_TTS_URL.replace("/v1/tts", "/v1/synthesis/sessions/close"),
+                    json=rec.synthesis_session_id,
+                    headers={"Accept": "application/json"},
+                )
+        except Exception as exc:
+            logger.warning(
+                "failed to close upstream synthesis session %s: %s",
+                rec.synthesis_session_id,
+                exc,
+            )
+
     removed = await session_store.close(req.session_id)
 
     return JSONResponse(
@@ -794,11 +820,18 @@ async def session_pcm_stream(session_id: str):
         req_id: str,
         commit_item: dict[str, Any],
     ) -> AsyncGenerator[bytes, None]:
-        payload = build_upstream_payload(text=commit_item["text"], config=config, rec=rec)
+        payload = build_upstream_payload(text=commit_item["text"], config=config)
 
         url = UPSTREAM_TTS_URL
         if rec.synthesis_session_id and config.tts.stateful_synthesis:
             url = url.replace("/v1/tts", "/v1/synthesis/synthesize")
+            payload.update(
+                {
+                    "synthesis_session_id": rec.synthesis_session_id,
+                    "commit_seq": commit_item["seq"],
+                    "commit_reason": commit_item["reason"],
+                }
+            )
 
         header_buffer = bytearray()
         pending_pcm = bytearray()

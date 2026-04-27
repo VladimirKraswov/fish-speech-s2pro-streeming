@@ -13,7 +13,7 @@ from kui.asgi import (
 from loguru import logger
 from pydantic import BaseModel
 
-from fish_speech import FishSpeechDriver
+from fish_speech import DriverTokenChunkEvent, FishSpeechDriver
 from fish_speech_server.config import load_runtime_config
 from fish_speech_server.services.inference import inference_wrapper as inference
 from fish_speech_server.schema import ServeTTSRequest

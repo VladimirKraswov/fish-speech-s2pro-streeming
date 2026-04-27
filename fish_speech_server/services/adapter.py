@@ -171,7 +171,10 @@ def stateful_tts_to_driver_request(
     # and handle them in a modified inference path if needed,
     # or just use them if they exist.
 
-    # If I can't find prompt_tokens in DriverSynthesisRequest, I'll add them:
+    # NOTE:
+    # This is only a preliminary continuation hook.
+    # It is not guaranteed to affect generation until DriverSynthesisRequest
+    # and the FishSpeechDriver pipeline explicitly consume prompt_text/prompt_tokens.
     driver_req.prompt_text = [t.text for t in history_turns]
     driver_req.prompt_tokens = [t.codes for t in history_turns]
 

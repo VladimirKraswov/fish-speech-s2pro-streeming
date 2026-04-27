@@ -26,7 +26,6 @@ from starlette.responses import Response
 from typing_extensions import Annotated
 
 from fish_speech import DriverErrorEvent, DriverFinalAudioEvent
-from fish_speech_server.services.adapter import api_tts_to_driver_request
 from fish_speech_server.schema import (
     AddEncodedReferenceResponse,
     AddReferenceRequest,
@@ -51,11 +50,11 @@ from fish_speech_server.api.utils import (
     get_content_type,
     inference_async,
 )
-from fish_speech_server.services.continuation import build_continuation_debug_summary
 from fish_speech_server.services.adapter import (
     api_tts_to_driver_request,
     stateful_tts_to_driver_request,
 )
+from fish_speech_server.services.continuation import build_continuation_debug_summary
 from fish_speech_server.services.stateful_inference import stateful_inference_async
 from fish_speech_server.services.model_manager import ModelManager
 from fish_speech_server.services.model_utils import (
@@ -618,7 +617,9 @@ async def open_synthesis_session(
     Обеспечивает сохранение контекста (истории) между запросами.
     """
     try:
-        store = request.app.state.synthesis_session_store
+        from kui.asgi import request as kui_request
+
+        store = kui_request.app.state.synthesis_session_store
         ctx = await store.create(
             reference_id=req.reference_id,
             max_history_turns=req.max_history_turns,
@@ -626,13 +627,13 @@ async def open_synthesis_session(
             max_history_code_frames=req.max_history_code_frames,
         )
 
-        return format_response(
+        return JSONResponse(
             OpenSynthesisSessionResponse(
                 ok=True,
                 synthesis_session_id=ctx.synthesis_session_id,
                 reference_id=ctx.reference_id,
                 context=ctx.to_public_dict(),
-            )
+            ).model_dump(mode="json")
         )
     except ValueError as e:
         raise HTTPException(HTTPStatus.BAD_REQUEST, content=str(e))
@@ -648,18 +649,20 @@ async def get_synthesis_session(synthesis_session_id: str):
     """
     GET /v1/synthesis/sessions/{id} — возвращает информацию о сессии и её историю.
     """
-    store = request.app.state.synthesis_session_store
+    from kui.asgi import request as kui_request
+
+    store = kui_request.app.state.synthesis_session_store
     ctx = await store.get(synthesis_session_id, touch=True)
 
     if ctx is None:
         raise HTTPException(HTTPStatus.NOT_FOUND, content="Synthesis session not found")
 
-    return format_response(
+    return JSONResponse(
         SynthesisSessionInfoResponse(
             ok=True,
             synthesis_session_id=ctx.synthesis_session_id,
             context=ctx.to_public_dict(),
-        )
+        ).model_dump(mode="json")
     )
 
 
@@ -668,15 +671,17 @@ async def close_synthesis_session(synthesis_session_id: str = Body(...)):
     """
     POST /v1/synthesis/sessions/close — закрывает сессию.
     """
-    store = request.app.state.synthesis_session_store
+    from kui.asgi import request as kui_request
+
+    store = kui_request.app.state.synthesis_session_store
     closed = await store.close(synthesis_session_id)
 
-    return format_response(
+    return JSONResponse(
         CloseSynthesisSessionResponse(
             ok=True,
             closed=closed,
             synthesis_session_id=synthesis_session_id,
-        )
+        ).model_dump(mode="json")
     )
 
 
@@ -687,7 +692,9 @@ async def stateful_synthesize(req: Annotated[StatefulTTSRequest, Body(exclusive=
     Автоматически обновляет историю сессии после завершения генерации.
     """
     try:
-        app_state = request.app.state
+        from kui.asgi import request as kui_request
+
+        app_state = kui_request.app.state
         model_manager: ModelManager = app_state.model_manager
         driver = model_manager.driver
         store = app_state.synthesis_session_store

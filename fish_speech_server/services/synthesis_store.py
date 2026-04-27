@@ -48,9 +48,21 @@ class SynthesisSessionStore:
                 reference_id=reference_id,
                 created_at=now,
                 updated_at=now,
-                max_history_turns=max_history_turns or self.default_max_history_turns,
-                max_history_chars=max_history_chars or self.default_max_history_chars,
-                max_history_code_frames=max_history_code_frames or self.default_max_history_code_frames,
+                max_history_turns=(
+                    max_history_turns
+                    if max_history_turns is not None
+                    else self.default_max_history_turns
+                ),
+                max_history_chars=(
+                    max_history_chars
+                    if max_history_chars is not None
+                    else self.default_max_history_chars
+                ),
+                max_history_code_frames=(
+                    max_history_code_frames
+                    if max_history_code_frames is not None
+                    else self.default_max_history_code_frames
+                ),
             )
 
             self._items[synthesis_session_id] = ctx

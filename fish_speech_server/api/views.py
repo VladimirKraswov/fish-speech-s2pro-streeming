@@ -1,7 +1,6 @@
 import io
 import os
 import re
-import shutil
 import tempfile
 import time
 from http import HTTPStatus
@@ -28,7 +27,6 @@ from typing_extensions import Annotated
 from fish_speech import DriverErrorEvent, DriverFinalAudioEvent
 from fish_speech_server.schema import (
     AddEncodedReferenceResponse,
-    AddReferenceRequest,
     AddReferenceResponse,
     CloseSynthesisSessionResponse,
     DeleteReferenceResponse,
@@ -617,9 +615,7 @@ async def open_synthesis_session(
     Обеспечивает сохранение контекста (истории) между запросами.
     """
     try:
-        from kui.asgi import request as kui_request
-
-        store = kui_request.app.state.synthesis_session_store
+        store = request.app.state.synthesis_session_store
         ctx = await store.create(
             reference_id=req.reference_id,
             max_history_turns=req.max_history_turns,
@@ -649,9 +645,7 @@ async def get_synthesis_session(synthesis_session_id: str):
     """
     GET /v1/synthesis/sessions/{id} — возвращает информацию о сессии и её историю.
     """
-    from kui.asgi import request as kui_request
-
-    store = kui_request.app.state.synthesis_session_store
+    store = request.app.state.synthesis_session_store
     ctx = await store.get(synthesis_session_id, touch=True)
 
     if ctx is None:
@@ -671,9 +665,7 @@ async def close_synthesis_session(synthesis_session_id: str = Body(...)):
     """
     POST /v1/synthesis/sessions/close — закрывает сессию.
     """
-    from kui.asgi import request as kui_request
-
-    store = kui_request.app.state.synthesis_session_store
+    store = request.app.state.synthesis_session_store
     closed = await store.close(synthesis_session_id)
 
     return JSONResponse(
@@ -692,9 +684,7 @@ async def stateful_synthesize(req: Annotated[StatefulTTSRequest, Body(exclusive=
     Автоматически обновляет историю сессии после завершения генерации.
     """
     try:
-        from kui.asgi import request as kui_request
-
-        app_state = kui_request.app.state
+        app_state = request.app.state
         model_manager: ModelManager = app_state.model_manager
         driver = model_manager.driver
         store = app_state.synthesis_session_store

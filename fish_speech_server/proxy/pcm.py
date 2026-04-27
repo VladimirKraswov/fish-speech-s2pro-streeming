@@ -584,6 +584,7 @@ async def session_open(req: SessionOpenRequest) -> JSONResponse:
                 )
                 rec.synthesis_session_id = None
             else:
+                await session_store.close(rec.session_id)
                 raise HTTPException(
                     502,
                     detail=f"failed to open upstream synthesis session: {exc}",

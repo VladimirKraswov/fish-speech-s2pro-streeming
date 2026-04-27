@@ -138,6 +138,10 @@ def stateful_tts_to_driver_request(
     # 1. Start with standard conversion
     driver_req = api_tts_to_driver_request(req)
 
+    # Also force stream_tokens=True to ensure we get codes back
+    # from the very first commit in a stateful session.
+    driver_req.generation.stream_tokens = True
+
     # 2. Select history for continuation
     history_turns = select_history_turns_for_continuation(context)
 
@@ -175,10 +179,14 @@ def stateful_tts_to_driver_request(
     # This is only a preliminary continuation hook.
     # It is not guaranteed to affect generation until DriverSynthesisRequest
     # and the FishSpeechDriver pipeline explicitly consume prompt_text/prompt_tokens.
-    driver_req.prompt_text = [t.text for t in history_turns]
-    driver_req.prompt_tokens = [t.codes for t in history_turns]
+    try:
+        driver_req.prompt_text = [t.text for t in history_turns]
+        driver_req.prompt_tokens = [t.codes for t in history_turns]
+    except Exception as e:
+        from loguru import logger
 
-    # Also force stream_tokens=True to ensure we get codes back
-    driver_req.generation.stream_tokens = True
+        logger.warning(
+            f"Could not attach continuation fields to DriverSynthesisRequest: {e}"
+        )
 
     return driver_req

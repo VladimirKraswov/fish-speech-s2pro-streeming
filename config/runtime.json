@@ -40,7 +40,7 @@
     "text": "Привет. Это дополнительный прогрев стримингового режима для Fish Speech.",
     "streaming": true,
     "stream_tokens": true,
-    "max_new_tokens": 160,
+    "max_new_tokens": 192,
     "chunk_length": 160,
     "initial_stream_chunk_size": 10,
     "stream_chunk_size": 8
@@ -52,18 +52,18 @@
     "version": 1,
     "commit": {
       "first": {
-        "min_chars": 35,
-        "target_chars": 55,
-        "max_chars": 80,
+        "min_chars": 32,
+        "target_chars": 58,
+        "max_chars": 84,
         "max_wait_ms": 150,
         "allow_partial_after_ms": 240
       },
       "next": {
-        "min_chars": 70,
-        "target_chars": 105,
-        "max_chars": 145,
-        "max_wait_ms": 300,
-        "allow_partial_after_ms": 550
+        "min_chars": 45,
+        "target_chars": 85,
+        "max_chars": 125,
+        "max_wait_ms": 340,
+        "allow_partial_after_ms": 600
       },
       "flush_on_sentence_punctuation": true,
       "flush_on_clause_punctuation": true,
@@ -89,8 +89,8 @@
     },
     "playback": {
       "target_emit_bytes": 6144,
-      "start_buffer_ms": 140,
-      "stop_grace_ms": 60
+      "start_buffer_ms": 160,
+      "stop_grace_ms": 80
     },
     "session": {
       "max_buffer_chars": 4000,
@@ -114,6 +114,7 @@
       "commit.flush_on_sentence_punctuation",
       "commit.flush_on_clause_punctuation",
       "commit.flush_on_newline",
+
       "tts.reference_id",
       "tts.format",
       "tts.normalize",
@@ -129,9 +130,11 @@
       "tts.stream_chunk_size",
       "tts.stateful_synthesis",
       "tts.stateful_fallback_to_stateless",
+
       "playback.target_emit_bytes",
       "playback.start_buffer_ms",
       "playback.stop_grace_ms",
+
       "session.max_buffer_chars",
       "session.auto_close_on_finish"
     ]

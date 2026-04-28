@@ -41,6 +41,28 @@ class ModelConfig(BaseModel):
     record_memory_history: bool = False
     memory_history_max_entries: int = Field(100000, ge=1)
 
+    # Long-form settings
+    long_form_auto_split: bool = True
+    long_form_target_chars: int = Field(220, ge=40)
+    long_form_max_chars: int = Field(320, ge=80)
+    long_form_context_policy: str = "tail_frames"
+    long_form_tail_frames: int = Field(48, ge=0)
+    long_form_max_history_segments: int = Field(1, ge=0)
+    long_form_tokens_per_char: float = Field(1.3, ge=0.1, le=5.0)
+    long_form_token_overhead: int = Field(32, ge=0)
+    long_form_min_new_tokens: int = Field(48, ge=1)
+    long_form_max_new_tokens_per_segment: int = Field(256, ge=1)
+
+    @field_validator("long_form_context_policy")
+    @classmethod
+    def validate_long_form_context_policy(cls, value: str) -> str:
+        value = value.strip().lower()
+        if value not in {"none", "last_segment", "tail_frames"}:
+            raise ValueError(
+                "long_form_context_policy must be one of: none, last_segment, tail_frames"
+            )
+        return value
+
     @field_validator("precision")
     @classmethod
     def validate_precision(cls, value: str) -> str:

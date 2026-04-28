@@ -13,6 +13,7 @@ from fish_speech.content_sequence import TextPart, VQPart
 from fish_speech.conversation import Conversation, Message
 from fish_speech.driver.config import load_runtime_config
 from fish_speech.generation.decode import _cache_max_seq_len, generate
+from fish_speech.generation.text_splitter import split_long_text
 
 
 @dataclass
@@ -45,6 +46,32 @@ def _count_code_frames(values: list[Any]) -> int:
     return total
 
 
+def _select_generated_history(
+    generated_history: list[tuple[str, torch.Tensor]],
+    *,
+    policy: str,
+    tail_frames: int,
+    max_history_segments: int,
+) -> list[tuple[str, torch.Tensor]]:
+    if not generated_history or policy == "none":
+        return []
+
+    if policy == "last_segment":
+        return generated_history[-max_history_segments:]
+
+    if policy == "tail_frames":
+        if tail_frames <= 0:
+            return []
+
+        last_text, last_codes = generated_history[-1]
+        if last_codes.shape[-1] <= tail_frames:
+            return [(last_text, last_codes)]
+
+        return [(last_text, last_codes[:, -tail_frames:])]
+
+    return []
+
+
 def generate_committed_segments(
     *,
     model,
@@ -69,9 +96,34 @@ def generate_committed_segments(
     stream_chunk_size: int = 8,
     initial_stream_chunk_size: int = 10,
 ):
-    committed_segments = [segment for segment in (segments or []) if segment.strip()]
-    if not committed_segments and text and text.strip():
-        committed_segments = [text]
+    runtime = load_runtime_config()
+    model_cfg = runtime.model
+
+    raw_segments = [segment for segment in (segments or []) if segment.strip()]
+    if not raw_segments and text and text.strip():
+        raw_segments = [text]
+
+    if model_cfg.long_form_auto_split:
+        committed_segments = []
+        for segment in raw_segments:
+            committed_segments.extend(
+                split_long_text(
+                    segment,
+                    target_chars=model_cfg.long_form_target_chars,
+                    max_chars=model_cfg.long_form_max_chars,
+                )
+            )
+    else:
+        committed_segments = raw_segments
+
+    logger.info(
+        "long_form_split: input_segments={} output_segments={} target_chars={} max_chars={} text_chars={}",
+        len(raw_segments),
+        len(committed_segments),
+        model_cfg.long_form_target_chars,
+        model_cfg.long_form_max_chars,
+        sum(len(s) for s in raw_segments),
+    )
 
     assert 0 < top_p <= 1, "top_p must be in (0, 1]"
     assert 0 < temperature < 2, "temperature must be in (0, 2)"
@@ -200,7 +252,7 @@ def generate_committed_segments(
             torch.cuda.synchronize()
 
         t0 = time.perf_counter()
-        conversation = deepcopy(base_conversation)
+        generated_history: list[tuple[str, torch.Tensor]] = []
 
         for batch_idx, batch_text in enumerate(committed_segments):
             logger.info(
@@ -210,6 +262,44 @@ def generate_committed_segments(
                 len(batch_text.encode("utf-8")),
             )
             logger.info("Segment text: {}", batch_text)
+
+            selected_history = _select_generated_history(
+                generated_history,
+                policy=model_cfg.long_form_context_policy,
+                tail_frames=model_cfg.long_form_tail_frames,
+                max_history_segments=model_cfg.long_form_max_history_segments,
+            )
+
+            logger.info(
+                "long_form_context: segment_idx={} policy={} history_segments={} history_frames={} tail_frames={}",
+                batch_idx,
+                model_cfg.long_form_context_policy,
+                len(selected_history),
+                _count_code_frames([codes for _, codes in selected_history]),
+                model_cfg.long_form_tail_frames,
+            )
+
+            conversation = deepcopy(base_conversation)
+            for hist_text, hist_codes in selected_history:
+                conversation.append(
+                    Message(
+                        role="user",
+                        parts=[TextPart(text=hist_text, cal_loss=False)],
+                        cal_loss=False,
+                        add_im_start=True,
+                        add_im_end=True,
+                    )
+                )
+                conversation.append(
+                    Message(
+                        role="assistant",
+                        parts=[VQPart(codes=hist_codes.cpu(), cal_loss=False)],
+                        cal_loss=False,
+                        modality="voice",
+                        add_im_start=True,
+                        add_im_end=True,
+                    )
+                )
 
             conversation.append(
                 Message(
@@ -285,19 +375,48 @@ def generate_committed_segments(
                 )
 
             clip_reasons = []
-            if requested_max_new_tokens > 0 and available_new_tokens < requested_max_new_tokens:
+            if (
+                requested_max_new_tokens > 0
+                and available_new_tokens < requested_max_new_tokens
+            ):
                 clip_reasons.append("cache")
 
-            cap = runtime.model.max_new_tokens_cap
+            cap = model_cfg.max_new_tokens_cap
             before_runtime_cap = effective_max_new_tokens
             if cap >= 1 and effective_max_new_tokens > cap:
                 effective_max_new_tokens = cap
                 clip_reasons.append("runtime_cap")
 
+            # Text-based adaptive cap for long-form
+            text_based_cap = effective_max_new_tokens
+            if model_cfg.long_form_auto_split:
+                text_based_cap = max(
+                    model_cfg.long_form_min_new_tokens,
+                    min(
+                        model_cfg.long_form_max_new_tokens_per_segment,
+                        int(len(batch_text) * model_cfg.long_form_tokens_per_char)
+                        + model_cfg.long_form_token_overhead,
+                    ),
+                )
+                if effective_max_new_tokens > text_based_cap:
+                    effective_max_new_tokens = text_based_cap
+                    clip_reasons.append("text_cap")
+
+            logger.info(
+                "segment_budget: segment_idx={} text_len={} requested={} available={} runtime_cap={} text_cap={} effective={}",
+                batch_idx,
+                len(batch_text),
+                requested_max_new_tokens,
+                available_new_tokens,
+                cap,
+                text_based_cap,
+                effective_max_new_tokens,
+            )
+
             logger.info(
                 "effective_generation_budget: prompt_len={} cache={} "
                 "requested_max_new_tokens={} effective_max_new_tokens={} "
-                "available_new_tokens={} runtime_cap={} clip_reasons={} "
+                "available_new_tokens={} runtime_cap={} text_cap={} clip_reasons={} "
                 "ref_turns={} continuation_turns={} continuation_frames={} text_len={}",
                 prompt_len,
                 max_length,
@@ -305,6 +424,7 @@ def generate_committed_segments(
                 effective_max_new_tokens,
                 available_new_tokens,
                 cap,
+                text_based_cap,
                 clip_reasons,
                 len(reference_texts),
                 len(continuation_texts),
@@ -430,16 +550,7 @@ def generate_committed_segments(
                 codes = torch.cat(codes_list, dim=1).clone() if codes_list else None
 
                 if codes is not None:
-                    conversation.append(
-                        Message(
-                            role="assistant",
-                            parts=[VQPart(codes=codes.cpu(), cal_loss=False)],
-                            cal_loss=False,
-                            modality="voice",
-                            add_im_start=True,
-                            add_im_end=True,
-                        )
-                    )
+                    generated_history.append((batch_text, codes.cpu()))
 
                 codes_list.clear()
                 del codes_list
@@ -523,16 +634,7 @@ def generate_committed_segments(
                         batch_text[:240],
                     )
 
-                conversation.append(
-                    Message(
-                        role="assistant",
-                        parts=[VQPart(codes=codes.cpu(), cal_loss=False)],
-                        cal_loss=False,
-                        modality="voice",
-                        add_im_start=True,
-                        add_im_end=True,
-                    )
-                )
+                generated_history.append((batch_text, codes.cpu()))
 
                 yield GenerateResponse(action="sample", codes=codes, text=batch_text)
                 del y, encoded

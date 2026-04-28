@@ -1209,32 +1209,54 @@ async def session_pcm_stream(session_id: str):
 
             if should_reset:
                 old_id = rec.synthesis_session_id
-                await _close_upstream_synthesis_session(client, old_id)
-                rec.synthesis_session_id = await _open_upstream_synthesis_session(
-                    client, rec, config
-                )
-                rec.chars_since_upstream_reset = 0
-                rec.last_upstream_reset_commit_seq = commit_item["seq"]
+                try:
+                    new_id = await _open_upstream_synthesis_session(
+                        client, rec, config
+                    )
+                    rec.synthesis_session_id = new_id
+                    rec.chars_since_upstream_reset = 0
+                    rec.last_upstream_reset_commit_seq = commit_item["seq"]
 
-                logger.info(
-                    "upstream synthesis reset session=%s commit_seq=%s reason=%s old=%s new=%s",
-                    rec.session_id[:8],
-                    commit_item["seq"],
-                    reset_reason,
-                    old_id[:8] if old_id else None,
-                    rec.synthesis_session_id[:8],
-                )
+                    logger.info(
+                        "upstream synthesis reset session=%s commit_seq=%s reason=%s old=%s new=%s",
+                        rec.session_id[:8],
+                        commit_item["seq"],
+                        reset_reason,
+                        old_id[:8] if old_id else None,
+                        rec.synthesis_session_id[:8],
+                    )
 
-                yield await emit(
-                    {
-                        "type": "upstream_reset",
-                        "session_id": rec.session_id,
-                        "commit_seq": commit_item["seq"],
-                        "reason": reset_reason,
-                        "old_synthesis_session_id": old_id,
-                        "new_synthesis_session_id": rec.synthesis_session_id,
-                    }
-                )
+                    yield await emit(
+                        {
+                            "type": "upstream_reset",
+                            "session_id": rec.session_id,
+                            "commit_seq": commit_item["seq"],
+                            "reason": reset_reason,
+                            "old_synthesis_session_id": old_id,
+                            "new_synthesis_session_id": rec.synthesis_session_id,
+                        }
+                    )
+
+                    # Best-effort close old session
+                    await _close_upstream_synthesis_session(client, old_id)
+
+                except Exception as exc:
+                    logger.warning(
+                        "upstream synthesis reset FAILED session=%s reason=%s: %s",
+                        rec.session_id[:8],
+                        reset_reason,
+                        exc,
+                    )
+                    yield await emit(
+                        {
+                            "type": "upstream_reset_failed",
+                            "session_id": rec.session_id,
+                            "commit_seq": commit_item["seq"],
+                            "reason": reset_reason,
+                            "message": str(exc),
+                        }
+                    )
+
                 await asyncio.sleep(0)
 
             payload = build_upstream_payload(text=commit_item["text"], config=config)

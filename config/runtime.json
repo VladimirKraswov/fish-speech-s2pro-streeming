@@ -22,7 +22,7 @@
     "precision": "bfloat16",
     "compile": true,
     "cache_max_seq_len": 1280,
-    "max_new_tokens_cap": 320,
+    "max_new_tokens_cap": 300,
     "sdpa_math": false,
 
     "cleanup_after_request": false,
@@ -45,7 +45,7 @@
     "long_form_tokens_per_char": 1.3,
     "long_form_token_overhead": 32,
     "long_form_min_new_tokens": 64,
-    "long_form_max_new_tokens_per_segment": 320
+    "long_form_max_new_tokens_per_segment": 300
   },
   "warmup": {
     "enabled": true,

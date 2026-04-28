@@ -149,6 +149,13 @@ export type StreamEvent =
       new_synthesis_session_id?: string | null;
     }
   | {
+      type: 'upstream_reset_failed';
+      session_id?: string;
+      commit_seq?: number;
+      reason?: string;
+      message?: string;
+    }
+  | {
       type: 'error';
       session_id?: string;
       req_id?: string;

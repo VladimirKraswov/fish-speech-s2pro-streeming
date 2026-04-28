@@ -754,8 +754,9 @@ async def stateful_synthesize(req: Annotated[StatefulTTSRequest, Body(exclusive=
                     logger.info(
                         "Stateful synthesize session={} commit_seq={} "
                         "history_turns={} history_with_codes={} "
-                        "selected_turns={} selected_chars={} selected_code_frames={} "
-                        "selected_commits={}",
+                        "selected_turns={} selected_chars={} "
+                        "selected_code_frames={} selected_source_code_frames={} "
+                        "selected_cropped_count={} selected_commits={}",
                         req.synthesis_session_id[:8],
                         req.commit_seq,
                         summary["history_turns"],
@@ -763,6 +764,8 @@ async def stateful_synthesize(req: Annotated[StatefulTTSRequest, Body(exclusive=
                         summary["selected_turns"],
                         summary["selected_chars"],
                         summary["selected_code_frames"],
+                        summary["selected_source_code_frames"],
+                        summary["selected_cropped_count"],
                         summary["commit_seq_list"],
                     )
 

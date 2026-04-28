@@ -8,6 +8,7 @@ from loguru import logger
 
 from fish_speech import DriverSynthesisRequest, DriverTokenChunkEvent, FishSpeechDriver
 from fish_speech_server.api.utils import inference_async
+from fish_speech_server.services.continuation import crop_codes_tail
 from fish_speech_server.services.synthesis_context import (
     SynthesisTurn,
     estimate_code_frames,
@@ -63,7 +64,6 @@ async def stateful_inference_async(
             # with shape (codebooks, frames)
             if all(hasattr(c, "shape") for c in collected_codes):
                 final_codes = torch.cat(collected_codes, dim=1).cpu()
-                code_frames = estimate_code_frames(final_codes)
             else:
                 # Fallback or mixed types (unlikely in practice)
                 # If they are not tensors, we still try to move them to CPU if they are objects
@@ -73,7 +73,14 @@ async def stateful_inference_async(
                         final_codes.append(c.cpu())
                     else:
                         final_codes.append(c)
-                code_frames = sum(estimate_code_frames(c) for c in collected_codes)
+
+            # Crop codes to limit before storing in history
+            if final_codes is not None and context.max_history_code_frames > 0:
+                final_codes = crop_codes_tail(
+                    final_codes, context.max_history_code_frames
+                )
+
+            code_frames = estimate_code_frames(final_codes)
         except Exception as e:
             logger.warning(f"Failed to concatenate collected codes: {e}")
             final_codes = None

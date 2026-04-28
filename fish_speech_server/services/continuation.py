@@ -4,6 +4,16 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+try:
+    import torch
+except ImportError:
+    torch = None
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
 from fish_speech_server.services.synthesis_context import estimate_code_frames
 
 if TYPE_CHECKING:
@@ -35,6 +45,12 @@ def crop_codes_tail(codes: Any | None, max_frames: int) -> Any | None:
         return codes
 
     # torch.Tensor / numpy.ndarray обычно поддерживают такой slicing
+    if torch is not None and torch.is_tensor(codes):
+        return codes[..., -max_frames:].detach().cpu().contiguous().clone()
+
+    if np is not None and isinstance(codes, np.ndarray):
+        return np.ascontiguousarray(codes[..., -max_frames:].copy())
+
     if hasattr(codes, "shape"):
         return codes[..., -max_frames:]
 

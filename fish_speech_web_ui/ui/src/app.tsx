@@ -53,8 +53,8 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
       stateful_history_turns: 1,
       stateful_history_chars: 180,
       stateful_history_code_frames: 120,
-      stateful_reset_every_commits: 4,
-      stateful_reset_every_chars: 800,
+      stateful_reset_every_commits: 6,
+      stateful_reset_every_chars: 900,
     },
     playback: {
       target_emit_bytes: 32768,
@@ -109,8 +109,8 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
     base.tts.stateful_history_turns = 1;
     base.tts.stateful_history_chars = 140;
     base.tts.stateful_history_code_frames = 96;
-    base.tts.stateful_reset_every_commits = 3;
-    base.tts.stateful_reset_every_chars = 650;
+    base.tts.stateful_reset_every_commits = 5;
+    base.tts.stateful_reset_every_chars = 700;
 
     base.playback.target_emit_bytes = 24576;
     base.playback.start_buffer_ms = 300;
@@ -157,8 +157,8 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
     base.tts.stateful_history_turns = 1;
     base.tts.stateful_history_chars = 220;
     base.tts.stateful_history_code_frames = 160;
-    base.tts.stateful_reset_every_commits = 5;
-    base.tts.stateful_reset_every_chars = 1000;
+    base.tts.stateful_reset_every_commits = 8;
+    base.tts.stateful_reset_every_chars = 1200;
 
     base.playback.target_emit_bytes = 32768; // Reduced to 32768 to avoid validation issues if limit was lower, but Step 1 increased it.
     base.playback.start_buffer_ms = 650;
@@ -249,7 +249,11 @@ export function App() {
     }
 
     if (event.type === 'upstream_reset') {
-      log(`upstream synthesis reset at commit #${event.commit_seq}: ${event.reason}`);
+      log(`upstream synthesis reset at commit #${event.commit_seq}, reason=${event.reason}`);
+    }
+
+    if (event.type === 'upstream_reset_failed') {
+      log(`upstream synthesis reset FAILED at commit #${event.commit_seq}, reason=${event.reason}: ${event.message}`);
     }
 
     if (event.type === 'commit_start') {

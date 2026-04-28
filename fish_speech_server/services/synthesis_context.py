@@ -82,8 +82,18 @@ class SynthesisContext:
         if not self.history:
             return
 
+        from fish_speech_server.services.continuation import crop_codes_tail
+
         # Always keep at least the last turn
         last_turn = self.history[-1]
+
+        # Real crop codes of the last turn if it exceeds the total limit
+        if last_turn.codes is not None and self.max_history_code_frames > 0:
+            last_turn.codes = crop_codes_tail(
+                last_turn.codes, self.max_history_code_frames
+            )
+            last_turn.code_frames = estimate_code_frames(last_turn.codes)
+
         other_turns = self.history[:-1]
 
         # 1. Limit by max_history_turns

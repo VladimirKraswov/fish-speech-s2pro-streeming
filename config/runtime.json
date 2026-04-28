@@ -15,17 +15,17 @@
       "host": "0.0.0.0",
       "port": 9000
     },
-    "upstream_tts_url": "http://127.0.0.1:8080/v1/tts"
+    "upstream_tts_url": "http://server:8080/v1/tts"
   },
   "model": {
     "device": "cuda",
     "precision": "bfloat16",
-    "compile": true,
+    "compile": false,
     "cache_max_seq_len": 1024,
-    "max_new_tokens_cap": 320,
+    "max_new_tokens_cap": 512,
     "sdpa_math": false,
     "cleanup_after_request": false,
-    "cleanup_every_n_requests": 24,
+    "cleanup_every_n_requests": 12,
     "cleanup_on_error": true,
     "cleanup_on_abort": true,
     "empty_cache_per_stream_chunk": false,
@@ -52,18 +52,18 @@
     "version": 1,
     "commit": {
       "first": {
-        "min_chars": 28,
-        "target_chars": 58,
-        "max_chars": 85,
-        "max_wait_ms": 150,
-        "allow_partial_after_ms": 240
+        "min_chars": 55,
+        "target_chars": 110,
+        "max_chars": 180,
+        "max_wait_ms": 220,
+        "allow_partial_after_ms": 420
       },
       "next": {
-        "min_chars": 35,
-        "target_chars": 78,
-        "max_chars": 110,
-        "max_wait_ms": 340,
-        "allow_partial_after_ms": 600
+        "min_chars": 90,
+        "target_chars": 170,
+        "max_chars": 260,
+        "max_wait_ms": 420,
+        "allow_partial_after_ms": 800
       },
       "flush_on_sentence_punctuation": true,
       "flush_on_clause_punctuation": false,
@@ -76,27 +76,27 @@
       "normalize": true,
       "use_memory_cache": "on",
       "seed": null,
-      "max_new_tokens": 300,
+      "max_new_tokens": 420,
       "chunk_length": 160,
       "top_p": 0.8,
-      "repetition_penalty": 1.0,
-      "temperature": 0.66,
+      "repetition_penalty": 1.06,
+      "temperature": 0.7,
       "stream_tokens": true,
       "initial_stream_chunk_size": 10,
       "stream_chunk_size": 8,
-      "stateful_synthesis": true,
-      "stateful_fallback_to_stateless": false,
+      "stateful_synthesis": false,
+      "stateful_fallback_to_stateless": true,
       "stateful_history_turns": 1,
       "stateful_history_chars": 160,
       "stateful_history_code_frames": 260
     },
     "playback": {
       "target_emit_bytes": 8192,
-      "start_buffer_ms": 180,
-      "stop_grace_ms": 100
+      "start_buffer_ms": 240,
+      "stop_grace_ms": 250
     },
     "session": {
-      "max_buffer_chars": 12000,
+      "max_buffer_chars": 20000,
       "auto_close_on_finish": false
     }
   },

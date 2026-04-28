@@ -16,21 +16,21 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
   const base: ProxyConfig = {
     commit: {
       first: {
-        min_chars: 40,
-        target_chars: 58,
-        max_chars: 84,
-        max_wait_ms: 150,
-        allow_partial_after_ms: 240,
+        min_chars: 55,
+        target_chars: 110,
+        max_chars: 180,
+        max_wait_ms: 220,
+        allow_partial_after_ms: 420,
       },
       next: {
-        min_chars: 120,
-        target_chars: 160,
-        max_chars: 240,
-        max_wait_ms: 340,
-        allow_partial_after_ms: 600,
+        min_chars: 90,
+        target_chars: 170,
+        max_chars: 260,
+        max_wait_ms: 420,
+        allow_partial_after_ms: 800,
       },
       flush_on_sentence_punctuation: true,
-      flush_on_clause_punctuation: true,
+      flush_on_clause_punctuation: false,
       flush_on_newline: true,
       carry_incomplete_tail: true,
     },
@@ -39,75 +39,81 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
       format: 'wav',
       normalize: true,
       use_memory_cache: 'on',
-      seed: 1234,
-      max_new_tokens: 160,
+      seed: null,
+      max_new_tokens: 420,
       chunk_length: 160,
-      top_p: 0.78,
-      repetition_penalty: 1.12,
+      top_p: 0.8,
+      repetition_penalty: 1.06,
       temperature: 0.7,
       stream_tokens: true,
       initial_stream_chunk_size: 10,
       stream_chunk_size: 8,
-      stateful_synthesis: true,
-      stateful_fallback_to_stateless: false,
+      stateful_synthesis: false,
+      stateful_fallback_to_stateless: true,
     },
     playback: {
-      target_emit_bytes: 6144,
-      start_buffer_ms: 120,
-      stop_grace_ms: 60,
+      target_emit_bytes: 8192,
+      start_buffer_ms: 240,
+      stop_grace_ms: 250,
     },
     session: {
-      max_buffer_chars: 8000,
+      max_buffer_chars: 20000,
       auto_close_on_finish: false,
     },
   };
 
   if (kind === 'lowLatency') {
     base.commit.first = {
-      min_chars: 24,
-      target_chars: 42,
-      max_chars: 68,
-      max_wait_ms: 100,
-      allow_partial_after_ms: 170,
+      min_chars: 45,
+      target_chars: 90,
+      max_chars: 150,
+      max_wait_ms: 160,
+      allow_partial_after_ms: 320,
     };
+
     base.commit.next = {
-      min_chars: 70,
-      target_chars: 110,
-      max_chars: 170,
-      max_wait_ms: 240,
-      allow_partial_after_ms: 420,
+      min_chars: 75,
+      target_chars: 140,
+      max_chars: 220,
+      max_wait_ms: 320,
+      allow_partial_after_ms: 650,
     };
-    base.tts.max_new_tokens = 128;
-    base.tts.chunk_length = 140;
+
+    base.tts.max_new_tokens = 360;
+    base.tts.chunk_length = 150;
     base.tts.initial_stream_chunk_size = 8;
     base.tts.stream_chunk_size = 6;
-    base.playback.target_emit_bytes = 4096;
-    base.playback.start_buffer_ms = 80;
-    base.playback.stop_grace_ms = 40;
+
+    base.playback.target_emit_bytes = 6144;
+    base.playback.start_buffer_ms = 160;
+    base.playback.stop_grace_ms = 180;
   }
 
   if (kind === 'stable') {
     base.commit.first = {
-      min_chars: 60,
-      target_chars: 90,
-      max_chars: 130,
-      max_wait_ms: 250,
-      allow_partial_after_ms: 420,
+      min_chars: 70,
+      target_chars: 140,
+      max_chars: 220,
+      max_wait_ms: 300,
+      allow_partial_after_ms: 600,
     };
+
     base.commit.next = {
-      min_chars: 150,
+      min_chars: 120,
       target_chars: 220,
-      max_chars: 300,
-      max_wait_ms: 520,
-      allow_partial_after_ms: 900,
+      max_chars: 340,
+      max_wait_ms: 600,
+      allow_partial_after_ms: 1100,
     };
-    base.tts.max_new_tokens = 160;
+
+    base.tts.max_new_tokens = 480;
     base.tts.chunk_length = 180;
     base.tts.initial_stream_chunk_size = 12;
     base.tts.stream_chunk_size = 10;
-    base.playback.target_emit_bytes = 8192;
-    base.playback.start_buffer_ms = 220;
-    base.playback.stop_grace_ms = 80;
+
+    base.playback.target_emit_bytes = 12288;
+    base.playback.start_buffer_ms = 320;
+    base.playback.stop_grace_ms = 350;
   }
 
   return base;
@@ -277,13 +283,13 @@ export function App() {
     try {
       const data = await client.current.openSession(configText);
 
-      if (!data.config?.tts?.stateful_synthesis) {
-        throw new Error('Session opened without stateful_synthesis=true');
-      }
-
       setSessionId(data.session_id);
       setSessionStatus('open');
-      log(`session opened: ${data.session_id.slice(0, 8)}`);
+
+      const stateful = data.config?.tts?.stateful_synthesis ? 'stateful' : 'stateless';
+      const maxTokens = data.config?.tts?.max_new_tokens ?? 'n/a';
+
+      log(`session opened: ${data.session_id.slice(0, 8)}, mode=${stateful}, max_new_tokens=${maxTokens}`);
 
       abortController.current = new AbortController();
 
@@ -402,10 +408,10 @@ export function App() {
       <section class="hero">
         <div>
           <div class="eyebrow">Fish Speech S2 Pro Streaming</div>
-          <h1>Stateful realtime voice console</h1>
+          <h1>Reliable realtime voice console</h1>
           <p>
-            Имитация LLM-вывода: текст отправляется маленькими чанками в proxy, а proxy
-            озвучивает его через одну stateful synthesis session.
+            Имитация LLM-вывода: текст отправляется маленькими чанками в proxy,
+            а proxy озвучивает его с увеличенным запасом генерации, чтобы не резать хвост фразы.
           </p>
         </div>
 
@@ -414,7 +420,7 @@ export function App() {
 
           {!sessionId ? (
             <button class="primary" onClick={openSession} disabled={sessionStatus === 'opening' || !!configError}>
-              Open stateful session
+              Open session
             </button>
           ) : (
             <button class="danger" onClick={closeSession}>
@@ -507,7 +513,7 @@ export function App() {
           <div class="panel-head">
             <div>
               <h2>Runtime preset</h2>
-              <p>JSON override для `/session/open`. Stateful режим включён явно.</p>
+              <p>JSON override для `/session/open`. Balanced и Stable настроены на полное дочитывание.</p>
             </div>
           </div>
 
@@ -541,7 +547,7 @@ export function App() {
           <div class="panel-head">
             <div>
               <h2>Committed segments</h2>
-              <p>Сегменты, которые proxy уже отправил в stateful TTS.</p>
+              <p>Сегменты, которые proxy уже отправил в TTS.</p>
             </div>
             <b>{committed.length}</b>
           </div>

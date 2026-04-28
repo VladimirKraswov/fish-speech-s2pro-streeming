@@ -61,28 +61,40 @@ class FishTokenizer:
         vocab = self._tokenizer.get_vocab()
         valid_ids = []
 
+        missing_codes = []
         for code_idx in range(4096):
             token = SEMANTIC_TOKEN_TEMPLATE.format(i=code_idx)
             if token in vocab:
                 token_id = vocab[token]
                 self.semantic_id_to_token_id[code_idx] = token_id
                 valid_ids.append(token_id)
+            else:
+                missing_codes.append(code_idx)
 
-        if not valid_ids:
-            logger.error(
-                "CRITICAL ERROR: No semantic tokens found in vocab! Audio cannot be synthesized."
+        if missing_codes:
+            raise RuntimeError(
+                f"Missing {len(missing_codes)} semantic tokens in vocab (e.g. {missing_codes[:5]}). "
+                "The model requires all 4096 semantic tokens to be present."
             )
-            self.semantic_begin_id = 0
-            self.semantic_end_id = 0
-            # Dummy tensor to prevent crash, though generation will fail
-            self.semantic_map_tensor = torch.zeros(4096, dtype=torch.long)
-        else:
-            self.semantic_begin_id = min(valid_ids)
-            self.semantic_end_id = max(valid_ids)
-            # Create a lookup tensor to handle potential gaps in token IDs safely
-            self.semantic_map_tensor = torch.zeros(4096, dtype=torch.long)
-            for k, v in self.semantic_id_to_token_id.items():
-                self.semantic_map_tensor[k] = v
+
+        self.semantic_begin_id = min(valid_ids)
+        self.semantic_end_id = max(valid_ids)
+
+        # code_idx -> token_id
+        self.semantic_map_tensor = torch.zeros(4096, dtype=torch.long)
+        for k, v in self.semantic_id_to_token_id.items():
+            self.semantic_map_tensor[k] = v
+
+        # token_id -> code_idx
+        self.semantic_token_to_code = torch.full(
+            (self.vocab_size,), -1, dtype=torch.long
+        )
+        for k, v in self.semantic_id_to_token_id.items():
+            self.semantic_token_to_code[v] = k
+
+        # bool mask over token ids
+        self.semantic_token_mask = torch.zeros(self.vocab_size, dtype=torch.bool)
+        self.semantic_token_mask[valid_ids] = True
 
         logger.info(
             f"Loaded Tokenizer. Semantic Range: {self.semantic_begin_id} -> {self.semantic_end_id}"

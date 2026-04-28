@@ -370,10 +370,14 @@ def generate_committed_segments(
 
                 for chunk in gen:
                     main_tokens = chunk[0]
-                    semantic_mask = (
-                        (main_tokens >= tokenizer.semantic_begin_id)
-                        & (main_tokens <= tokenizer.semantic_end_id)
-                    )
+                    if hasattr(tokenizer, "semantic_token_mask"):
+                        mask = tokenizer.semantic_token_mask.to(main_tokens.device)
+                        semantic_mask = mask[main_tokens]
+                    else:
+                        semantic_mask = (
+                            (main_tokens >= tokenizer.semantic_begin_id)
+                            & (main_tokens <= tokenizer.semantic_end_id)
+                        )
 
                     if semantic_mask.any():
                         codes_chunk = chunk[1:, semantic_mask].clone()
@@ -492,10 +496,14 @@ def generate_committed_segments(
 
                 generated = y[:, prompt_length:]
                 main_tokens = generated[0]
-                semantic_mask = (
-                    (main_tokens >= tokenizer.semantic_begin_id)
-                    & (main_tokens <= tokenizer.semantic_end_id)
-                )
+                if hasattr(tokenizer, "semantic_token_mask"):
+                    mask = tokenizer.semantic_token_mask.to(main_tokens.device)
+                    semantic_mask = mask[main_tokens]
+                else:
+                    semantic_mask = (
+                        (main_tokens >= tokenizer.semantic_begin_id)
+                        & (main_tokens <= tokenizer.semantic_end_id)
+                    )
                 codes = generated[1:, semantic_mask].clone()
                 assert (codes >= 0).all(), f"Negative code found: {codes}"
 

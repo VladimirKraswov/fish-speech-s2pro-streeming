@@ -345,9 +345,15 @@ class BaseTransformer(nn.Module):
 
         vq_embeds_sum = torch.stack(embeds, dim=1).sum(dim=1)
 
-        is_semantic = (inp[:, 0] >= self.config.semantic_begin_id) & (
-            inp[:, 0] <= self.config.semantic_end_id
-        )
+        if hasattr(self, "tokenizer") and hasattr(
+            self.tokenizer, "semantic_token_mask"
+        ):
+            mask = self.tokenizer.semantic_token_mask.to(inp.device)
+            is_semantic = mask[inp[:, 0]]
+        else:
+            is_semantic = (inp[:, 0] >= self.config.semantic_begin_id) & (
+                inp[:, 0] <= self.config.semantic_end_id
+            )
 
         vq_embeds_sum[~is_semantic] = 0
 
@@ -417,9 +423,15 @@ class BaseTransformer(nn.Module):
 
         vq_embeds_sum = torch.stack(embeds, dim=1).sum(dim=1)
 
-        vq_masks = (inp[:, 0] >= self.config.semantic_begin_id) & (
-            inp[:, 0] <= self.config.semantic_end_id
-        )
+        if hasattr(self, "tokenizer") and hasattr(
+            self.tokenizer, "semantic_token_mask"
+        ):
+            mask = self.tokenizer.semantic_token_mask.to(inp.device)
+            vq_masks = mask[inp[:, 0]]
+        else:
+            vq_masks = (inp[:, 0] >= self.config.semantic_begin_id) & (
+                inp[:, 0] <= self.config.semantic_end_id
+            )
 
         vq_embeds_sum[~vq_masks] = 0
         x = self.embeddings(inp[:, 0]) + vq_embeds_sum
@@ -769,9 +781,15 @@ class DualARTransformer(BaseTransformer):
         token_labels = labels[:, 0]
 
         # [MODIFIED] Use config instead of tokenizer
-        codebook_mask = (token_labels >= self.config.semantic_begin_id) & (
-            token_labels <= self.config.semantic_end_id
-        )
+        if hasattr(self, "tokenizer") and hasattr(
+            self.tokenizer, "semantic_token_mask"
+        ):
+            mask = self.tokenizer.semantic_token_mask.to(token_labels.device)
+            codebook_mask = mask[token_labels]
+        else:
+            codebook_mask = (token_labels >= self.config.semantic_begin_id) & (
+                token_labels <= self.config.semantic_end_id
+            )
 
         # This gives where input token is <|semantic|>
         x = x[codebook_mask]

@@ -93,9 +93,16 @@ def decode_one_token_ar(
 
     if previous_tokens is not None:
         in_window = (previous_tokens[0] == main_token_normal).any()
-        is_semantic = (main_token_normal >= model.config.semantic_begin_id) & (
-            main_token_normal <= model.config.semantic_end_id
-        )
+        if hasattr(model, "tokenizer") and hasattr(
+            model.tokenizer, "semantic_token_mask"
+        ):
+            mask = model.tokenizer.semantic_token_mask.to(main_token_normal.device)
+            is_semantic = mask[main_token_normal]
+        else:
+            is_semantic = (main_token_normal >= model.config.semantic_begin_id) & (
+                main_token_normal <= model.config.semantic_end_id
+            )
+
         should_use_high = in_window & is_semantic
         main_token_normal = torch.where(
             should_use_high, main_token_high, main_token_normal
@@ -106,8 +113,15 @@ def decode_one_token_ar(
     input_pos = torch.tensor([0], device=hidden_states.device, dtype=torch.long)
     model.forward_generate_fast(hidden_states, input_pos)
 
-    a = codebooks[0] - model.config.semantic_begin_id
-    a = torch.clamp(a, min=0, max=model.config.codebook_size - 1)
+    if hasattr(model, "tokenizer") and hasattr(model.tokenizer, "semantic_token_to_code"):
+        mapping = model.tokenizer.semantic_token_to_code.to(main_token_normal.device)
+        a = mapping[main_token_normal]
+        # For non-semantic tokens (like IM_END), a will be -1.
+        # We use 0 as a dummy code because codebooks after EOS are ignored.
+        a = torch.where(a >= 0, a, torch.zeros_like(a))
+    else:
+        a = codebooks[0] - model.config.semantic_begin_id
+        a = torch.clamp(a, min=0, max=model.config.codebook_size - 1)
 
     hidden_states = model.fast_embeddings(a)
     codebooks.append(a)
@@ -289,7 +303,7 @@ def decode_n_tokens(
                 new_tokens = []
                 first_chunk_emitted = True
 
-        if cur_token[0, 0, -1] == im_end_id:
+        if (cur_token[0, 0, -1] == im_end_id).any():
             if do_stream_log:
                 logger.info("stream: decode_n_tokens EOS at iter={}", i)
             break
@@ -371,9 +385,13 @@ def generate(
         (1, 1, vocab_size), float("-inf"), device=device, dtype=dtype
     )
 
-    semantic_logit_bias[
-        0, 0, model.config.semantic_begin_id : model.config.semantic_end_id + 1
-    ] = 0.0
+    if hasattr(model, "tokenizer") and hasattr(model.tokenizer, "semantic_map_tensor"):
+        semantic_ids = model.tokenizer.semantic_map_tensor.to(device=device)
+        semantic_logit_bias[0, 0, semantic_ids] = 0.0
+    else:
+        semantic_logit_bias[
+            0, 0, model.config.semantic_begin_id : model.config.semantic_end_id + 1
+        ] = 0.0
     semantic_logit_bias[0, 0, model.tokenizer.get_token_id(IM_END_TOKEN)] = 0.0
 
     prefill_decode = decode_one_token_ar

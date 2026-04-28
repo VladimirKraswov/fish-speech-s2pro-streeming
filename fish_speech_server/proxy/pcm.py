@@ -11,7 +11,6 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-import numpy as np
 from typing import Any, AsyncGenerator, Optional, Tuple
 
 import httpx
@@ -459,40 +458,53 @@ def _apply_pcm16_fade(
     if not pcm:
         return pcm
 
-    arr = np.frombuffer(pcm, dtype="<i2").copy()
-
     if channels <= 0:
         return pcm
 
-    usable_samples = (arr.size // channels) * channels
-    if usable_samples <= 0:
+    frame_bytes = channels * 2  # PCM16 little-endian
+    usable_len = len(pcm) - (len(pcm) % frame_bytes)
+
+    if usable_len <= 0:
         return pcm
 
-    prefix = arr[:usable_samples].reshape(-1, channels)
-    frame_count = prefix.shape[0]
+    out = bytearray(pcm)
+    frame_count = usable_len // frame_bytes
+
+    def clamp_i16(value: float) -> int:
+        ivalue = int(round(value))
+        if ivalue > 32767:
+            return 32767
+        if ivalue < -32768:
+            return -32768
+        return ivalue
+
+    def scale_frame(frame_index: int, gain: float) -> None:
+        base = frame_index * frame_bytes
+        for ch in range(channels):
+            offset = base + ch * 2
+            sample = struct.unpack_from("<h", out, offset)[0]
+            struct.pack_into("<h", out, offset, clamp_i16(sample * gain))
 
     if fade_in_frames > 0:
         n = min(frame_count, fade_in_frames)
-        if n > 0:
-            gain = np.linspace(0.0, 1.0, n, endpoint=True, dtype=np.float32)[:, None]
-            prefix[:n] = np.clip(
-                prefix[:n].astype(np.float32) * gain,
-                -32768,
-                32767,
-            ).astype(np.int16)
+        if n == 1:
+            scale_frame(0, 1.0)
+        elif n > 1:
+            denom = n - 1
+            for i in range(n):
+                scale_frame(i, i / denom)
 
     if fade_out_frames > 0:
         n = min(frame_count, fade_out_frames)
-        if n > 0:
-            gain = np.linspace(1.0, 0.0, n, endpoint=True, dtype=np.float32)[:, None]
-            prefix[-n:] = np.clip(
-                prefix[-n:].astype(np.float32) * gain,
-                -32768,
-                32767,
-            ).astype(np.int16)
+        if n == 1:
+            scale_frame(frame_count - 1, 0.0)
+        elif n > 1:
+            denom = n - 1
+            start = frame_count - n
+            for i in range(n):
+                scale_frame(start + i, 1.0 - (i / denom))
 
-    arr[:usable_samples] = prefix.reshape(-1)
-    return arr.astype("<i2", copy=False).tobytes()
+    return bytes(out)
 
 
 def _last_boundary_before(

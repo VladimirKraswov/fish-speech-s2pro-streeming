@@ -22,7 +22,7 @@
     "precision": "bfloat16",
     "compile": true,
     "cache_max_seq_len": 1024,
-    "max_new_tokens_cap": 256,
+    "max_new_tokens_cap": 320,
     "sdpa_math": false,
     "cleanup_after_request": false,
     "cleanup_every_n_requests": 24,
@@ -40,7 +40,7 @@
     "text": "Привет. Это дополнительный прогрев стримингового режима для Fish Speech.",
     "streaming": true,
     "stream_tokens": true,
-    "max_new_tokens": 192,
+    "max_new_tokens": 220,
     "chunk_length": 160,
     "initial_stream_chunk_size": 10,
     "stream_chunk_size": 8
@@ -52,16 +52,16 @@
     "version": 1,
     "commit": {
       "first": {
-        "min_chars": 32,
-        "target_chars": 70,
-        "max_chars": 110,
+        "min_chars": 28,
+        "target_chars": 58,
+        "max_chars": 85,
         "max_wait_ms": 150,
         "allow_partial_after_ms": 240
       },
       "next": {
-        "min_chars": 45,
-        "target_chars": 95,
-        "max_chars": 135,
+        "min_chars": 35,
+        "target_chars": 78,
+        "max_chars": 110,
         "max_wait_ms": 340,
         "allow_partial_after_ms": 600
       },
@@ -76,24 +76,27 @@
       "normalize": true,
       "use_memory_cache": "on",
       "seed": null,
-      "max_new_tokens": 240,
+      "max_new_tokens": 300,
       "chunk_length": 160,
-      "top_p": 0.78,
-      "repetition_penalty": 1.02,
-      "temperature": 0.7,
+      "top_p": 0.8,
+      "repetition_penalty": 1.0,
+      "temperature": 0.66,
       "stream_tokens": true,
       "initial_stream_chunk_size": 10,
       "stream_chunk_size": 8,
       "stateful_synthesis": true,
-      "stateful_fallback_to_stateless": false
+      "stateful_fallback_to_stateless": false,
+      "stateful_history_turns": 1,
+      "stateful_history_chars": 160,
+      "stateful_history_code_frames": 260
     },
     "playback": {
-      "target_emit_bytes": 6144,
-      "start_buffer_ms": 160,
-      "stop_grace_ms": 80
+      "target_emit_bytes": 8192,
+      "start_buffer_ms": 180,
+      "stop_grace_ms": 100
     },
     "session": {
-      "max_buffer_chars": 4000,
+      "max_buffer_chars": 12000,
       "auto_close_on_finish": false
     }
   },
@@ -105,11 +108,13 @@
       "commit.first.max_chars",
       "commit.first.max_wait_ms",
       "commit.first.allow_partial_after_ms",
+
       "commit.next.min_chars",
       "commit.next.target_chars",
       "commit.next.max_chars",
       "commit.next.max_wait_ms",
       "commit.next.allow_partial_after_ms",
+
       "commit.carry_incomplete_tail",
       "commit.flush_on_sentence_punctuation",
       "commit.flush_on_clause_punctuation",
@@ -130,6 +135,9 @@
       "tts.stream_chunk_size",
       "tts.stateful_synthesis",
       "tts.stateful_fallback_to_stateless",
+      "tts.stateful_history_turns",
+      "tts.stateful_history_chars",
+      "tts.stateful_history_code_frames",
 
       "playback.target_emit_bytes",
       "playback.start_buffer_ms",

@@ -17,7 +17,7 @@ export interface ProxyConfig {
   };
   tts: {
     reference_id: string;
-    format?: 'wav';
+    format?: string;
     normalize?: boolean;
     use_memory_cache?: 'on' | 'off';
     seed?: number | null;
@@ -31,6 +31,9 @@ export interface ProxyConfig {
     stream_chunk_size: number;
     stateful_synthesis?: boolean;
     stateful_fallback_to_stateless?: boolean;
+    stateful_history_turns?: number;
+    stateful_history_chars?: number;
+    stateful_history_code_frames?: number;
   };
   playback: {
     target_emit_bytes: number;

@@ -28,7 +28,6 @@ from fish_speech_server.config import (
 _RUNTIME = load_runtime_config()
 UPSTREAM_TTS_URL = os.getenv("FISH_UPSTREAM_TTS_URL", _RUNTIME.network.upstream_tts_url)
 
-# Backward compatibility for the audit requested env name
 if os.getenv("UPSTREAM_TTS_URL"):
     UPSTREAM_TTS_URL = os.getenv("UPSTREAM_TTS_URL")
 
@@ -72,7 +71,7 @@ class SessionCloseRequest(BaseModel):
 
 class SessionAppendRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    text: str = Field(..., min_length=1, max_length=4000)
+    text: str = Field(..., min_length=1, max_length=100_000)
     source_ts_ms: int | None = None
 
 
@@ -329,6 +328,28 @@ def _normalize_tail_after_commit(text: str) -> str:
     return text.lstrip()
 
 
+def _safe_hard_cut(text: str, limit: int, min_keep: int) -> int:
+    """
+    Безопасный hard cut: старается резать по пробелу/переносу, а не посреди слова.
+    """
+    if len(text) <= limit:
+        return len(text)
+
+    lower_bound = max(1, min_keep, int(limit * 0.65))
+    search_area = text[:limit]
+
+    cut = max(
+        search_area.rfind(" "),
+        search_area.rfind("\n"),
+        search_area.rfind("\t"),
+    )
+
+    if cut >= lower_bound:
+        return cut + 1
+
+    return limit
+
+
 def _pcm_bytes_for_duration_ms(
     sample_rate: int,
     channels: int,
@@ -398,6 +419,7 @@ def _extract_commits(
     text = buffer_text
 
     while True:
+        text = _normalize_tail_after_commit(text)
         text_len = len(text)
 
         if text_len == 0:
@@ -406,16 +428,36 @@ def _extract_commits(
         stage = cfg.first if (next_commit_seq + len(commits)) == 1 else cfg.next
 
         if force:
-            piece = _right_trim_committed(text)
-            if piece:
-                commits.append((piece, "force"))
+            if text_len <= stage.max_chars:
+                piece = _right_trim_committed(text)
+                if piece:
+                    commits.append((piece, "force"))
+                text = ""
+                break
 
-            text = ""
+            boundary = _last_boundary_before(
+                text,
+                stage.max_chars,
+                include_clause=cfg.flush_on_clause_punctuation,
+                include_newline=cfg.flush_on_newline,
+            )
+
+            if boundary:
+                end, boundary_reason = boundary
+                reason = f"force_{boundary_reason}"
+            else:
+                end = _safe_hard_cut(text, stage.max_chars, stage.min_chars)
+                reason = "force_hard_limit"
+
+            piece = _right_trim_committed(text[:end])
+            text = _normalize_tail_after_commit(text[end:])
+
+            if piece:
+                commits.append((piece, reason))
+                continue
+
             break
 
-        # Commit a short complete sentence even if it is shorter than stage.min_chars.
-        # This prevents final short tails from getting stuck, but avoids micro-commits
-        # like "Да." and avoids committing a huge buffer before max_chars logic.
         if (
             cfg.flush_on_sentence_punctuation
             and text_len < stage.min_chars
@@ -474,7 +516,8 @@ def _extract_commits(
             if hard_boundary:
                 end, reason = hard_boundary
             else:
-                end, reason = stage.max_chars, "hard_limit"
+                end = _safe_hard_cut(text, stage.max_chars, stage.min_chars)
+                reason = "hard_limit"
 
         if end is None:
             break
@@ -558,13 +601,16 @@ async def session_open(req: SessionOpenRequest) -> JSONResponse:
                 resp = await client.post(
                     UPSTREAM_TTS_URL.replace("/v1/tts", "/v1/synthesis/sessions/open"),
                     json={
-                        "reference_id": config.tts.reference_id
-                        or config.default_reference_id,
+                        "reference_id": config.tts.reference_id or config.default_reference_id,
+                        "max_history_turns": getattr(config.tts, "stateful_history_turns", 1),
+                        "max_history_chars": getattr(config.tts, "stateful_history_chars", 160),
+                        "max_history_code_frames": getattr(config.tts, "stateful_history_code_frames", 260),
                     },
                     headers={"Accept": "application/json"},
                 )
                 if resp.status_code != 200:
-                    raise RuntimeError(f"upstream status={resp.status_code}")
+                    body = resp.text
+                    raise RuntimeError(f"upstream status={resp.status_code}: {body}")
 
                 data = resp.json()
                 rec.synthesis_session_id = data.get("synthesis_session_id")
@@ -689,12 +735,20 @@ async def session_flush(session_id: str, req: SessionFlushRequest) -> JSONRespon
     if rec is None:
         raise HTTPException(404, detail="session not found")
 
+    config = ProxyConfig.model_validate(rec.config)
+
     async with rec.lock:
         queued = []
 
         if rec.buffer_text.strip():
-            queued = await _queue_commits(rec, [(rec.buffer_text.strip(), req.reason)])
-            rec.buffer_text = ""
+            commits, remainder = _extract_commits(
+                rec.buffer_text,
+                config.commit,
+                next_commit_seq=rec.next_commit_seq,
+                force=True,
+            )
+            queued = await _queue_commits(rec, commits)
+            rec.buffer_text = remainder
 
         await _touch_session(rec)
 
@@ -742,8 +796,14 @@ async def session_finish(session_id: str, req: SessionFinishRequest) -> JSONResp
         queued = []
 
         if rec.buffer_text.strip():
-            queued = await _queue_commits(rec, [(rec.buffer_text.strip(), req.reason)])
-            rec.buffer_text = ""
+            commits, remainder = _extract_commits(
+                rec.buffer_text,
+                config.commit,
+                next_commit_seq=rec.next_commit_seq,
+                force=True,
+            )
+            queued = await _queue_commits(rec, commits)
+            rec.buffer_text = remainder
 
         await rec.commit_queue.put({"type": "eof"})
         await _touch_session(rec)
@@ -836,11 +896,6 @@ async def session_pcm_stream(session_id: str):
 
         header_buffer = bytearray()
         pending_pcm = bytearray()
-
-        # Important:
-        # Every upstream /v1/tts response is a fresh WAV stream with its own RIFF header.
-        # We must parse and strip the header for every commit, even if rec.audio_meta
-        # is already known from a previous commit.
         header_sent = False
 
         upstream_bytes = 0
@@ -899,12 +954,13 @@ async def session_pcm_stream(session_id: str):
 
         async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
             logger.info(
-                "REQ %s commit_seq=%s upstream start text_len=%s ref=%s url=%s",
+                "REQ %s commit_seq=%s upstream start text_len=%s ref=%s url=%s max_new_tokens=%s",
                 req_id,
                 commit_item["seq"],
                 len(commit_item["text"]),
                 payload["reference_id"],
                 url,
+                payload.get("max_new_tokens"),
             )
 
             async with client.stream("POST", url, json=payload) as upstream:

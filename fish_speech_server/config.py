@@ -69,16 +69,26 @@ class ProxyTTSConfig(BaseModel):
     normalize: bool = True
     use_memory_cache: str = "on"
     seed: int | None = None
-    max_new_tokens: int = Field(128, ge=1, le=512)
-    chunk_length: int = Field(180, ge=100, le=300)
+
+    max_new_tokens: int = Field(300, ge=1, le=512)
+    chunk_length: int = Field(160, ge=100, le=300)
+
     top_p: float = Field(0.8, ge=0.1, le=1.0)
-    repetition_penalty: float = Field(1.08, ge=0.9, le=2.0)
-    temperature: float = Field(0.75, ge=0.1, le=1.0)
+    repetition_penalty: float = Field(1.0, ge=0.9, le=2.0)
+    temperature: float = Field(0.66, ge=0.1, le=1.0)
+
     stream_tokens: bool = True
-    initial_stream_chunk_size: int = Field(8, ge=1, le=200)
+    initial_stream_chunk_size: int = Field(10, ge=1, le=200)
     stream_chunk_size: int = Field(8, ge=1, le=200)
-    stateful_synthesis: bool = False
-    stateful_fallback_to_stateless: bool = True
+
+    stateful_synthesis: bool = True
+    stateful_fallback_to_stateless: bool = False
+
+    # Для длинного текста лучше держать только последний акустический кусок.
+    # Иначе prompt быстро раздувается, а модель начинает путаться/повторять/пропускать.
+    stateful_history_turns: int = Field(1, ge=1, le=4)
+    stateful_history_chars: int = Field(160, ge=1, le=1000)
+    stateful_history_code_frames: int = Field(260, ge=0, le=2000)
 
     @field_validator("format")
     @classmethod

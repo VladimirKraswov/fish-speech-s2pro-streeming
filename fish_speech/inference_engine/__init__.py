@@ -242,152 +242,153 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                     )
                     break
 
-                if not isinstance(wrapped_result.response, GenerateResponse):
-                    raise TypeError(
-                        f"Expected GenerateResponse, got {type(wrapped_result.response).__name__}"
-                    )
+                needs_ack = ack_queue is not None
+                try:
+                    if not isinstance(wrapped_result.response, GenerateResponse):
+                        raise TypeError(
+                            f"Expected GenerateResponse, got {type(wrapped_result.response).__name__}"
+                        )
 
-                result = wrapped_result.response
-                if result.action != "next":
-                    if req.stream_tokens and result.codes is not None:
-                        yield InferenceResult(
-                            code="tokens",
-                            audio=None,
-                            error=None,
-                            tokens=(
-                                result.codes.cpu()
-                                if getattr(result.codes, "is_cuda", False)
-                                else result.codes
+                    result = wrapped_result.response
+                    if result.action != "next":
+                        if req.stream_tokens and result.codes is not None:
+                            yield InferenceResult(
+                                code="tokens",
+                                audio=None,
+                                error=None,
+                                tokens=(
+                                    result.codes.cpu()
+                                    if getattr(result.codes, "is_cuda", False)
+                                    else result.codes
+                                ),
+                            )
+
+                        if stream_tokens:
+                            logger.info(
+                                "stream: decoding segment seg_idx={} codes_shape={} req={}",
+                                seg_idx + 1,
+                                result.codes.shape if result.codes is not None else None,
+                                req_tag,
+                            )
+
+                        _mark(
+                            "decode_vq_start",
+                            segment_idx=seg_idx + 1,
+                            codes_frames=(
+                                result.codes.shape[1] if result.codes is not None else 0
                             ),
                         )
 
-                    if stream_tokens:
-                        logger.info(
-                            "stream: decoding segment seg_idx={} codes_shape={} req={}",
-                            seg_idx + 1,
-                            result.codes.shape if result.codes is not None else None,
-                            req_tag,
+                        try:
+                            if stream_tokens and result.codes is not None:
+                                new_codes = result.codes
+                                context_frames_before = (
+                                    vq_left_context.shape[-1]
+                                    if vq_left_context is not None
+                                    else 0
+                                )
+
+                                segment, vq_left_context, full_decoded_size = (
+                                    self._decode_stream_codes_with_context(
+                                        new_codes=new_codes,
+                                        left_context_codes=vq_left_context,
+                                        max_context_frames=max_vq_context_frames,
+                                    )
+                                )
+
+                                if stream_decode_idx < 3:
+                                    logger.info(
+                                        "stream_vq_context_decode: new_frames={} context_frames={} decode_frames={} decoded_samples={} emitted_samples={}",
+                                        new_codes.shape[-1],
+                                        context_frames_before,
+                                        new_codes.shape[-1] + context_frames_before,
+                                        full_decoded_size,
+                                        len(segment),
+                                    )
+                                    stream_decode_idx += 1
+                            else:
+                                if result.codes is not None and not result.codes.is_cuda:
+                                    result = GenerateResponse(
+                                        result.action,
+                                        result.codes.to(self.decoder_model.device),
+                                        getattr(result, "text", None),
+                                    )
+                                segment = self.get_audio_segment(result)
+                        except Exception as seg_err:
+                            if stream_tokens:
+                                logger.exception(
+                                    "stream: get_audio_segment FAILED seg_idx={} codes_shape={} req={}: {}",
+                                    seg_idx + 1,
+                                    (
+                                        result.codes.shape
+                                        if result.codes is not None
+                                        else None
+                                    ),
+                                    req_tag,
+                                    seg_err,
+                                )
+                            raise
+
+                        seg_idx += 1
+                        _mark(
+                            "segment_decoded", segment_idx=seg_idx, samples=len(segment)
                         )
-
-                    _mark(
-                        "decode_vq_start",
-                        segment_idx=seg_idx + 1,
-                        codes_frames=(
-                            result.codes.shape[1] if result.codes is not None else 0
-                        ),
-                    )
-
-                    try:
-                        if stream_tokens and result.codes is not None:
-                            new_codes = result.codes
-                            context_frames_before = (
-                                vq_left_context.shape[-1]
-                                if vq_left_context is not None
-                                else 0
-                            )
-
-                            segment, vq_left_context = (
-                                self._decode_stream_codes_with_context(
-                                    new_codes=new_codes,
-                                    left_context_codes=vq_left_context,
-                                    max_context_frames=max_vq_context_frames,
-                                )
-                            )
-
-                            if stream_decode_idx < 3:
-                                frame_length = int(
-                                    getattr(self.decoder_model, "frame_length", 2048)
-                                )
-                                logger.info(
-                                    "stream_vq_context_decode: new_frames={} context_frames={} decode_frames={} decoded_samples={} emitted_samples={}",
-                                    new_codes.shape[-1],
-                                    context_frames_before,
-                                    new_codes.shape[-1] + context_frames_before,
-                                    segment.size + (context_frames_before * frame_length),
-                                    segment.size,
-                                )
-                                stream_decode_idx += 1
-                        else:
-                            if result.codes is not None and not result.codes.is_cuda:
-                                result = GenerateResponse(
-                                    result.action,
-                                    result.codes.to(self.decoder_model.device),
-                                    getattr(result, "text", None),
-                                )
-                            segment = self.get_audio_segment(result)
-                    except Exception as seg_err:
                         if stream_tokens:
-                            logger.exception(
-                                "stream: get_audio_segment FAILED seg_idx={} codes_shape={} req={}: {}",
-                                seg_idx + 1,
-                                (
-                                    result.codes.shape
-                                    if result.codes is not None
-                                    else None
-                                ),
+                            logger.info(
+                                "stream: segment_decoded seg_idx={} samples={} req={}",
+                                seg_idx,
+                                len(segment),
                                 req_tag,
-                                seg_err,
                             )
-                        raise
 
-                    seg_idx += 1
-                    _mark("segment_decoded", segment_idx=seg_idx, samples=len(segment))
-                    if stream_tokens:
-                        logger.info(
-                            "stream: segment_decoded seg_idx={} samples={} req={}",
-                            seg_idx,
-                            len(segment),
-                            req_tag,
-                        )
-
-                    if req.stream_audio:
-                        processed_segment, pending_pcm_tail = (
-                            self._crossfade_stream_segment(
-                                segment=segment,
-                                pending_tail=pending_pcm_tail,
-                                sample_rate=sample_rate,
-                                fade_ms=8.0,
+                        if req.stream_audio:
+                            processed_segment, pending_pcm_tail = (
+                                self._crossfade_stream_segment(
+                                    segment=segment,
+                                    pending_tail=pending_pcm_tail,
+                                    sample_rate=sample_rate,
+                                    fade_ms=8.0,
+                                )
                             )
-                        )
 
-                        if processed_segment.size > 0:
-                            _mark("yield_segment", segment_idx=seg_idx)
-                            yield InferenceResult(
-                                code="segment",
-                                audio=(sample_rate, processed_segment),
-                                error=None,
-                            )
-                            segments.append(processed_segment)
+                            if processed_segment.size > 0:
+                                _mark("yield_segment", segment_idx=seg_idx)
+                                yield InferenceResult(
+                                    code="segment",
+                                    audio=(sample_rate, processed_segment),
+                                    error=None,
+                                )
+                                segments.append(processed_segment)
+                        else:
+                            segments.append(segment)
+
+                        if self.empty_cache_per_segment and torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                     else:
-                        segments.append(segment)
+                        if stream_tokens:
+                            logger.info(
+                                "stream: got_next (end of stream), total_segments={} req={}",
+                                seg_idx,
+                                req_tag,
+                            )
 
-                    if ack_queue is not None:
+                        if req.stream_audio and pending_pcm_tail is not None:
+                            _mark("yield_final_tail")
+                            tail = self._flush_stream_tail(pending_pcm_tail)
+                            if tail is not None:
+                                yield InferenceResult(
+                                    code="segment",
+                                    audio=(sample_rate, tail),
+                                    error=None,
+                                )
+                                segments.append(tail)
+                            pending_pcm_tail = None
+
+                        _mark("got_next")
+                        break
+                finally:
+                    if needs_ack:
                         ack_queue.put(None)
-
-                    if self.empty_cache_per_segment and torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                else:
-                    if stream_tokens:
-                        logger.info(
-                            "stream: got_next (end of stream), total_segments={} req={}",
-                            seg_idx,
-                            req_tag,
-                        )
-
-                    if req.stream_audio and pending_pcm_tail is not None:
-                        _mark("yield_final_tail")
-                        yield InferenceResult(
-                            code="segment",
-                            audio=(sample_rate, pending_pcm_tail),
-                            error=None,
-                        )
-                        segments.append(pending_pcm_tail)
-                        pending_pcm_tail = None
-
-                    if ack_queue is not None:
-                        ack_queue.put(None)
-                    _mark("got_next")
-                    break
 
             if len(segments) == 0:
                 _mark("yield_error_empty")
@@ -466,7 +467,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         new_codes: torch.Tensor,
         left_context_codes: torch.Tensor | None,
         max_context_frames: int,
-    ) -> tuple[np.ndarray, torch.Tensor | None]:
+    ) -> tuple[np.ndarray, torch.Tensor | None, int]:
         new_codes_cpu = new_codes.detach().cpu()
 
         if left_context_codes is not None and left_context_codes.numel() > 0:
@@ -494,7 +495,14 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         else:
             next_context = None
 
-        return decoded_new.astype(np.float32, copy=False), next_context
+        return (
+            decoded_new.astype(np.float32, copy=False),
+            next_context,
+            decoded.size,
+        )
+
+    def _flush_stream_tail(self, pending_tail: np.ndarray | None) -> np.ndarray | None:
+        return pending_tail
 
     def _crossfade_stream_segment(
         self,
@@ -555,5 +563,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         if result.codes is None:
             return np.zeros(0, dtype=np.float32)
 
-        segment = self.decode_vq_tokens(codes=result.codes)
+        with torch.inference_mode():
+            segment = self.decode_vq_tokens(codes=result.codes)
+
         return segment.float().detach().cpu().numpy().astype(np.float32, copy=False)

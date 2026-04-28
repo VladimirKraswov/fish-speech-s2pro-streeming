@@ -5,7 +5,6 @@ import base64
 import json
 import logging
 import os
-import re
 import struct
 import time
 import uuid
@@ -51,11 +50,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SENTENCE_BOUNDARY_RE = re.compile(r'.+?[.!?…](?:["»”)\]]+)?(?:\s+|$)', re.S)
-CLAUSE_BOUNDARY_RE = re.compile(r'.+?[,:;—\-](?:\s+|$)', re.S)
+SENTENCE_END_CHARS = ".!?…"
+CLAUSE_END_CHARS = ",:;—-"
+CLOSING_CHARS = '"»”)]}'
 
 SHORT_COMPLETE_SENTENCE_MIN_CHARS = 24
-
 DEFAULT_SESSION_CONFIG = _RUNTIME.proxy.model_dump(mode="python")
 
 
@@ -202,9 +201,12 @@ class SessionStore:
                         "idle_sec": round(now - rec.updated_at, 1),
                         "expires_in_sec": max(0, round(rec.expires_at - now, 1)),
                         "buffer_chars": len(rec.buffer_text),
+                        "append_chars": rec.append_chars,
+                        "commit_chars": rec.commit_chars,
                         "input_closed": rec.input_closed,
                         "stream_started": rec.stream_started,
                         "stream_finished": rec.stream_finished,
+                        "queued_commits": rec.commit_queue.qsize(),
                     }
                     for rec in self._items.values()
                 ],
@@ -328,26 +330,86 @@ def _normalize_tail_after_commit(text: str) -> str:
     return text.lstrip()
 
 
-def _safe_hard_cut(text: str, limit: int, min_keep: int) -> int:
+def _boundary_end_with_closers_and_space(text: str, index: int, limit: int) -> int:
+    end = index + 1
+
+    while end < limit and text[end] in CLOSING_CHARS:
+        end += 1
+
+    while end < limit and text[end].isspace():
+        end += 1
+
+    return end
+
+
+def _last_boundary_before(
+    text: str,
+    limit: int,
+    *,
+    include_clause: bool,
+    include_newline: bool,
+) -> tuple[int, str] | None:
+    limit = max(0, min(limit, len(text)))
+    if limit <= 0:
+        return None
+
+    candidates: list[tuple[int, str]] = []
+
+    for i, ch in enumerate(text[:limit]):
+        if ch in SENTENCE_END_CHARS:
+            end = _boundary_end_with_closers_and_space(text, i, limit)
+            candidates.append((end, "sentence"))
+
+        elif include_clause and ch in CLAUSE_END_CHARS:
+            end = _boundary_end_with_closers_and_space(text, i, limit)
+            candidates.append((end, "clause"))
+
+        elif include_newline and ch == "\n":
+            candidates.append((i + 1, "newline"))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[0])
+    return candidates[-1]
+
+
+def _has_complete_sentence_at_end(text: str) -> bool:
+    stripped = text.rstrip()
+    if not stripped:
+        return False
+
+    while stripped and stripped[-1] in CLOSING_CHARS:
+        stripped = stripped[:-1].rstrip()
+
+    return bool(stripped and stripped[-1] in SENTENCE_END_CHARS)
+
+
+def _safe_cut_before(text: str, limit: int) -> tuple[int, str]:
     """
-    Безопасный hard cut: старается резать по пробелу/переносу, а не посреди слова.
+    Безопасно режет текст не дальше limit.
+    Главное: не разрывать слово посередине, иначе TTS часто пропускает хвосты/слова.
     """
     if len(text) <= limit:
-        return len(text)
+        return len(text), "safe_end"
 
-    lower_bound = max(1, min_keep, int(limit * 0.65))
-    search_area = text[:limit]
+    limit = max(1, min(limit, len(text)))
+    search = text[:limit]
 
-    cut = max(
-        search_area.rfind(" "),
-        search_area.rfind("\n"),
-        search_area.rfind("\t"),
-    )
+    # 1. Пробел/перевод строки — лучший вариант.
+    for i in range(len(search) - 1, 0, -1):
+        if search[i].isspace():
+            return i + 1, "word_boundary"
 
-    if cut >= lower_bound:
-        return cut + 1
+    # 2. Мягкая пунктуация, но не слишком близко к началу.
+    min_soft_pos = max(10, limit // 2)
+    for mark in [",", ";", ":", "—", "-"]:
+        idx = search.rfind(mark)
+        if idx >= min_soft_pos:
+            return idx + 1, "soft_boundary"
 
-    return limit
+    # 3. Крайний случай.
+    return limit, "hard_limit"
 
 
 def _pcm_bytes_for_duration_ms(
@@ -368,46 +430,6 @@ def _pcm_bytes_for_duration_ms(
     return raw
 
 
-def _last_boundary_before(
-    text: str,
-    limit: int,
-    *,
-    include_clause: bool,
-    include_newline: bool,
-) -> tuple[int, str] | None:
-    candidates: list[tuple[int, str]] = []
-
-    for match in SENTENCE_BOUNDARY_RE.finditer(text):
-        end = match.end()
-        if end <= limit:
-            candidates.append((end, "sentence"))
-
-    if include_clause:
-        for match in CLAUSE_BOUNDARY_RE.finditer(text):
-            end = match.end()
-            if end <= limit:
-                candidates.append((end, "clause"))
-
-    if include_newline:
-        idx = 0
-        while True:
-            idx = text.find("\n", idx)
-            if idx == -1:
-                break
-
-            end = idx + 1
-            if end <= limit:
-                candidates.append((end, "newline"))
-
-            idx = end
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda x: x[0])
-    return candidates[-1]
-
-
 def _extract_commits(
     buffer_text: str,
     cfg: CommitPolicyConfig,
@@ -419,7 +441,6 @@ def _extract_commits(
     text = buffer_text
 
     while True:
-        text = _normalize_tail_after_commit(text)
         text_len = len(text)
 
         if text_len == 0:
@@ -428,55 +449,24 @@ def _extract_commits(
         stage = cfg.first if (next_commit_seq + len(commits)) == 1 else cfg.next
 
         if force:
-            if text_len <= stage.max_chars:
-                piece = _right_trim_committed(text)
-                if piece:
-                    commits.append((piece, "force"))
-                text = ""
-                break
-
-            boundary = _last_boundary_before(
-                text,
-                stage.max_chars,
-                include_clause=cfg.flush_on_clause_punctuation,
-                include_newline=cfg.flush_on_newline,
-            )
-
-            if boundary:
-                end, boundary_reason = boundary
-                reason = f"force_{boundary_reason}"
-            else:
-                end = _safe_hard_cut(text, stage.max_chars, stage.min_chars)
-                reason = "force_hard_limit"
-
-            piece = _right_trim_committed(text[:end])
-            text = _normalize_tail_after_commit(text[end:])
-
+            piece = _right_trim_committed(text)
             if piece:
-                commits.append((piece, reason))
-                continue
-
+                commits.append((piece, "force"))
+            text = ""
             break
 
+        # Короткое, но законченное предложение — можно отправить.
         if (
             cfg.flush_on_sentence_punctuation
             and text_len < stage.min_chars
             and text_len >= SHORT_COMPLETE_SENTENCE_MIN_CHARS
+            and _has_complete_sentence_at_end(text)
         ):
-            sentence_boundary = _last_boundary_before(
-                text,
-                text_len,
-                include_clause=False,
-                include_newline=cfg.flush_on_newline,
-            )
-
-            if sentence_boundary and sentence_boundary[0] == text_len:
-                piece = _right_trim_committed(text)
-                if piece:
-                    commits.append((piece, "sentence"))
-
-                text = ""
-                break
+            piece = _right_trim_committed(text)
+            if piece:
+                commits.append((piece, "sentence"))
+            text = ""
+            break
 
         if text_len < stage.min_chars:
             break
@@ -484,40 +474,46 @@ def _extract_commits(
         reason = None
         end = None
 
-        sentence_boundary = _last_boundary_before(
-            text,
-            stage.target_chars,
-            include_clause=False,
-            include_newline=cfg.flush_on_newline,
-        )
-
-        if sentence_boundary and cfg.flush_on_sentence_punctuation:
-            end, reason = sentence_boundary
-
-        if end is None and text_len >= stage.target_chars:
-            any_boundary = _last_boundary_before(
+        # 1. Полное предложение до max_chars.
+        # Важно: ищем до max_chars, а не только до target_chars,
+        # иначе длинные предложения будут висеть до hard cut.
+        if cfg.flush_on_sentence_punctuation:
+            sentence_boundary = _last_boundary_before(
                 text,
-                stage.max_chars,
-                include_clause=cfg.flush_on_clause_punctuation,
+                min(stage.max_chars, text_len),
+                include_clause=False,
                 include_newline=cfg.flush_on_newline,
             )
 
-            if any_boundary:
-                end, reason = any_boundary
+            if sentence_boundary:
+                candidate_end, candidate_reason = sentence_boundary
 
+                if candidate_end >= stage.min_chars or candidate_end == text_len:
+                    end, reason = candidate_end, candidate_reason
+
+        # 2. Clause cut — только если явно включён.
+        # Для длинной озвучки лучше держать false, чтобы не резать слишком часто по запятым.
+        if (
+            end is None
+            and cfg.flush_on_clause_punctuation
+            and text_len >= stage.target_chars
+        ):
+            clause_boundary = _last_boundary_before(
+                text,
+                min(stage.max_chars, text_len),
+                include_clause=True,
+                include_newline=cfg.flush_on_newline,
+            )
+
+            if clause_boundary:
+                candidate_end, candidate_reason = clause_boundary
+
+                if candidate_end >= stage.min_chars:
+                    end, reason = candidate_end, candidate_reason
+
+        # 3. Если дошли до max_chars — режем безопасно по границе слова.
         if end is None and text_len >= stage.max_chars:
-            hard_boundary = _last_boundary_before(
-                text,
-                stage.max_chars,
-                include_clause=cfg.flush_on_clause_punctuation,
-                include_newline=cfg.flush_on_newline,
-            )
-
-            if hard_boundary:
-                end, reason = hard_boundary
-            else:
-                end = _safe_hard_cut(text, stage.max_chars, stage.min_chars)
-                reason = "hard_limit"
+            end, reason = _safe_cut_before(text, stage.max_chars)
 
         if end is None:
             break
@@ -563,11 +559,12 @@ async def _queue_commits(
         items.append(item)
 
         logger.info(
-            "commit queued session=%s seq=%s reason=%s text_len=%s",
+            "commit queued session=%s seq=%s reason=%s text_len=%s text=%r",
             rec.session_id[:8],
             seq,
             reason,
             len(text),
+            text[:180],
         )
 
     return items
@@ -597,31 +594,44 @@ async def session_open(req: SessionOpenRequest) -> JSONResponse:
 
     if config.tts.stateful_synthesis:
         try:
+            open_payload = {
+                "reference_id": config.tts.reference_id or config.default_reference_id,
+                "max_history_turns": getattr(config.tts, "stateful_history_turns", 1),
+                "max_history_chars": getattr(config.tts, "stateful_history_chars", 160),
+                "max_history_code_frames": getattr(
+                    config.tts,
+                    "stateful_history_code_frames",
+                    260,
+                ),
+            }
+
             async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
                 resp = await client.post(
                     UPSTREAM_TTS_URL.replace("/v1/tts", "/v1/synthesis/sessions/open"),
-                    json={
-                        "reference_id": config.tts.reference_id or config.default_reference_id,
-                        "max_history_turns": getattr(config.tts, "stateful_history_turns", 1),
-                        "max_history_chars": getattr(config.tts, "stateful_history_chars", 160),
-                        "max_history_code_frames": getattr(config.tts, "stateful_history_code_frames", 260),
-                    },
+                    json=open_payload,
                     headers={"Accept": "application/json"},
                 )
+
                 if resp.status_code != 200:
                     body = resp.text
                     raise RuntimeError(f"upstream status={resp.status_code}: {body}")
 
                 data = resp.json()
                 rec.synthesis_session_id = data.get("synthesis_session_id")
+
                 if not rec.synthesis_session_id:
                     raise RuntimeError("upstream did not return synthesis_session_id")
 
                 logger.info(
-                    "proxy session %s linked to upstream synthesis session %s",
+                    "proxy session %s linked to upstream synthesis session %s "
+                    "history_turns=%s history_chars=%s history_code_frames=%s",
                     rec.session_id[:8],
                     rec.synthesis_session_id[:8],
+                    open_payload["max_history_turns"],
+                    open_payload["max_history_chars"],
+                    open_payload["max_history_code_frames"],
                 )
+
         except Exception as exc:
             if config.tts.stateful_fallback_to_stateless:
                 logger.warning(
@@ -637,10 +647,11 @@ async def session_open(req: SessionOpenRequest) -> JSONResponse:
                 )
 
     logger.info(
-        "session open id=%s ref=%s emit_bytes=%s",
+        "session open id=%s ref=%s emit_bytes=%s stateful=%s",
         rec.session_id[:8],
         config.tts.reference_id,
         config.playback.target_emit_bytes,
+        config.tts.stateful_synthesis,
     )
 
     return JSONResponse(
@@ -679,7 +690,8 @@ async def session_get(session_id: str) -> JSONResponse:
             "stateful_synthesis": config.tts.stateful_synthesis,
             "stream_started": rec.stream_started,
             "stream_finished": rec.stream_finished,
-            "commit_history": rec.commit_history[-50:],
+            "commit_history": rec.commit_history[-100:],
+            "queued_commits": rec.commit_queue.qsize(),
         }
     )
 
@@ -694,7 +706,14 @@ async def session_append(session_id: str, req: SessionAppendRequest) -> JSONResp
     config = ProxyConfig.model_validate(rec.config)
 
     if len(req.text) + len(rec.buffer_text) > config.session.max_buffer_chars:
-        raise HTTPException(400, detail="session buffer limit exceeded")
+        raise HTTPException(
+            400,
+            detail=(
+                "session buffer limit exceeded: "
+                f"incoming={len(req.text)} buffered={len(rec.buffer_text)} "
+                f"limit={config.session.max_buffer_chars}"
+            ),
+        )
 
     async with rec.lock:
         if rec.input_closed:
@@ -735,20 +754,12 @@ async def session_flush(session_id: str, req: SessionFlushRequest) -> JSONRespon
     if rec is None:
         raise HTTPException(404, detail="session not found")
 
-    config = ProxyConfig.model_validate(rec.config)
-
     async with rec.lock:
         queued = []
 
         if rec.buffer_text.strip():
-            commits, remainder = _extract_commits(
-                rec.buffer_text,
-                config.commit,
-                next_commit_seq=rec.next_commit_seq,
-                force=True,
-            )
-            queued = await _queue_commits(rec, commits)
-            rec.buffer_text = remainder
+            queued = await _queue_commits(rec, [(rec.buffer_text.strip(), req.reason)])
+            rec.buffer_text = ""
 
         await _touch_session(rec)
 
@@ -788,7 +799,9 @@ async def session_finish(session_id: str, req: SessionFinishRequest) -> JSONResp
                     "session_id": rec.session_id,
                     "already_finished": True,
                     "buffer_text": rec.buffer_text,
+                    "buffer_chars": len(rec.buffer_text),
                     "committed": [],
+                    "input_closed": rec.input_closed,
                 }
             )
 
@@ -796,23 +809,16 @@ async def session_finish(session_id: str, req: SessionFinishRequest) -> JSONResp
         queued = []
 
         if rec.buffer_text.strip():
-            commits, remainder = _extract_commits(
-                rec.buffer_text,
-                config.commit,
-                next_commit_seq=rec.next_commit_seq,
-                force=True,
-            )
-            queued = await _queue_commits(rec, commits)
-            rec.buffer_text = remainder
+            queued = await _queue_commits(rec, [(rec.buffer_text.strip(), req.reason)])
+            rec.buffer_text = ""
 
         await rec.commit_queue.put({"type": "eof"})
         await _touch_session(rec)
 
     logger.info(
-        "session finish id=%s committed=%s buffer_chars=%s input_closed=%s",
+        "session finish id=%s committed=%s input_closed=%s",
         rec.session_id[:8],
         len(queued),
-        len(rec.buffer_text),
         rec.input_closed,
     )
 
@@ -896,8 +902,8 @@ async def session_pcm_stream(session_id: str):
 
         header_buffer = bytearray()
         pending_pcm = bytearray()
-        header_sent = False
 
+        header_sent = False
         upstream_bytes = 0
         first_emit_done = False
         start_buffer_bytes = 0
@@ -954,13 +960,13 @@ async def session_pcm_stream(session_id: str):
 
         async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
             logger.info(
-                "REQ %s commit_seq=%s upstream start text_len=%s ref=%s url=%s max_new_tokens=%s",
+                "REQ %s commit_seq=%s upstream start text_len=%s ref=%s url=%s text=%r",
                 req_id,
                 commit_item["seq"],
                 len(commit_item["text"]),
                 payload["reference_id"],
                 url,
-                payload.get("max_new_tokens"),
+                commit_item["text"][:180],
             )
 
             async with client.stream("POST", url, json=payload) as upstream:
@@ -1040,6 +1046,9 @@ async def session_pcm_stream(session_id: str):
 
                         async for event in flush_pending(force=False):
                             yield event
+
+        if not header_sent:
+            raise RuntimeError("upstream finished before WAV header/data was received")
 
         if config.playback.stop_grace_ms > 0:
             await asyncio.sleep(config.playback.stop_grace_ms / 1000.0)
@@ -1145,7 +1154,7 @@ async def session_pcm_stream(session_id: str):
 
 
 @app.get("/pcm-stream")
-async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
+async def pcm_stream(text: str = Query(..., min_length=1, max_length=12000)):
     config = load_runtime_config().proxy
     req_id = uuid.uuid4().hex[:8]
     payload = build_upstream_payload(text=text, config=config)
@@ -1195,6 +1204,7 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
 
                 pcm_seq += 1
                 first_emit_done = True
+                await asyncio.sleep(0)
 
         yield await emit(
             {
@@ -1257,13 +1267,13 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
                         if pcm:
                             pending_pcm.extend(pcm)
 
-                            async for event in flush_pending():
+                            async for event in flush_pending(force=False):
                                 yield event
 
                     else:
                         pending_pcm.extend(chunk)
 
-                        async for event in flush_pending():
+                        async for event in flush_pending(force=False):
                             yield event
 
         if config.playback.stop_grace_ms > 0:

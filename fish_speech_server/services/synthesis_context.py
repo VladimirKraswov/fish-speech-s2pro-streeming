@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -67,6 +68,7 @@ class SynthesisContext:
     max_history_turns: int = 4
     max_history_chars: int = 500
     max_history_code_frames: int = 2000
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     def append_turn(self, turn: SynthesisTurn) -> None:
         if turn.code_frames == 0 and turn.codes is not None:

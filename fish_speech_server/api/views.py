@@ -740,31 +740,48 @@ async def stateful_synthesize(req: Annotated[StatefulTTSRequest, Body(exclusive=
                 content="Streaming only supports WAV format",
             )
 
-        stateful_req = stateful_tts_to_driver_request(req, ctx)
+        async def locked_stateful_stream():
+            async with ctx.lock:
+                logger.info(
+                    "Synthesis lock acquired session=%s commit_seq=%s",
+                    req.synthesis_session_id[:8],
+                    req.commit_seq,
+                )
+                try:
+                    stateful_req = stateful_tts_to_driver_request(req, ctx)
 
-        summary = build_continuation_debug_summary(ctx)
-        logger.info(
-            "Stateful synthesize session=%s commit_seq=%s "
-            "history_turns=%s history_with_codes=%s "
-            "selected_turns=%s selected_chars=%s selected_code_frames=%s "
-            "selected_commits=%s",
-            req.synthesis_session_id[:8],
-            req.commit_seq,
-            summary["history_turns"],
-            summary["history_with_codes"],
-            summary["selected_turns"],
-            summary["selected_chars"],
-            summary["selected_code_frames"],
-            summary["commit_seq_list"],
-        )
+                    summary = build_continuation_debug_summary(ctx)
+                    logger.info(
+                        "Stateful synthesize session=%s commit_seq=%s "
+                        "history_turns=%s history_with_codes=%s "
+                        "selected_turns=%s selected_chars=%s selected_code_frames=%s "
+                        "selected_commits=%s",
+                        req.synthesis_session_id[:8],
+                        req.commit_seq,
+                        summary["history_turns"],
+                        summary["history_with_codes"],
+                        summary["selected_turns"],
+                        summary["selected_chars"],
+                        summary["selected_code_frames"],
+                        summary["commit_seq_list"],
+                    )
+
+                    async for chunk in stateful_inference_async(
+                        stateful_req,
+                        driver,
+                        ctx,
+                        original_req=req,
+                    ):
+                        yield chunk
+                finally:
+                    logger.info(
+                        "Synthesis lock released session=%s commit_seq=%s",
+                        req.synthesis_session_id[:8],
+                        req.commit_seq,
+                    )
 
         return StreamResponse(
-            iterable=stateful_inference_async(
-                stateful_req,
-                driver,
-                ctx,
-                original_req=req,
-            ),
+            iterable=locked_stateful_stream(),
             headers={
                 "Content-Disposition": f"attachment; filename=audio.{req.format}",
             },

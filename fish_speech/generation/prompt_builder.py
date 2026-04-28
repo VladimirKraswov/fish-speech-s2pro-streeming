@@ -78,6 +78,16 @@ def generate_committed_segments(
         ), "Continuation text and tokens must have the same length"
         continuation_tokens = [i.cpu() for i in continuation_tokens]
 
+    logger.info(
+        "generation_prompt_inputs: prompt_text_count={} prompt_token_count={} "
+        "continuation_text_count={} continuation_token_count={} continuation_token_frames={}",
+        len(prompt_text or []),
+        len(prompt_tokens or []),
+        len(continuation_text or []),
+        len(continuation_tokens or []),
+        sum(int(c.shape[-1]) for c in continuation_tokens or [] if hasattr(c, "shape")),
+    )
+
     model_size = sum(p.numel() for p in model.parameters() if p.requires_grad)
     tokenizer = model.tokenizer
     max_length = _cache_max_seq_len(model)

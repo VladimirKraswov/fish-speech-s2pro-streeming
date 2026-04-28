@@ -246,7 +246,7 @@ class ReferenceLoader:
         if ref_dir.exists() and hash_file.exists():
             if hash_file.read_text(encoding="utf-8").strip() == content_hash:
                 logger.info(
-                    "Reference %s/%s unchanged (hash match), skip write", id, stem
+                    "Reference {}/{} unchanged (hash match), skip write", id, stem
                 )
                 return "unchanged"
 
@@ -258,7 +258,7 @@ class ReferenceLoader:
         if id in self.ref_by_id:
             del self.ref_by_id[id]
         status = "updated" if existed_before else "created"
-        logger.info("Reference %s/%s %s", id, stem, status)
+        logger.info("Reference {}/{} {}", id, stem, status)
         return status
 
     def add_reference(self, id: str, wav_file_path: str, reference_text: str) -> None:

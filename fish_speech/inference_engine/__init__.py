@@ -137,8 +137,6 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
         try:
             ref_id = req.reference_id
-            prompt_tokens, prompt_texts = [], []
-
             ref_tokens, ref_texts = [], []
             history_tokens, history_texts = [], []
 
@@ -151,23 +149,26 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                     req.references, req.use_memory_cache
                 )
                 _mark("ref_loaded", mode="hash", refs=len(req.references))
+            elif req.prompt_tokens and req.prompt_text:
+                ref_tokens = list(req.prompt_tokens)
+                ref_texts = list(req.prompt_text)
+                logger.info(
+                    "reference: using request prompt turns={} chars={} frames={}",
+                    len(ref_texts),
+                    sum(len(t) for t in ref_texts),
+                    sum(int(t.shape[-1]) for t in ref_tokens if hasattr(t, "shape")),
+                )
+                _mark("ref_loaded", mode="prompt", refs=len(ref_texts))
 
             # 2. Load continuation history
             if req.continuation_tokens and req.continuation_text:
                 history_tokens = list(req.continuation_tokens)
                 history_texts = list(req.continuation_text)
                 logger.info(
-                    "continuation: added history after reference turns={} chars={}",
+                    "continuation: added history after reference turns={} chars={} frames={}",
                     len(history_texts),
                     sum(len(t) for t in history_texts),
-                )
-            elif req.prompt_tokens and req.prompt_text:
-                history_tokens = list(req.prompt_tokens)
-                history_texts = list(req.prompt_text)
-                logger.info(
-                    "continuation: added legacy history after reference turns={} chars={}",
-                    len(history_texts),
-                    sum(len(t) for t in history_texts),
+                    sum(int(t.shape[-1]) for t in history_tokens if hasattr(t, "shape")),
                 )
 
             if req.seed is not None:

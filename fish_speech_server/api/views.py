@@ -492,7 +492,7 @@ async def add_reference_encoded(
         return format_response(response)
 
     except ValueError as e:
-        logger.warning("add_encoded invalid input: %s", e)
+        logger.warning("add_encoded invalid input: {}", e)
         return format_response(
             AddEncodedReferenceResponse(
                 success=False, status="error", message=str(e), reference_id=id or ""
@@ -500,7 +500,7 @@ async def add_reference_encoded(
             status_code=400,
         )
     except Exception as e:
-        logger.error("add_encoded error: %s", e, exc_info=True)
+        logger.error("add_encoded error: {}", e, exc_info=True)
         return format_response(
             AddEncodedReferenceResponse(
                 success=False,

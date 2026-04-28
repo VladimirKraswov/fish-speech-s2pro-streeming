@@ -129,7 +129,7 @@ class SessionStore:
                 self._items.pop(sid, None)
 
             if expired:
-                logger.info("session cleanup removed=%s", len(expired))
+                logger.info("session cleanup removed={}", len(expired))
 
     async def create(
         self,
@@ -798,7 +798,7 @@ async def session_finish(session_id: str, req: SessionFinishRequest) -> JSONResp
     )
 
     if config.session.auto_close_on_finish:
-        logger.info("session %s marked auto-close-on-finish", rec.session_id[:8])
+        logger.info("session {} marked auto-close-on-finish", rec.session_id[:8])
 
     return JSONResponse(
         {
@@ -1091,7 +1091,7 @@ async def session_pcm_stream(session_id: str):
                         return
 
             except asyncio.CancelledError:
-                logger.warning("session stream cancelled id=%s", rec.session_id[:8])
+                logger.warning("session stream cancelled id={}", rec.session_id[:8])
                 raise
 
             except Exception as exc:

@@ -16,21 +16,21 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
   const base: ProxyConfig = {
     commit: {
       first: {
-        min_chars: 55,
-        target_chars: 110,
-        max_chars: 180,
+        min_chars: 24,
+        target_chars: 60,
+        max_chars: 90,
         max_wait_ms: 220,
         allow_partial_after_ms: 420,
       },
       next: {
-        min_chars: 90,
-        target_chars: 170,
-        max_chars: 260,
-        max_wait_ms: 420,
-        allow_partial_after_ms: 800,
+        min_chars: 28,
+        target_chars: 70,
+        max_chars: 100,
+        max_wait_ms: 360,
+        allow_partial_after_ms: 700,
       },
       flush_on_sentence_punctuation: true,
-      flush_on_clause_punctuation: false,
+      flush_on_clause_punctuation: true,
       flush_on_newline: true,
       carry_incomplete_tail: true,
     },
@@ -40,24 +40,24 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
       normalize: true,
       use_memory_cache: 'on',
       seed: null,
-      max_new_tokens: 220,
-      chunk_length: 180,
+      max_new_tokens: 280,
+      chunk_length: 160,
       top_p: 0.8,
       repetition_penalty: 1.0,
       temperature: 0.66,
       stream_tokens: true,
-      initial_stream_chunk_size: 18,
-      stream_chunk_size: 14,
+      initial_stream_chunk_size: 10,
+      stream_chunk_size: 8,
       stateful_synthesis: true,
       stateful_fallback_to_stateless: false,
       stateful_history_turns: 1,
-      stateful_history_chars: 160,
-      stateful_history_code_frames: 260,
+      stateful_history_chars: 80,
+      stateful_history_code_frames: 96,
     },
     playback: {
-      target_emit_bytes: 16384,
-      start_buffer_ms: 350,
-      stop_grace_ms: 180,
+      target_emit_bytes: 8192,
+      start_buffer_ms: 180,
+      stop_grace_ms: 120,
     },
     session: {
       max_buffer_chars: 20000,
@@ -67,56 +67,60 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
 
   if (kind === 'lowLatency') {
     base.commit.first = {
-      min_chars: 45,
-      target_chars: 90,
-      max_chars: 150,
-      max_wait_ms: 160,
-      allow_partial_after_ms: 320,
+      min_chars: 18,
+      target_chars: 42,
+      max_chars: 70,
+      max_wait_ms: 140,
+      allow_partial_after_ms: 300,
     };
 
     base.commit.next = {
-      min_chars: 75,
-      target_chars: 140,
-      max_chars: 220,
-      max_wait_ms: 320,
-      allow_partial_after_ms: 650,
+      min_chars: 22,
+      target_chars: 52,
+      max_chars: 82,
+      max_wait_ms: 260,
+      allow_partial_after_ms: 550,
     };
 
-    base.tts.max_new_tokens = 360;
-    base.tts.chunk_length = 150;
-    base.tts.initial_stream_chunk_size = 8;
-    base.tts.stream_chunk_size = 6;
+    base.tts.max_new_tokens = 220;
+    base.tts.chunk_length = 140;
+    base.tts.initial_stream_chunk_size = 6;
+    base.tts.stream_chunk_size = 5;
+    base.tts.stateful_history_chars = 60;
+    base.tts.stateful_history_code_frames = 80;
 
     base.playback.target_emit_bytes = 6144;
-    base.playback.start_buffer_ms = 160;
-    base.playback.stop_grace_ms = 180;
+    base.playback.start_buffer_ms = 120;
+    base.playback.stop_grace_ms = 100;
   }
 
   if (kind === 'stable') {
     base.commit.first = {
-      min_chars: 70,
-      target_chars: 140,
-      max_chars: 220,
+      min_chars: 28,
+      target_chars: 70,
+      max_chars: 105,
       max_wait_ms: 300,
       allow_partial_after_ms: 600,
     };
 
     base.commit.next = {
-      min_chars: 120,
-      target_chars: 220,
-      max_chars: 340,
-      max_wait_ms: 600,
-      allow_partial_after_ms: 1100,
+      min_chars: 34,
+      target_chars: 85,
+      max_chars: 125,
+      max_wait_ms: 500,
+      allow_partial_after_ms: 950,
     };
 
-    base.tts.max_new_tokens = 480;
-    base.tts.chunk_length = 180;
+    base.tts.max_new_tokens = 320;
+    base.tts.chunk_length = 160;
     base.tts.initial_stream_chunk_size = 12;
-    base.tts.stream_chunk_size = 10;
+    base.tts.stream_chunk_size = 8;
+    base.tts.stateful_history_chars = 100;
+    base.tts.stateful_history_code_frames = 128;
 
     base.playback.target_emit_bytes = 12288;
-    base.playback.start_buffer_ms = 320;
-    base.playback.stop_grace_ms = 350;
+    base.playback.start_buffer_ms = 260;
+    base.playback.stop_grace_ms = 180;
   }
 
   return base;
@@ -291,8 +295,11 @@ export function App() {
 
       const stateful = data.config?.tts?.stateful_synthesis ? 'stateful' : 'stateless';
       const maxTokens = data.config?.tts?.max_new_tokens ?? 'n/a';
+      const historyFrames = data.config?.tts?.stateful_history_code_frames ?? 'n/a';
 
-      log(`session opened: ${data.session_id.slice(0, 8)}, mode=${stateful}, max_new_tokens=${maxTokens}`);
+      log(
+        `session opened: ${data.session_id.slice(0, 8)}, mode=${stateful}, max_new_tokens=${maxTokens}, history_frames=${historyFrames}`,
+      );
 
       abortController.current = new AbortController();
 
@@ -414,7 +421,7 @@ export function App() {
           <h1>Reliable realtime voice console</h1>
           <p>
             Имитация LLM-вывода: текст отправляется маленькими чанками в proxy,
-            а proxy озвучивает его с увеличенным запасом генерации, чтобы не резать хвост фразы.
+            а proxy озвучивает его короткими commit-сегментами с acoustic continuation.
           </p>
         </div>
 
@@ -516,7 +523,7 @@ export function App() {
           <div class="panel-head">
             <div>
               <h2>Runtime preset</h2>
-              <p>JSON override для `/session/open`. Balanced и Stable настроены на полное дочитывание.</p>
+              <p>JSON override для `/session/open`. Сегменты специально короткие, чтобы не упираться в KV-cache.</p>
             </div>
           </div>
 

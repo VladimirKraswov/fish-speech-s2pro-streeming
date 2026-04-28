@@ -21,8 +21,8 @@
     "device": "cuda",
     "precision": "bfloat16",
     "compile": true,
-    "cache_max_seq_len": 768,
-    "max_new_tokens_cap": 220,
+    "cache_max_seq_len": 1280,
+    "max_new_tokens_cap": 320,
     "sdpa_math": false,
     "cleanup_after_request": false,
     "cleanup_every_n_requests": 12,
@@ -52,21 +52,21 @@
     "version": 1,
     "commit": {
       "first": {
-        "min_chars": 55,
-        "target_chars": 110,
-        "max_chars": 180,
+        "min_chars": 24,
+        "target_chars": 60,
+        "max_chars": 90,
         "max_wait_ms": 220,
         "allow_partial_after_ms": 420
       },
       "next": {
-        "min_chars": 90,
-        "target_chars": 170,
-        "max_chars": 260,
-        "max_wait_ms": 420,
-        "allow_partial_after_ms": 800
+        "min_chars": 28,
+        "target_chars": 70,
+        "max_chars": 100,
+        "max_wait_ms": 360,
+        "allow_partial_after_ms": 700
       },
       "flush_on_sentence_punctuation": true,
-      "flush_on_clause_punctuation": false,
+      "flush_on_clause_punctuation": true,
       "flush_on_newline": true,
       "carry_incomplete_tail": true
     },
@@ -76,24 +76,24 @@
       "normalize": true,
       "use_memory_cache": "on",
       "seed": null,
-      "max_new_tokens": 220,
-      "chunk_length": 180,
+      "max_new_tokens": 280,
+      "chunk_length": 160,
       "top_p": 0.8,
       "repetition_penalty": 1.0,
       "temperature": 0.66,
       "stream_tokens": true,
-      "initial_stream_chunk_size": 18,
-      "stream_chunk_size": 14,
+      "initial_stream_chunk_size": 10,
+      "stream_chunk_size": 8,
       "stateful_synthesis": true,
       "stateful_fallback_to_stateless": false,
       "stateful_history_turns": 1,
-      "stateful_history_chars": 160,
-      "stateful_history_code_frames": 260
+      "stateful_history_chars": 80,
+      "stateful_history_code_frames": 96
     },
     "playback": {
-      "target_emit_bytes": 16384,
-      "start_buffer_ms": 350,
-      "stop_grace_ms": 180
+      "target_emit_bytes": 8192,
+      "start_buffer_ms": 180,
+      "stop_grace_ms": 120
     },
     "session": {
       "max_buffer_chars": 20000,

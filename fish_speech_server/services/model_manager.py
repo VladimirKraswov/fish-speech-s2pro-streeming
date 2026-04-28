@@ -56,7 +56,7 @@ class ModelManager:
                     self.runtime.model.memory_history_max_entries,
                 )
             except Exception as e:
-                logger.warning("Could not enable CUDA memory history recording: %s", e)
+                logger.warning("Could not enable CUDA memory history recording: {}", e)
 
         if self.mode == "tts" and self.compile and self.runtime.warmup.enabled:
             logger.warning(

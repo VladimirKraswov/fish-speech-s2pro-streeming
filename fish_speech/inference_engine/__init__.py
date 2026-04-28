@@ -175,8 +175,9 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                 set_seed(req.seed)
                 logger.warning(f"set seed: {req.seed}")
 
-            stream_tokens = bool(req.stream_tokens)
-            ack_queue = queue.Queue() if stream_tokens else None
+            stream_decode = bool(req.stream_tokens or req.stream_audio)
+            emit_token_events = bool(req.stream_tokens)
+            ack_queue = queue.Queue() if stream_decode else None
             response_queue = self.send_Llama_request(
                 req,
                 prompt_tokens=ref_tokens,
@@ -187,7 +188,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                 continuation_text=history_texts,
             )
             _mark("llama_queued")
-            if stream_tokens:
+            if stream_decode:
                 logger.info(
                     "stream: inference started (token streaming), req={}", req_tag
                 )
@@ -205,13 +206,13 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             max_vq_context_frames = 32
 
             while True:
-                if stream_tokens:
+                if stream_decode:
                     logger.info(
                         "stream: waiting for next chunk from queue, req={}", req_tag
                     )
                 wrapped_result = response_queue.get()
                 _mark("queue_get")
-                if stream_tokens:
+                if stream_decode:
                     action = (
                         getattr(wrapped_result.response, "action", None)
                         if hasattr(wrapped_result.response, "action")
@@ -251,7 +252,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
                     result = wrapped_result.response
                     if result.action != "next":
-                        if req.stream_tokens and result.codes is not None:
+                        if emit_token_events and result.codes is not None:
                             yield InferenceResult(
                                 code="tokens",
                                 audio=None,
@@ -263,7 +264,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                                 ),
                             )
 
-                        if stream_tokens:
+                        if stream_decode:
                             logger.info(
                                 "stream: decoding segment seg_idx={} codes_shape={} req={}",
                                 seg_idx + 1,
@@ -280,7 +281,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                         )
 
                         try:
-                            if stream_tokens and result.codes is not None:
+                            if stream_decode and result.codes is not None:
                                 new_codes = result.codes
                                 context_frames_before = (
                                     vq_left_context.shape[-1]
@@ -315,7 +316,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                                     )
                                 segment = self.get_audio_segment(result)
                         except Exception as seg_err:
-                            if stream_tokens:
+                            if stream_decode:
                                 logger.exception(
                                     "stream: get_audio_segment FAILED seg_idx={} codes_shape={} req={}: {}",
                                     seg_idx + 1,
@@ -333,7 +334,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                         _mark(
                             "segment_decoded", segment_idx=seg_idx, samples=len(segment)
                         )
-                        if stream_tokens:
+                        if stream_decode:
                             logger.info(
                                 "stream: segment_decoded seg_idx={} samples={} req={}",
                                 seg_idx,
@@ -365,7 +366,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                         if self.empty_cache_per_segment and torch.cuda.is_available():
                             torch.cuda.empty_cache()
                     else:
-                        if stream_tokens:
+                        if stream_decode:
                             logger.info(
                                 "stream: got_next (end of stream), total_segments={} req={}",
                                 seg_idx,

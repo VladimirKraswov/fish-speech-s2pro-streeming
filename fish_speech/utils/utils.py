@@ -135,9 +135,44 @@ def set_seed(seed: int):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-def enforce_tags(cfg, save_to_file=False):
-    pass
+def enforce_tags(cfg: DictConfig, save_to_file: bool = False) -> None:
+    """Prompts user to input tags from command line if none are provided in the config."""
+    if not cfg.get("tags"):
+        if "rich" in find_spec("rich").name:
+            from rich.prompt import Prompt
+
+            tags = Prompt.ask("Enter tags (comma separated)")
+            cfg.tags = [t.strip() for t in tags.split(",") if t.strip()]
+        else:
+            tags = input("Enter tags (comma separated): ")
+            cfg.tags = [t.strip() for t in tags.split(",") if t.strip()]
 
 
-def print_config_tree(cfg, resolve=False, save_to_file=False):
-    pass
+def print_config_tree(
+    cfg: DictConfig,
+    resolve: bool = False,
+    save_to_file: bool = False,
+) -> None:
+    """Prints content of DictConfig using Rich library and saves it to a file."""
+    from rich.console import Console
+    from rich.tree import Tree
+    from rich.syntax import Syntax
+    from omegaconf import OmegaConf
+
+    console = Console()
+    tree = Tree("Config Tree")
+
+    for key in cfg.keys():
+        branch = tree.add(key)
+        config_group = cfg.get(key)
+        if isinstance(config_group, DictConfig):
+            branch_content = OmegaConf.to_yaml(config_group, resolve=resolve)
+        else:
+            branch_content = str(config_group)
+        branch.add(Syntax(branch_content, "yaml", indent_guides=True, word_wrap=True))
+
+    console.print(tree)
+
+    if save_to_file:
+        with open("config_tree.log", "w") as f:
+            f.write(OmegaConf.to_yaml(cfg, resolve=resolve))

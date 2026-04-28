@@ -743,7 +743,7 @@ async def stateful_synthesize(req: Annotated[StatefulTTSRequest, Body(exclusive=
         async def locked_stateful_stream():
             async with ctx.lock:
                 logger.info(
-                    "Synthesis lock acquired session=%s commit_seq=%s",
+                    "Synthesis lock acquired session={} commit_seq={}",
                     req.synthesis_session_id[:8],
                     req.commit_seq,
                 )
@@ -752,10 +752,10 @@ async def stateful_synthesize(req: Annotated[StatefulTTSRequest, Body(exclusive=
 
                     summary = build_continuation_debug_summary(ctx)
                     logger.info(
-                        "Stateful synthesize session=%s commit_seq=%s "
-                        "history_turns=%s history_with_codes=%s "
-                        "selected_turns=%s selected_chars=%s selected_code_frames=%s "
-                        "selected_commits=%s",
+                        "Stateful synthesize session={} commit_seq={} "
+                        "history_turns={} history_with_codes={} "
+                        "selected_turns={} selected_chars={} selected_code_frames={} "
+                        "selected_commits={}",
                         req.synthesis_session_id[:8],
                         req.commit_seq,
                         summary["history_turns"],
@@ -775,7 +775,7 @@ async def stateful_synthesize(req: Annotated[StatefulTTSRequest, Body(exclusive=
                         yield chunk
                 finally:
                     logger.info(
-                        "Synthesis lock released session=%s commit_seq=%s",
+                        "Synthesis lock released session={} commit_seq={}",
                         req.synthesis_session_id[:8],
                         req.commit_seq,
                     )

@@ -130,7 +130,7 @@ class OpenSynthesisSessionRequest(BaseModel):
     reference_id: str = Field(..., min_length=1)
     max_history_turns: Annotated[int, conint(ge=1)] = 2
     max_history_chars: Annotated[int, conint(ge=1)] = 220
-    max_history_code_frames: Annotated[int, conint(ge=0)] = 180
+    max_history_code_frames: Annotated[int, conint(ge=0)] = 400
 
 
 class OpenSynthesisSessionResponse(BaseModel):

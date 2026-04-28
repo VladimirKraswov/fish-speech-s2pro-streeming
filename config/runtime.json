@@ -84,8 +84,8 @@
       "stream_tokens": true,
       "initial_stream_chunk_size": 10,
       "stream_chunk_size": 8,
-      "stateful_synthesis": false,
-      "stateful_fallback_to_stateless": true
+      "stateful_synthesis": true,
+      "stateful_fallback_to_stateless": false
     },
     "playback": {
       "target_emit_bytes": 6144,

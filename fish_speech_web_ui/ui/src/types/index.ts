@@ -17,13 +17,20 @@ export interface ProxyConfig {
   };
   tts: {
     reference_id: string;
+    format?: 'wav';
+    normalize?: boolean;
+    use_memory_cache?: 'on' | 'off';
+    seed?: number | null;
     max_new_tokens: number;
     chunk_length: number;
     top_p: number;
     repetition_penalty: number;
     temperature: number;
+    stream_tokens?: boolean;
     initial_stream_chunk_size: number;
     stream_chunk_size: number;
+    stateful_synthesis?: boolean;
+    stateful_fallback_to_stateless?: boolean;
   };
   playback: {
     target_emit_bytes: number;
@@ -58,6 +65,7 @@ export interface SessionAppendResponse {
   buffer_chars?: number;
   committed?: CommittedItem[];
   input_closed?: boolean;
+  already_finished?: boolean;
 }
 
 export type StreamEvent =
@@ -98,14 +106,17 @@ export type StreamEvent =
   | {
       type: 'session_done';
       session_id: string;
+      req_id?: string;
       commit_count?: number;
     }
   | {
       type: 'session_aborted';
       session_id: string;
+      req_id?: string;
     }
   | {
       type: 'error';
       session_id?: string;
+      req_id?: string;
       message: string;
     };

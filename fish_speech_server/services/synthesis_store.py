@@ -15,7 +15,7 @@ class SynthesisSessionStore:
         max_sessions: int = 128,
         default_max_history_turns: int = 2,
         default_max_history_chars: int = 220,
-        default_max_history_code_frames: int = 180,
+        default_max_history_code_frames: int = 400,
     ) -> None:
         self.ttl_sec = ttl_sec
         self.max_sessions = max_sessions

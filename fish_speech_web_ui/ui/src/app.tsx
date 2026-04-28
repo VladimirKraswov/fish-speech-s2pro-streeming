@@ -2,91 +2,130 @@ import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { FishProxyClient } from './api/client';
 import { AudioEngine } from './audio/engine';
 import { LLMSimulator, type ChunkMode } from './lib/simulator';
-import type { CommittedItem, StreamEvent } from './types';
+import type { CommittedItem, ProxyConfig, StreamEvent } from './types';
 import './app.css';
 
-const PROXY_URL = `http://${window.location.hostname}:9000`;
-const SERVER_URL = `http://${window.location.hostname}:8080`;
+const HOST = window.location.hostname;
+const PROXY_URL = `http://${HOST}:9000`;
+const SERVER_URL = `http://${HOST}:8080`;
 
 const DEFAULT_TEXT =
-  'Встретил он по дороге Зайчика, Волка и Медведя, спел им свою песенку и убежал от них. Катился дальше Колобок и повстречалась ему Лисичка. Она и говорит: Колобок, Колобок, какая у тебя красивая песенка.';
+  'Встретил он по дороге Зайчика, Волка и Медведя, спел им свою песенку и убежал от них. Катился дальше Колобок и повстречалась ему Лисичка. Она и говорит: Колобок, Колобок, какая у тебя красивая песенка. А Колобок отвечает: я тебе её сейчас ещё раз спою.';
+
+function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConfig {
+  const base: ProxyConfig = {
+    commit: {
+      first: {
+        min_chars: 40,
+        target_chars: 58,
+        max_chars: 84,
+        max_wait_ms: 150,
+        allow_partial_after_ms: 240,
+      },
+      next: {
+        min_chars: 120,
+        target_chars: 160,
+        max_chars: 240,
+        max_wait_ms: 340,
+        allow_partial_after_ms: 600,
+      },
+      flush_on_sentence_punctuation: true,
+      flush_on_clause_punctuation: true,
+      flush_on_newline: true,
+      carry_incomplete_tail: true,
+    },
+    tts: {
+      reference_id: 'voice',
+      format: 'wav',
+      normalize: true,
+      use_memory_cache: 'on',
+      seed: 1234,
+      max_new_tokens: 160,
+      chunk_length: 160,
+      top_p: 0.78,
+      repetition_penalty: 1.12,
+      temperature: 0.7,
+      stream_tokens: true,
+      initial_stream_chunk_size: 10,
+      stream_chunk_size: 8,
+      stateful_synthesis: true,
+      stateful_fallback_to_stateless: false,
+    },
+    playback: {
+      target_emit_bytes: 6144,
+      start_buffer_ms: 120,
+      stop_grace_ms: 60,
+    },
+    session: {
+      max_buffer_chars: 8000,
+      auto_close_on_finish: false,
+    },
+  };
+
+  if (kind === 'lowLatency') {
+    base.commit.first = {
+      min_chars: 24,
+      target_chars: 42,
+      max_chars: 68,
+      max_wait_ms: 100,
+      allow_partial_after_ms: 170,
+    };
+    base.commit.next = {
+      min_chars: 70,
+      target_chars: 110,
+      max_chars: 170,
+      max_wait_ms: 240,
+      allow_partial_after_ms: 420,
+    };
+    base.tts.max_new_tokens = 128;
+    base.tts.chunk_length = 140;
+    base.tts.initial_stream_chunk_size = 8;
+    base.tts.stream_chunk_size = 6;
+    base.playback.target_emit_bytes = 4096;
+    base.playback.start_buffer_ms = 80;
+    base.playback.stop_grace_ms = 40;
+  }
+
+  if (kind === 'stable') {
+    base.commit.first = {
+      min_chars: 60,
+      target_chars: 90,
+      max_chars: 130,
+      max_wait_ms: 250,
+      allow_partial_after_ms: 420,
+    };
+    base.commit.next = {
+      min_chars: 150,
+      target_chars: 220,
+      max_chars: 300,
+      max_wait_ms: 520,
+      allow_partial_after_ms: 900,
+    };
+    base.tts.max_new_tokens = 160;
+    base.tts.chunk_length = 180;
+    base.tts.initial_stream_chunk_size = 12;
+    base.tts.stream_chunk_size = 10;
+    base.playback.target_emit_bytes = 8192;
+    base.playback.start_buffer_ms = 220;
+    base.playback.stop_grace_ms = 80;
+  }
+
+  return base;
+}
 
 const PRESETS = {
   balanced: {
     title: 'Balanced',
-    config: {
-      commit: {
-        first: { min_chars: 40, target_chars: 58, max_chars: 84, max_wait_ms: 150, allow_partial_after_ms: 240 },
-        next: { min_chars: 120, target_chars: 160, max_chars: 240, max_wait_ms: 340, allow_partial_after_ms: 600 },
-        flush_on_sentence_punctuation: true,
-        flush_on_clause_punctuation: true,
-        flush_on_newline: true,
-        carry_incomplete_tail: true
-      },
-      tts: {
-        reference_id: 'voice',
-        max_new_tokens: 160,
-        chunk_length: 160,
-        top_p: 0.78,
-        repetition_penalty: 1.12,
-        temperature: 0.7,
-        initial_stream_chunk_size: 10,
-        stream_chunk_size: 8
-      },
-      playback: { target_emit_bytes: 6144, start_buffer_ms: 120, stop_grace_ms: 60 },
-      session: { max_buffer_chars: 4000, auto_close_on_finish: false }
-    }
+    config: makePresetConfig('balanced'),
   },
   lowLatency: {
     title: 'Low latency',
-    config: {
-      commit: {
-        first: { min_chars: 24, target_chars: 42, max_chars: 68, max_wait_ms: 100, allow_partial_after_ms: 170 },
-        next: { min_chars: 70, target_chars: 110, max_chars: 170, max_wait_ms: 240, allow_partial_after_ms: 420 },
-        flush_on_sentence_punctuation: true,
-        flush_on_clause_punctuation: true,
-        flush_on_newline: true,
-        carry_incomplete_tail: true
-      },
-      tts: {
-        reference_id: 'voice',
-        max_new_tokens: 128,
-        chunk_length: 140,
-        top_p: 0.78,
-        repetition_penalty: 1.12,
-        temperature: 0.7,
-        initial_stream_chunk_size: 8,
-        stream_chunk_size: 6
-      },
-      playback: { target_emit_bytes: 4096, start_buffer_ms: 80, stop_grace_ms: 40 },
-      session: { max_buffer_chars: 4000, auto_close_on_finish: false }
-    }
+    config: makePresetConfig('lowLatency'),
   },
   stable: {
     title: 'Stable',
-    config: {
-      commit: {
-        first: { min_chars: 60, target_chars: 90, max_chars: 130, max_wait_ms: 250, allow_partial_after_ms: 420 },
-        next: { min_chars: 150, target_chars: 220, max_chars: 300, max_wait_ms: 520, allow_partial_after_ms: 900 },
-        flush_on_sentence_punctuation: true,
-        flush_on_clause_punctuation: true,
-        flush_on_newline: true,
-        carry_incomplete_tail: true
-      },
-      tts: {
-        reference_id: 'voice',
-        max_new_tokens: 180,
-        chunk_length: 180,
-        top_p: 0.78,
-        repetition_penalty: 1.12,
-        temperature: 0.7,
-        initial_stream_chunk_size: 12,
-        stream_chunk_size: 10
-      },
-      playback: { target_emit_bytes: 8192, start_buffer_ms: 180, stop_grace_ms: 80 },
-      session: { max_buffer_chars: 4000, auto_close_on_finish: false }
-    }
-  }
+    config: makePresetConfig('stable'),
+  },
 };
 
 type Health = any;
@@ -98,6 +137,7 @@ function jsonPretty(value: unknown) {
 function StatusPill({ label, health }: { label: string; health: Health }) {
   const ok = health && (health.ok || health.status === 'ok');
   const loading = health === null;
+
   return (
     <div class={`status-pill ${ok ? 'ok' : loading ? 'loading' : 'bad'}`}>
       <span class="dot" />
@@ -115,6 +155,7 @@ export function App() {
   const [preset, setPreset] = useState<keyof typeof PRESETS>('balanced');
   const [configText, setConfigText] = useState(jsonPretty(PRESETS.balanced.config));
   const [text, setText] = useState(DEFAULT_TEXT);
+
   const [mode, setMode] = useState<ChunkMode>('words');
   const [minSize, setMinSize] = useState(3);
   const [maxSize, setMaxSize] = useState(8);
@@ -124,8 +165,9 @@ export function App() {
   const [sessionStatus, setSessionStatus] = useState('idle');
   const [audioStatus, setAudioStatus] = useState('idle');
   const [isStreaming, setIsStreaming] = useState(false);
+
   const [committed, setCommitted] = useState<CommittedItem[]>([]);
-  const [activeCommit, setActiveCommit] = useState<string>('');
+  const [activeCommit, setActiveCommit] = useState('');
   const [logs, setLogs] = useState<string[]>([]);
 
   const client = useRef(new FishProxyClient(PROXY_URL));
@@ -134,25 +176,39 @@ export function App() {
 
   const log = (message: string) => {
     const time = new Date().toLocaleTimeString();
-    setLogs((prev) => [...prev.slice(-160), `[${time}] ${message}`]);
+    setLogs((prev) => [...prev.slice(-180), `[${time}] ${message}`]);
   };
 
   const onStreamEvent = (event: StreamEvent) => {
+    if (event.type === 'session_start') {
+      log(`pcm stream opened, target_emit_bytes=${event.target_emit_bytes ?? 'n/a'}`);
+    }
+
     if (event.type === 'commit_start') {
       setActiveCommit(event.text || '');
-      log(`commit #${event.commit_seq} started`);
+      log(`commit #${event.commit_seq} started, reason=${event.reason}`);
     }
+
     if (event.type === 'commit_done') {
       setActiveCommit('');
-      log(`commit #${event.commit_seq} done`);
+      log(`commit #${event.commit_seq} done, upstream_bytes=${event.upstream_bytes ?? 'n/a'}`);
     }
+
     if (event.type === 'error') {
       log(`stream error: ${event.message}`);
+      setIsStreaming(false);
     }
+
     if (event.type === 'session_done') {
       setSessionStatus('finished');
       setIsStreaming(false);
-      log('session done');
+      log(`session done, commits=${event.commit_count ?? 'n/a'}`);
+    }
+
+    if (event.type === 'session_aborted') {
+      setSessionStatus('aborted');
+      setIsStreaming(false);
+      log('session aborted');
     }
   };
 
@@ -175,13 +231,13 @@ export function App() {
     }
 
     try {
-      setServerHealth(await fetch(`${SERVER_URL}/v1/health`).then((r) => r.json()));
+      setServerHealth(await fetch(`${SERVER_URL}/v1/health`, { cache: 'no-store' }).then((r) => r.json()));
     } catch {
       setServerHealth({ ok: false });
     }
 
     try {
-      setWebUiHealth(await fetch('/health').then((r) => r.json()));
+      setWebUiHealth(await fetch('/health', { cache: 'no-store' }).then((r) => r.json()));
     } catch {
       setWebUiHealth({ ok: false });
     }
@@ -199,11 +255,20 @@ export function App() {
     log(`preset selected: ${PRESETS[value].title}`);
   };
 
+  const addCommitted = (items: CommittedItem[] | undefined) => {
+    if (!items?.length) return;
+    setCommitted((prev) => [...items, ...prev].slice(0, 100));
+  };
+
   const openSession = async () => {
     if (configError) {
       log(`config error: ${configError}`);
       return;
     }
+
+    simulator.current?.stop();
+    abortController.current?.abort();
+    audioEngine.current.reset();
 
     setSessionStatus('opening');
     setCommitted([]);
@@ -211,15 +276,23 @@ export function App() {
 
     try {
       const data = await client.current.openSession(configText);
+
+      if (!data.config?.tts?.stateful_synthesis) {
+        throw new Error('Session opened without stateful_synthesis=true');
+      }
+
       setSessionId(data.session_id);
       setSessionStatus('open');
       log(`session opened: ${data.session_id.slice(0, 8)}`);
 
       abortController.current = new AbortController();
+
       audioEngine.current
         .connectStream(client.current.getStreamUrl(data.session_id), abortController.current.signal)
         .catch((error) => {
-          if (error?.name !== 'AbortError') log(`audio error: ${error.message}`);
+          if (error?.name !== 'AbortError') {
+            log(`audio error: ${error instanceof Error ? error.message : String(error)}`);
+          }
         });
     } catch (error) {
       setSessionStatus('idle');
@@ -227,47 +300,57 @@ export function App() {
     }
   };
 
-    const finishSession = async () => {
+  const finishSession = async () => {
     if (!sessionId) return;
 
     setSessionStatus('finishing');
 
     try {
-        const data = await client.current.finishSession(sessionId);
+      const data = await client.current.finishSession(sessionId, 'llm_input_finished');
+      addCommitted(data.committed);
 
-        if (data.committed?.length) {
-        setCommitted((prev) => [...(data.committed ?? []), ...prev].slice(0, 80));
+      if (data.committed?.length) {
         log(`finish committed ${data.committed.length} segment(s)`);
-        } else {
+      } else {
         log('finish sent, no buffered text');
-        }
+      }
     } catch (error) {
-        log(`finish failed: ${error instanceof Error ? error.message : String(error)}`);
+      setSessionStatus('open');
+      log(`finish failed: ${error instanceof Error ? error.message : String(error)}`);
     }
-    };
+  };
 
   const closeSession = async () => {
     if (!sessionId) return;
+
+    const id = sessionId;
 
     simulator.current?.stop();
     abortController.current?.abort();
     audioEngine.current.reset();
 
-    await client.current.closeSession(sessionId).catch((error) => log(`close failed: ${error.message}`));
+    setIsStreaming(false);
+    setSessionStatus('closing');
+
+    try {
+      await client.current.closeSession(id);
+      log(`session closed: ${id.slice(0, 8)}`);
+    } catch (error) {
+      log(`close failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
 
     setSessionId(null);
     setSessionStatus('idle');
-    setIsStreaming(false);
     setCommitted([]);
     setActiveCommit('');
-    log('session closed');
   };
 
   const startTextStream = () => {
     if (!sessionId || isStreaming) return;
 
     setIsStreaming(true);
-    log('text stream started');
+    setSessionStatus('open');
+    log('LLM text simulation started');
 
     simulator.current = new LLMSimulator({
       mode,
@@ -277,9 +360,7 @@ export function App() {
       onChunk: async (chunk) => {
         try {
           const data = await client.current.appendText(sessionId, chunk);
-            if (data.committed?.length) {
-            setCommitted((prev) => [...(data.committed ?? []), ...prev].slice(0, 80));
-            }
+          addCommitted(data.committed);
           return true;
         } catch (error) {
           log(`append failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -289,30 +370,28 @@ export function App() {
       },
       onFinish: async () => {
         setIsStreaming(false);
-        log('text stream finished');
+        log('LLM text simulation finished');
         await finishSession();
-      }
+      },
     });
 
     simulator.current.start(text);
   };
 
-    const stopTextStream = async () => {
+  const stopTextStream = async () => {
     simulator.current?.stop();
     setIsStreaming(false);
-    log('text stream stopped');
-
+    log('LLM text simulation stopped');
     await finishSession();
-    };
+  };
 
   const flush = async () => {
     if (!sessionId) return;
+
     try {
-      const data = await client.current.flushSession(sessionId);
-        if (data.committed?.length) {
-        setCommitted((prev) => [...(data.committed ?? []), ...prev].slice(0, 80));
-        }
-      log('manual flush');
+      const data = await client.current.flushSession(sessionId, 'manual_flush');
+      addCommitted(data.committed);
+      log(`manual flush, committed=${data.committed?.length ?? 0}`);
     } catch (error) {
       log(`flush failed: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -323,18 +402,24 @@ export function App() {
       <section class="hero">
         <div>
           <div class="eyebrow">Fish Speech S2 Pro Streaming</div>
-          <h1>Realtime voice session console</h1>
-          <p>Управление сессией, LLM-потоком, PCM playback и диагностикой в одном нормальном интерфейсе.</p>
+          <h1>Stateful realtime voice console</h1>
+          <p>
+            Имитация LLM-вывода: текст отправляется маленькими чанками в proxy, а proxy
+            озвучивает его через одну stateful synthesis session.
+          </p>
         </div>
 
         <div class="hero-actions">
           <button class="ghost" onClick={refreshHealth}>Refresh</button>
+
           {!sessionId ? (
             <button class="primary" onClick={openSession} disabled={sessionStatus === 'opening' || !!configError}>
-              Open session
+              Open stateful session
             </button>
           ) : (
-            <button class="danger" onClick={closeSession}>Close session</button>
+            <button class="danger" onClick={closeSession}>
+              Close session
+            </button>
           )}
         </div>
       </section>
@@ -343,6 +428,7 @@ export function App() {
         <StatusPill label="Server" health={serverHealth} />
         <StatusPill label="Proxy" health={proxyHealth} />
         <StatusPill label="Web UI" health={webUiHealth} />
+
         <div class="status-pill audio">
           <span class="dot" />
           <span>Audio</span>
@@ -354,13 +440,17 @@ export function App() {
         <div class="panel composer">
           <div class="panel-head">
             <div>
-              <h2>Text stream</h2>
-              <p>Имитация входящего LLM текста с постепенной отправкой в proxy.</p>
+              <h2>LLM text stream</h2>
+              <p>Вставь длинный текст и запусти постепенную отправку как будто это output LLM.</p>
             </div>
             <span class={`session-badge ${sessionId ? 'on' : ''}`}>{sessionStatus}</span>
           </div>
 
-          <textarea class="text-input" value={text} onInput={(e) => setText((e.currentTarget as HTMLTextAreaElement).value)} />
+          <textarea
+            class="text-input"
+            value={text}
+            onInput={(e) => setText((e.currentTarget as HTMLTextAreaElement).value)}
+          />
 
           <div class="controls-grid">
             <label>
@@ -374,17 +464,32 @@ export function App() {
 
             <label>
               Min
-              <input type="number" value={minSize} min="1" onInput={(e) => setMinSize(Number((e.currentTarget as HTMLInputElement).value))} />
+              <input
+                type="number"
+                value={minSize}
+                min="1"
+                onInput={(e) => setMinSize(Number((e.currentTarget as HTMLInputElement).value))}
+              />
             </label>
 
             <label>
               Max
-              <input type="number" value={maxSize} min="1" onInput={(e) => setMaxSize(Number((e.currentTarget as HTMLInputElement).value))} />
+              <input
+                type="number"
+                value={maxSize}
+                min="1"
+                onInput={(e) => setMaxSize(Number((e.currentTarget as HTMLInputElement).value))}
+              />
             </label>
 
             <label>
               Interval ms
-              <input type="number" value={intervalMs} min="10" onInput={(e) => setIntervalMs(Number((e.currentTarget as HTMLInputElement).value))} />
+              <input
+                type="number"
+                value={intervalMs}
+                min="10"
+                onInput={(e) => setIntervalMs(Number((e.currentTarget as HTMLInputElement).value))}
+              />
             </label>
           </div>
 
@@ -392,9 +497,9 @@ export function App() {
             <button class="primary" onClick={startTextStream} disabled={!sessionId || isStreaming}>
               Start streaming
             </button>
-            <button onClick={stopTextStream} disabled={!isStreaming}>Stop</button>
+            <button onClick={stopTextStream} disabled={!sessionId || !isStreaming}>Stop + finish</button>
             <button onClick={flush} disabled={!sessionId}>Force flush</button>
-            <button onClick={finishSession} disabled={!sessionId || sessionStatus !== 'open'}>Finish input</button>
+            <button onClick={finishSession} disabled={!sessionId || sessionStatus === 'finishing'}>Finish input</button>
           </div>
         </div>
 
@@ -402,7 +507,7 @@ export function App() {
           <div class="panel-head">
             <div>
               <h2>Runtime preset</h2>
-              <p>JSON override для proxy session.</p>
+              <p>JSON override для `/session/open`. Stateful режим включён явно.</p>
             </div>
           </div>
 
@@ -436,7 +541,7 @@ export function App() {
           <div class="panel-head">
             <div>
               <h2>Committed segments</h2>
-              <p>Фразы, которые proxy уже отправил в TTS.</p>
+              <p>Сегменты, которые proxy уже отправил в stateful TTS.</p>
             </div>
             <b>{committed.length}</b>
           </div>
@@ -450,6 +555,7 @@ export function App() {
 
           <div class="timeline">
             {committed.length === 0 && <div class="empty">Пока нет committed сегментов.</div>}
+
             {committed.map((item) => (
               <article class="timeline-item" key={item.seq}>
                 <div class="timeline-dot">#{item.seq}</div>
@@ -466,7 +572,7 @@ export function App() {
           <div class="panel-head">
             <div>
               <h2>Event log</h2>
-              <p>Последние события UI/proxy/audio.</p>
+              <p>События UI, proxy stream и audio scheduler.</p>
             </div>
           </div>
 

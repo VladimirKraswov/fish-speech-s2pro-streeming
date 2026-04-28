@@ -22,8 +22,8 @@ from typing_extensions import Annotated
 
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
-from fish_speech.driver.config import load_runtime_config
 from fish_speech_server.api.utils import MsgPackRequest, parse_args
+from fish_speech_server.config import load_runtime_config
 from fish_speech_server.api.exception_handler import ExceptionHandler
 from fish_speech_server.services.model_manager import ModelManager
 from fish_speech_server.services.synthesis_store import SynthesisSessionStore
@@ -49,11 +49,10 @@ class API(ExceptionHandler):
                 return passthrough
 
         self.routes = Routes(
-            routes,  # keep existing routes
-            http_middlewares=[api_auth],  # apply api_auth middleware
+            routes,
+            http_middlewares=[api_auth],
         )
 
-        # OpenAPIの設定
         self.openapi = OpenAPI(
             Info(
                 {
@@ -63,9 +62,8 @@ class API(ExceptionHandler):
             ),
         ).routes
 
-        # Initialize the app
         self.app = Kui(
-            routes=self.routes + self.openapi[1:],  # Remove the default route
+            routes=self.routes + self.openapi[1:],
             exception_handlers={
                 HTTPException: self.http_exception_handler,
                 Exception: self.other_exception_handler,
@@ -74,23 +72,20 @@ class API(ExceptionHandler):
             cors_config=CORSConfig(),
         )
 
-        # Add the state variables
         self.app.state.lock = Lock()
         self.app.state.device = self.args.device
         self.app.state.max_text_length = self.args.max_text_length
 
-        # Associate the app with the model manager
         self.app.on_startup(self.initialize_app)
 
     async def initialize_app(self, app: Kui):
-        # Initialize the synthesis session store
         cfg = load_runtime_config()
+
         app.state.synthesis_session_store = SynthesisSessionStore(
             ttl_sec=cfg.proxy.session_ttl_sec,
             max_sessions=cfg.proxy.session_max_count,
         )
 
-        # Make the ModelManager available to the views
         app.state.model_manager = ModelManager(
             mode=self.args.mode,
             device=self.args.device,
@@ -105,12 +100,11 @@ class API(ExceptionHandler):
 
 
 def split_listen_address(listen: str) -> tuple[str, int]:
-    # IPv6 address format is [xxxx:xxxx::xxxx]:port
     match = re.search(r"\[([^\]]+)\]:(\d+)$", listen)
     if match:
-        host, port = match.groups()  # IPv6
+        host, port = match.groups()
     else:
-        host, port = listen.split(":")  # IPv4
+        host, port = listen.split(":")
     return host, int(port)
 
 
@@ -132,8 +126,6 @@ def run_api(api: API | None = None) -> None:
 
 
 def main() -> None:
-    # Each worker process created by Uvicorn has its own memory space,
-    # so model handles are not shared across workers.
     run_api()
 
 

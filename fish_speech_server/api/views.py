@@ -605,7 +605,6 @@ async def delete_reference(reference_id: str = Body(...)):
 # Stateful Synthesis Sessions (Управление сессиями синтеза)
 # =============================================================================
 
-
 @routes.http.post("/v1/synthesis/sessions/open")
 async def open_synthesis_session(
     req: Annotated[OpenSynthesisSessionRequest, Body(exclusive=True)]
@@ -631,19 +630,27 @@ async def open_synthesis_session(
                 context=ctx.to_public_dict(),
             ).model_dump(mode="json")
         )
+
     except ValueError as e:
         raise HTTPException(HTTPStatus.BAD_REQUEST, content=str(e))
+
     except Exception as e:
         logger.error(f"Error opening synthesis session: {e}", exc_info=True)
         raise HTTPException(
-            HTTPStatus.INTERNAL_SERVER_ERROR, content="Failed to open synthesis session"
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            content="Failed to open synthesis session",
         )
 
 
 @routes.http.get("/v1/synthesis/sessions/{synthesis_session_id}")
 async def get_synthesis_session():
     """
-    GET /v1/synthesis/sessions/{id} — возвращает информацию о сессии и её историю.
+    GET /v1/synthesis/sessions/{synthesis_session_id}
+    Возвращает информацию о сессии и её историю.
+
+    Важно:
+    Kui в текущей обвязке вызывает endpoint без positional args,
+    поэтому path-параметр нужно брать через request.path_params.
     """
     synthesis_session_id = request.path_params.get("synthesis_session_id")
 
@@ -657,7 +664,10 @@ async def get_synthesis_session():
     ctx = await store.get(synthesis_session_id, touch=True)
 
     if ctx is None:
-        raise HTTPException(HTTPStatus.NOT_FOUND, content="Synthesis session not found")
+        raise HTTPException(
+            HTTPStatus.NOT_FOUND,
+            content="Synthesis session not found",
+        )
 
     return JSONResponse(
         SynthesisSessionInfoResponse(
@@ -672,6 +682,14 @@ async def get_synthesis_session():
 async def close_synthesis_session(synthesis_session_id: str = Body(...)):
     """
     POST /v1/synthesis/sessions/close — закрывает сессию.
+
+    Тело запроса должно быть JSON-строкой:
+        "session_id_here"
+
+    Пример:
+        curl -X POST http://127.0.0.1:8080/v1/synthesis/sessions/close \
+          -H "Content-Type: application/json" \
+          -d '"0090e12427bc46c0945480d72bf58632"'
     """
     store = request.app.state.synthesis_session_store
     closed = await store.close(synthesis_session_id)
@@ -700,17 +718,16 @@ async def stateful_synthesize(req: Annotated[StatefulTTSRequest, Body(exclusive=
         ctx = await store.get(req.synthesis_session_id, touch=True)
         if ctx is None:
             raise HTTPException(
-                HTTPStatus.NOT_FOUND, content="Synthesis session not found"
+                HTTPStatus.NOT_FOUND,
+                content="Synthesis session not found",
             )
 
-        # Проверка длины текста (как в обычном /v1/tts)
         if app_state.max_text_length > 0 and len(req.text) > app_state.max_text_length:
             raise HTTPException(
                 HTTPStatus.BAD_REQUEST,
                 content=f"Text is too long, max length is {app_state.max_text_length}",
             )
 
-        # Пока поддерживаем только streaming=True для stateful
         if not req.streaming:
             raise HTTPException(
                 HTTPStatus.BAD_REQUEST,
@@ -723,21 +740,23 @@ async def stateful_synthesize(req: Annotated[StatefulTTSRequest, Body(exclusive=
                 content="Streaming only supports WAV format",
             )
 
-        # Build stateful request with continuation history
         stateful_req = stateful_tts_to_driver_request(req, ctx)
 
-        # Logging diagnostics
         summary = build_continuation_debug_summary(ctx)
         logger.info(
             f"Stateful synthesize session={req.synthesis_session_id[:8]} "
-            f"history_turns={summary['selected_turns']} history_chars={summary['selected_chars']}"
+            f"history_turns={summary['selected_turns']} "
+            f"history_chars={summary['selected_chars']} "
+            f"history_code_frames={summary['selected_code_frames']}"
         )
 
-        # We need to pass the original request info (commit_seq etc) for session tracking
-        # even if stateful_req is a DriverSynthesisRequest.
-        # Let's adjust stateful_inference_async to take both.
         return StreamResponse(
-            iterable=stateful_inference_async(stateful_req, driver, ctx, original_req=req),
+            iterable=stateful_inference_async(
+                stateful_req,
+                driver,
+                ctx,
+                original_req=req,
+            ),
             headers={
                 "Content-Disposition": f"attachment; filename=audio.{req.format}",
             },
@@ -746,10 +765,12 @@ async def stateful_synthesize(req: Annotated[StatefulTTSRequest, Body(exclusive=
 
     except HTTPException:
         raise
+
     except Exception as e:
         logger.error(f"Error in stateful synthesis: {e}", exc_info=True)
         raise HTTPException(
-            HTTPStatus.INTERNAL_SERVER_ERROR, content="Failed to generate speech"
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            content="Failed to generate speech",
         )
 
 

@@ -105,30 +105,40 @@
       "commit.first.max_chars",
       "commit.first.max_wait_ms",
       "commit.first.allow_partial_after_ms",
+
       "commit.next.min_chars",
       "commit.next.target_chars",
       "commit.next.max_chars",
       "commit.next.max_wait_ms",
       "commit.next.allow_partial_after_ms",
+
       "commit.carry_incomplete_tail",
       "commit.flush_on_sentence_punctuation",
       "commit.flush_on_clause_punctuation",
       "commit.flush_on_newline",
+
       "tts.reference_id",
+      "tts.format",
+      "tts.normalize",
+      "tts.use_memory_cache",
+      "tts.seed",
       "tts.max_new_tokens",
       "tts.chunk_length",
       "tts.top_p",
       "tts.repetition_penalty",
       "tts.temperature",
+      "tts.stream_tokens",
       "tts.initial_stream_chunk_size",
       "tts.stream_chunk_size",
+      "tts.stateful_synthesis",
+      "tts.stateful_fallback_to_stateless",
+
       "playback.target_emit_bytes",
       "playback.start_buffer_ms",
       "playback.stop_grace_ms",
+
       "session.max_buffer_chars",
-      "session.auto_close_on_finish",
-      "tts.stateful_synthesis",
-      "tts.stateful_fallback_to_stateless"
+      "session.auto_close_on_finish"
     ]
   }
 }

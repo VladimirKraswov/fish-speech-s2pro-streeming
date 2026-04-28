@@ -641,10 +641,18 @@ async def open_synthesis_session(
 
 
 @routes.http.get("/v1/synthesis/sessions/{synthesis_session_id}")
-async def get_synthesis_session(synthesis_session_id: str):
+async def get_synthesis_session():
     """
     GET /v1/synthesis/sessions/{id} — возвращает информацию о сессии и её историю.
     """
+    synthesis_session_id = request.path_params.get("synthesis_session_id")
+
+    if not synthesis_session_id:
+        raise HTTPException(
+            HTTPStatus.BAD_REQUEST,
+            content="Missing synthesis_session_id",
+        )
+
     store = request.app.state.synthesis_session_store
     ctx = await store.get(synthesis_session_id, touch=True)
 

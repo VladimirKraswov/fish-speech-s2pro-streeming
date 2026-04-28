@@ -50,6 +50,13 @@ class ModelConfig(BaseModel):
         return value
 
 
+class ProxyConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    session_ttl_sec: int = Field(1800, ge=1)
+    session_max_count: int = Field(128, ge=1)
+
+
 class WarmupConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -77,6 +84,7 @@ class DriverConfig(BaseModel):
     paths: PathsConfig
     model: ModelConfig
     warmup: WarmupConfig
+    proxy: ProxyConfig
 
 
 def _driver_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -85,6 +93,7 @@ def _driver_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "paths": payload.get("paths", {}),
         "model": payload.get("model", {}),
         "warmup": payload.get("warmup", {}),
+        "proxy": payload.get("proxy", {}),
     }
 
 

@@ -31,4 +31,8 @@ def build_continuation_debug_summary(context: SynthesisContext) -> dict[str, Any
         "selected_code_frames": sum(t.code_frames for t in selected),
         "commit_seq_list": [t.commit_seq for t in selected],
         "has_codes_count": len(selected),
+        "history_turns": len(context.history),
+        "history_with_codes": context.history_with_codes_count(),
+        "history_code_frames": context.history_code_frames(),
+        "continuation_ready": context.history_with_codes_count() > 0,
     }

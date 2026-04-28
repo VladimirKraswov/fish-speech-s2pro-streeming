@@ -92,3 +92,18 @@ async def stateful_inference_async(
     )
 
     context.append_turn(turn)
+
+    logger.info(
+        "[SYNTH_CONTEXT] updated session=%s commit_seq=%s has_codes=%s "
+        "collected_code_chunks=%s code_frames=%s pcm_bytes=%s "
+        "history_turns=%s history_with_codes=%s history_code_frames=%s",
+        context.synthesis_session_id[:8],
+        turn.commit_seq,
+        final_codes is not None,
+        len(collected_codes),
+        code_frames,
+        pcm_bytes,
+        len(context.history),
+        context.history_with_codes_count(),
+        context.history_code_frames(),
+    )

@@ -116,6 +116,37 @@ class SynthesisContext:
     def history_code_frames(self) -> int:
         return sum(t.code_frames for t in self.history)
 
+    def history_with_codes_count(self) -> int:
+        return sum(1 for t in self.history if t.codes is not None)
+
+    def history_without_codes_count(self) -> int:
+        return sum(1 for t in self.history if t.codes is None)
+
+    def last_commit_seq(self) -> int | None:
+        return self.history[-1].commit_seq if self.history else None
+
+    def last_turn_has_codes(self) -> bool:
+        return bool(self.history and self.history[-1].codes is not None)
+
+    def last_turn_code_frames(self) -> int:
+        return self.history[-1].code_frames if self.history else 0
+
+    def diagnostics(self) -> dict[str, Any]:
+        return {
+            "history_turns": len(self.history),
+            "history_with_codes": self.history_with_codes_count(),
+            "history_without_codes": self.history_without_codes_count(),
+            "history_chars": self.history_chars(),
+            "history_code_frames": self.history_code_frames(),
+            "last_commit_seq": self.last_commit_seq(),
+            "last_turn_has_codes": self.last_turn_has_codes(),
+            "last_turn_code_frames": self.last_turn_code_frames(),
+            "continuation_ready": self.history_with_codes_count() > 0,
+            "max_history_turns": self.max_history_turns,
+            "max_history_chars": self.max_history_chars,
+            "max_history_code_frames": self.max_history_code_frames,
+        }
+
     def to_public_dict(self) -> dict[str, Any]:
         return {
             "synthesis_session_id": self.synthesis_session_id,
@@ -128,6 +159,7 @@ class SynthesisContext:
             "history_turns": len(self.history),
             "history_chars": self.history_chars(),
             "history_code_frames": self.history_code_frames(),
+            "diagnostics": self.diagnostics(),
             "history": [
                 {
                     "commit_seq": t.commit_seq,

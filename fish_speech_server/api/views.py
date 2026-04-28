@@ -744,10 +744,18 @@ async def stateful_synthesize(req: Annotated[StatefulTTSRequest, Body(exclusive=
 
         summary = build_continuation_debug_summary(ctx)
         logger.info(
-            f"Stateful synthesize session={req.synthesis_session_id[:8]} "
-            f"history_turns={summary['selected_turns']} "
-            f"history_chars={summary['selected_chars']} "
-            f"history_code_frames={summary['selected_code_frames']}"
+            "Stateful synthesize session=%s commit_seq=%s "
+            "history_turns=%s history_with_codes=%s "
+            "selected_turns=%s selected_chars=%s selected_code_frames=%s "
+            "selected_commits=%s",
+            req.synthesis_session_id[:8],
+            req.commit_seq,
+            summary["history_turns"],
+            summary["history_with_codes"],
+            summary["selected_turns"],
+            summary["selected_chars"],
+            summary["selected_code_frames"],
+            summary["commit_seq_list"],
         )
 
         return StreamResponse(

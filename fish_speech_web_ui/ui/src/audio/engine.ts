@@ -19,8 +19,22 @@ export class AudioEngine {
 
   private activeSources = new Set<AudioBufferSourceNode>();
 
-  private readonly initialPlaybackBufferMs = 320;
-  private readonly underrunRestartDelaySec = 0.08;
+  // Было слишком мало для стабильного браузерного playback.
+  // При маленьком буфере появляются underrun/щелчки/электронные артефакты.
+  private readonly initialPlaybackBufferMs = 450;
+
+  // Первый запуск делаем не "прямо сейчас", а с запасом.
+  private readonly initialStartDelaySec = 0.22;
+
+  // Если до конца уже запланированного аудио осталось меньше этого,
+  // новый source лучше не приклеивать впритык — браузер может не успеть.
+  private readonly criticalLeadSec = 0.045;
+
+  // Задержка восстановления после underrun.
+  private readonly underrunRestartDelaySec = 0.18;
+
+  private lastStatus = '';
+  private lastStatusAt = 0;
 
   private onStatusChange: (status: string) => void;
   private onEvent: (event: StreamEvent) => void;
@@ -35,8 +49,13 @@ export class AudioEngine {
 
   async init() {
     if (!this.ctx) {
-      this.ctx = new (window.AudioContext || (window as any).webkitAudioContext)({
-        latencyHint: 'interactive',
+      const AudioContextCtor =
+        window.AudioContext || (window as any).webkitAudioContext;
+
+      this.ctx = new AudioContextCtor({
+        // Чуть стабильнее, чем latencyHint: 'interactive'.
+        // Для TTS важнее ровный звук, чем минимальная задержка.
+        latencyHint: 0.18,
       });
 
       this.gainNode = this.ctx.createGain();
@@ -54,17 +73,20 @@ export class AudioEngine {
       try {
         source.stop();
       } catch {
-        // source may already be stopped
+        // Source may already be stopped or not started yet.
       }
     }
 
     this.activeSources.clear();
+
     this.meta = null;
     this.scheduledUntil = 0;
     this.started = false;
+
     this.pendingBuffers = [];
     this.pendingSamplesCount = 0;
-    this.onStatusChange('idle');
+
+    this.setStatus('idle', true);
   }
 
   async connectStream(url: string, signal: AbortSignal) {
@@ -80,17 +102,21 @@ export class AudioEngine {
       throw new Error(`Stream connect failed: ${response.status} ${response.statusText}`);
     }
 
-    this.onStatusChange('connected');
+    this.setStatus('connected', true);
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
+
     let textBuffer = '';
 
     try {
       while (true) {
         const { done, value } = await reader.read();
 
-        if (done) break;
+        if (done) {
+          textBuffer += decoder.decode();
+          break;
+        }
 
         textBuffer += decoder.decode(value, { stream: true });
 
@@ -98,46 +124,44 @@ export class AudioEngine {
         textBuffer = lines.pop() || '';
 
         for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-
-          let event: StreamEvent;
-
-          try {
-            event = JSON.parse(trimmed) as StreamEvent;
-          } catch {
-            this.onStatusChange('bad stream event');
-            continue;
-          }
-
-          this.onEvent(event);
-          await this.handleEvent(event);
+          await this.handleStreamLine(line);
         }
       }
 
       if (textBuffer.trim()) {
-        try {
-          const event = JSON.parse(textBuffer.trim()) as StreamEvent;
-          this.onEvent(event);
-          await this.handleEvent(event);
-        } catch {
-          // ignore incomplete tail
-        }
+        await this.handleStreamLine(textBuffer);
       }
     } catch (error: any) {
       if (error?.name === 'AbortError') {
-        this.onStatusChange('aborted');
+        this.setStatus('aborted', true);
         return;
       }
 
-      this.onStatusChange('error');
+      this.setStatus('error', true);
       throw error;
     }
   }
 
+  private async handleStreamLine(line: string) {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+
+    let event: StreamEvent;
+
+    try {
+      event = JSON.parse(trimmed) as StreamEvent;
+    } catch {
+      this.setStatus('bad stream event');
+      return;
+    }
+
+    this.onEvent(event);
+    await this.handleEvent(event);
+  }
+
   private async handleEvent(event: StreamEvent) {
     if (event.type === 'session_start') {
-      this.onStatusChange('stream ready');
+      this.setStatus('stream ready', true);
       return;
     }
 
@@ -148,7 +172,7 @@ export class AudioEngine {
         sample_width: event.sample_width,
       };
 
-      this.onStatusChange(`${this.meta.sample_rate}Hz / ${this.meta.channels}ch`);
+      this.setStatus(`${this.meta.sample_rate}Hz / ${this.meta.channels}ch`, true);
       return;
     }
 
@@ -158,17 +182,17 @@ export class AudioEngine {
     }
 
     if (event.type === 'session_done') {
-      this.onStatusChange('finished');
+      this.setStatus('finished', true);
       return;
     }
 
     if (event.type === 'session_aborted') {
-      this.onStatusChange('aborted');
+      this.setStatus('aborted', true);
       return;
     }
 
     if (event.type === 'error') {
-      this.onStatusChange('error');
+      this.setStatus('error', true);
     }
   }
 
@@ -176,7 +200,16 @@ export class AudioEngine {
     if (!this.meta || !this.ctx) return;
 
     const bytes = this.base64ToBytes(base64Data);
+
+    if (bytes.byteLength < 2) {
+      return;
+    }
+
     const floatData = this.pcm16ToFloat32(bytes);
+
+    if (floatData.length === 0) {
+      return;
+    }
 
     this.pendingBuffers.push(floatData);
     this.pendingSamplesCount += floatData.length / Math.max(1, this.meta.channels);
@@ -207,6 +240,37 @@ export class AudioEngine {
     return output;
   }
 
+  private mergePendingBuffers(): Float32Array | null {
+    if (this.pendingBuffers.length === 0) {
+      return null;
+    }
+
+    if (this.pendingBuffers.length === 1) {
+      const only = this.pendingBuffers.shift() || null;
+      this.pendingSamplesCount = 0;
+      return only;
+    }
+
+    let totalLength = 0;
+
+    for (const buffer of this.pendingBuffers) {
+      totalLength += buffer.length;
+    }
+
+    const merged = new Float32Array(totalLength);
+    let offset = 0;
+
+    for (const buffer of this.pendingBuffers) {
+      merged.set(buffer, offset);
+      offset += buffer.length;
+    }
+
+    this.pendingBuffers = [];
+    this.pendingSamplesCount = 0;
+
+    return merged;
+  }
+
   private schedulePlayback() {
     if (!this.ctx || !this.meta || !this.gainNode || this.pendingBuffers.length === 0) {
       return;
@@ -219,53 +283,74 @@ export class AudioEngine {
       const bufferedMs = (this.pendingSamplesCount / this.meta.sample_rate) * 1000;
 
       if (bufferedMs < this.initialPlaybackBufferMs) {
-        this.onStatusChange(`buffering ${Math.round(bufferedMs)}ms`);
+        this.setStatus(`buffering ${Math.round(bufferedMs)}ms`);
         return;
       }
 
       this.started = true;
-      this.scheduledUntil = now + this.underrunRestartDelaySec;
-      this.onStatusChange('playing');
+      this.scheduledUntil = now + this.initialStartDelaySec;
+      this.setStatus('playing', true);
     }
 
-    if (this.scheduledUntil < now) {
+    const leadSec = this.scheduledUntil - now;
+
+    if (leadSec < this.criticalLeadSec) {
       this.scheduledUntil = now + this.underrunRestartDelaySec;
-      this.onStatusChange('underrun recovery');
+      this.setStatus('underrun recovery', true);
     }
 
-    while (this.pendingBuffers.length > 0) {
-      const interleaved = this.pendingBuffers.shift();
-      if (!interleaved) break;
+    const interleaved = this.mergePendingBuffers();
+    if (!interleaved) return;
 
-      const frames = Math.floor(interleaved.length / channels);
-      this.pendingSamplesCount = Math.max(0, this.pendingSamplesCount - frames);
+    const frames = Math.floor(interleaved.length / channels);
+    if (frames <= 0) return;
 
-      if (frames <= 0) continue;
+    const usableSamples = frames * channels;
+    const audioBuffer = this.ctx.createBuffer(channels, frames, this.meta.sample_rate);
 
-      const audioBuffer = this.ctx.createBuffer(channels, frames, this.meta.sample_rate);
+    for (let channel = 0; channel < channels; channel++) {
+      const channelData = audioBuffer.getChannelData(channel);
 
-      for (let channel = 0; channel < channels; channel++) {
-        const channelData = audioBuffer.getChannelData(channel);
+      for (let frame = 0; frame < frames; frame++) {
+        const sampleIndex = frame * channels + channel;
 
-        for (let frame = 0; frame < frames; frame++) {
-          channelData[frame] = interleaved[frame * channels + channel] || 0;
+        if (sampleIndex < usableSamples) {
+          channelData[frame] = interleaved[sampleIndex] || 0;
+        } else {
+          channelData[frame] = 0;
         }
       }
-
-      const source = this.ctx.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(this.gainNode);
-
-      source.onended = () => {
-        this.activeSources.delete(source);
-      };
-
-      const startTime = Math.max(now + 0.02, this.scheduledUntil);
-
-      this.activeSources.add(source);
-      source.start(startTime);
-
-      this.scheduledUntil = startTime + audioBuffer.duration;
     }
+
+    const source = this.ctx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(this.gainNode);
+
+    source.onended = () => {
+      this.activeSources.delete(source);
+    };
+
+    const startTime = Math.max(this.scheduledUntil, now + this.criticalLeadSec);
+
+    this.activeSources.add(source);
+    source.start(startTime);
+
+    this.scheduledUntil = startTime + audioBuffer.duration;
+  }
+
+  private setStatus(status: string, force = false) {
+    const now = performance.now();
+
+    if (!force && status === this.lastStatus && now - this.lastStatusAt < 300) {
+      return;
+    }
+
+    if (!force && status.startsWith('buffering') && now - this.lastStatusAt < 250) {
+      return;
+    }
+
+    this.lastStatus = status;
+    this.lastStatusAt = now;
+    this.onStatusChange(status);
   }
 }

@@ -21,8 +21,8 @@
     "device": "cuda",
     "precision": "bfloat16",
     "compile": true,
-    "cache_max_seq_len": 768,
-    "max_new_tokens_cap": 160,
+    "cache_max_seq_len": 1024,
+    "max_new_tokens_cap": 256,
     "sdpa_math": false,
     "cleanup_after_request": false,
     "cleanup_every_n_requests": 24,
@@ -40,7 +40,7 @@
     "text": "Привет. Это дополнительный прогрев стримингового режима для Fish Speech.",
     "streaming": true,
     "stream_tokens": true,
-    "max_new_tokens": 128,
+    "max_new_tokens": 160,
     "chunk_length": 160,
     "initial_stream_chunk_size": 10,
     "stream_chunk_size": 8
@@ -52,18 +52,18 @@
     "version": 1,
     "commit": {
       "first": {
-        "min_chars": 40,
-        "target_chars": 58,
-        "max_chars": 84,
+        "min_chars": 35,
+        "target_chars": 55,
+        "max_chars": 80,
         "max_wait_ms": 150,
         "allow_partial_after_ms": 240
       },
       "next": {
-        "min_chars": 120,
-        "target_chars": 160,
-        "max_chars": 240,
-        "max_wait_ms": 340,
-        "allow_partial_after_ms": 600
+        "min_chars": 70,
+        "target_chars": 105,
+        "max_chars": 145,
+        "max_wait_ms": 300,
+        "allow_partial_after_ms": 550
       },
       "flush_on_sentence_punctuation": true,
       "flush_on_clause_punctuation": true,
@@ -76,7 +76,7 @@
       "normalize": true,
       "use_memory_cache": "on",
       "seed": 1234,
-      "max_new_tokens": 160,
+      "max_new_tokens": 240,
       "chunk_length": 160,
       "top_p": 0.78,
       "repetition_penalty": 1.12,
@@ -89,7 +89,7 @@
     },
     "playback": {
       "target_emit_bytes": 6144,
-      "start_buffer_ms": 120,
+      "start_buffer_ms": 140,
       "stop_grace_ms": 60
     },
     "session": {
@@ -105,18 +105,15 @@
       "commit.first.max_chars",
       "commit.first.max_wait_ms",
       "commit.first.allow_partial_after_ms",
-
       "commit.next.min_chars",
       "commit.next.target_chars",
       "commit.next.max_chars",
       "commit.next.max_wait_ms",
       "commit.next.allow_partial_after_ms",
-
       "commit.carry_incomplete_tail",
       "commit.flush_on_sentence_punctuation",
       "commit.flush_on_clause_punctuation",
       "commit.flush_on_newline",
-
       "tts.reference_id",
       "tts.format",
       "tts.normalize",
@@ -132,11 +129,9 @@
       "tts.stream_chunk_size",
       "tts.stateful_synthesis",
       "tts.stateful_fallback_to_stateless",
-
       "playback.target_emit_bytes",
       "playback.start_buffer_ms",
       "playback.stop_grace_ms",
-
       "session.max_buffer_chars",
       "session.auto_close_on_finish"
     ]

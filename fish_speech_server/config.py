@@ -118,9 +118,21 @@ class ProxyTTSConfig(BaseModel):
 class PlaybackConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    target_emit_bytes: int = Field(8192, ge=512, le=32768)
+    target_emit_bytes: int = Field(8192, ge=512, le=65536)
     start_buffer_ms: int = Field(180, ge=0, le=5000)
     stop_grace_ms: int = Field(100, ge=0, le=5000)
+
+    boundary_smoothing_enabled: bool = True
+    punctuation_pauses_enabled: bool = True
+
+    fade_in_ms: int = Field(8, ge=0, le=100)
+    fade_out_ms: int = Field(12, ge=0, le=100)
+
+    pause_after_clause_ms: int = Field(110, ge=0, le=2000)
+    pause_after_sentence_ms: int = Field(280, ge=0, le=3000)
+    pause_after_newline_ms: int = Field(520, ge=0, le=5000)
+    pause_after_force_ms: int = Field(220, ge=0, le=3000)
+    pause_after_hard_limit_ms: int = Field(40, ge=0, le=1000)
 
     @field_validator("target_emit_bytes")
     @classmethod

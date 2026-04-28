@@ -89,8 +89,8 @@
       "normalize": true,
       "use_memory_cache": "on",
       "seed": null,
-      "max_new_tokens": 320,
-      "chunk_length": 220,
+      "max_new_tokens": 300,
+      "chunk_length": 200,
       "top_p": 0.82,
       "repetition_penalty": 1.03,
       "temperature": 0.7,
@@ -100,13 +100,22 @@
       "stateful_synthesis": true,
       "stateful_fallback_to_stateless": false,
       "stateful_history_turns": 1,
-      "stateful_history_chars": 180,
+      "stateful_history_chars": 160,
       "stateful_history_code_frames": 120
     },
     "playback": {
       "target_emit_bytes": 32768,
       "start_buffer_ms": 450,
-      "stop_grace_ms": 300
+      "stop_grace_ms": 0,
+      "boundary_smoothing_enabled": true,
+      "punctuation_pauses_enabled": true,
+      "fade_in_ms": 8,
+      "fade_out_ms": 12,
+      "pause_after_clause_ms": 110,
+      "pause_after_sentence_ms": 280,
+      "pause_after_newline_ms": 520,
+      "pause_after_force_ms": 220,
+      "pause_after_hard_limit_ms": 40
     },
     "session": {
       "max_buffer_chars": 20000,
@@ -151,6 +160,15 @@
       "playback.target_emit_bytes",
       "playback.start_buffer_ms",
       "playback.stop_grace_ms",
+      "playback.boundary_smoothing_enabled",
+      "playback.punctuation_pauses_enabled",
+      "playback.fade_in_ms",
+      "playback.fade_out_ms",
+      "playback.pause_after_clause_ms",
+      "playback.pause_after_sentence_ms",
+      "playback.pause_after_newline_ms",
+      "playback.pause_after_force_ms",
+      "playback.pause_after_hard_limit_ms",
       "session.max_buffer_chars",
       "session.auto_close_on_finish"
     ]

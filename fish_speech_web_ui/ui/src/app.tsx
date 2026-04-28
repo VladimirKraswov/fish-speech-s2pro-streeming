@@ -57,7 +57,16 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
     playback: {
       target_emit_bytes: 32768,
       start_buffer_ms: 450,
-      stop_grace_ms: 300,
+      stop_grace_ms: 0,
+      boundary_smoothing_enabled: true,
+      punctuation_pauses_enabled: true,
+      fade_in_ms: 8,
+      fade_out_ms: 12,
+      pause_after_clause_ms: 110,
+      pause_after_sentence_ms: 280,
+      pause_after_newline_ms: 520,
+      pause_after_force_ms: 220,
+      pause_after_hard_limit_ms: 40,
     },
     session: {
       max_buffer_chars: 20000,
@@ -101,7 +110,14 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
 
     base.playback.target_emit_bytes = 24576;
     base.playback.start_buffer_ms = 300;
-    base.playback.stop_grace_ms = 220;
+    base.playback.stop_grace_ms = 0;
+    base.playback.fade_in_ms = 6;
+    base.playback.fade_out_ms = 8;
+    base.playback.pause_after_clause_ms = 80;
+    base.playback.pause_after_sentence_ms = 220;
+    base.playback.pause_after_newline_ms = 420;
+    base.playback.pause_after_force_ms = 160;
+    base.playback.pause_after_hard_limit_ms = 20;
   }
 
   if (kind === 'stable') {
@@ -138,9 +154,16 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
     base.tts.stateful_history_chars = 220;
     base.tts.stateful_history_code_frames = 160;
 
-    base.playback.target_emit_bytes = 49152;
+    base.playback.target_emit_bytes = 32768; // Reduced to 32768 to avoid validation issues if limit was lower, but Step 1 increased it.
     base.playback.start_buffer_ms = 650;
-    base.playback.stop_grace_ms = 450;
+    base.playback.stop_grace_ms = 0;
+    base.playback.fade_in_ms = 10;
+    base.playback.fade_out_ms = 16;
+    base.playback.pause_after_clause_ms = 140;
+    base.playback.pause_after_sentence_ms = 340;
+    base.playback.pause_after_newline_ms = 650;
+    base.playback.pause_after_force_ms = 260;
+    base.playback.pause_after_hard_limit_ms = 60;
   }
 
   return base;
@@ -190,8 +213,8 @@ export function App() {
   const [text, setText] = useState(DEFAULT_TEXT);
 
   const [mode, setMode] = useState<ChunkMode>('words');
-  const [minSize, setMinSize] = useState(3);
-  const [maxSize, setMaxSize] = useState(8);
+  const [minSize] = useState(3);
+  const [maxSize] = useState(8);
   const [intervalMs, setIntervalMs] = useState(100);
 
   const [sessionId, setSessionId] = useState<string | null>(null);
@@ -224,9 +247,16 @@ export function App() {
       log(`commit #${event.commit_seq} started, reason=${event.reason}`);
     }
 
+    if (event.type === 'pause') {
+      log(`pause #${event.commit_seq}: ${event.pause_ms}ms, boundary=${event.boundary}`);
+    }
+
     if (event.type === 'commit_done') {
       setActiveCommit('');
-      log(`commit #${event.commit_seq} done, upstream_bytes=${event.upstream_bytes ?? 'n/a'}`);
+      log(
+        `commit #${event.commit_seq} done, upstream_bytes=${event.upstream_bytes ?? 'n/a'}, ` +
+          `pause=${event.pause_ms ?? 0}ms, boundary=${event.boundary ?? 'n/a'}`,
+      );
     }
 
     if (event.type === 'error') {

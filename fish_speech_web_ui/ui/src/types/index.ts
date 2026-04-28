@@ -39,6 +39,15 @@ export interface ProxyConfig {
     target_emit_bytes: number;
     start_buffer_ms: number;
     stop_grace_ms: number;
+    boundary_smoothing_enabled?: boolean;
+    punctuation_pauses_enabled?: boolean;
+    fade_in_ms?: number;
+    fade_out_ms?: number;
+    pause_after_clause_ms?: number;
+    pause_after_sentence_ms?: number;
+    pause_after_newline_ms?: number;
+    pause_after_force_ms?: number;
+    pause_after_hard_limit_ms?: number;
   };
   session: {
     max_buffer_chars: number;
@@ -101,10 +110,22 @@ export type StreamEvent =
       data: string;
     }
   | {
+      type: 'pause';
+      session_id?: string;
+      req_id?: string;
+      commit_seq?: number;
+      boundary?: string;
+      pause_ms?: number;
+    }
+  | {
       type: 'commit_done';
       session_id?: string;
       commit_seq: number;
       upstream_bytes?: number;
+      boundary?: string;
+      pause_ms?: number;
+      fade_in_ms?: number;
+      fade_out_ms?: number;
     }
   | {
       type: 'session_done';

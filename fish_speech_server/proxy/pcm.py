@@ -10,6 +10,8 @@ import struct
 import time
 import uuid
 from dataclasses import dataclass, field
+
+import numpy as np
 from typing import Any, AsyncGenerator, Optional, Tuple
 
 import httpx
@@ -372,6 +374,125 @@ def _pcm_bytes_for_duration_ms(
         raw += 1
 
     return raw
+
+
+def _align_down(value: int, frame_bytes: int) -> int:
+    if frame_bytes <= 0:
+        return value
+    return value - (value % frame_bytes)
+
+
+def _pcm_silence_bytes(
+    sample_rate: int,
+    channels: int,
+    bits_per_sample: int,
+    duration_ms: int,
+) -> bytes:
+    if duration_ms <= 0:
+        return b""
+    frame_bytes = channels * (bits_per_sample // 8)
+    frames = int(sample_rate * duration_ms / 1000.0)
+    return b"\x00" * (frames * frame_bytes)
+
+
+SENTENCE_END_RE = re.compile(r'[.!?…]+(?:["»”)\]]+)?\s*$')
+CLAUSE_END_RE = re.compile(r'[,;:—–-]+(?:["»”)\]]+)?\s*$')
+
+
+def _classify_commit_boundary(text: str, reason: str) -> str:
+    stripped = text.rstrip()
+
+    if reason == "newline":
+        return "newline"
+
+    if "\n" in text[-3:]:
+        return "newline"
+
+    if SENTENCE_END_RE.search(stripped):
+        return "sentence"
+
+    if CLAUSE_END_RE.search(stripped):
+        return "clause"
+
+    if reason in {"force", "manual_flush", "input_finished", "llm_input_finished"}:
+        return "force"
+
+    if reason.startswith("hard_limit"):
+        return "hard_limit"
+
+    if reason == "sentence":
+        return "sentence"
+
+    if reason == "clause":
+        return "clause"
+
+    return "soft"
+
+
+def _pause_ms_for_commit(text: str, reason: str, playback) -> tuple[str, int]:
+    if not playback.punctuation_pauses_enabled:
+        return "disabled", 0
+
+    boundary = _classify_commit_boundary(text, reason)
+
+    if boundary == "newline":
+        return boundary, playback.pause_after_newline_ms
+    if boundary == "sentence":
+        return boundary, playback.pause_after_sentence_ms
+    if boundary == "clause":
+        return boundary, playback.pause_after_clause_ms
+    if boundary == "force":
+        return boundary, playback.pause_after_force_ms
+    if boundary == "hard_limit":
+        return boundary, playback.pause_after_hard_limit_ms
+
+    return boundary, 0
+
+
+def _apply_pcm16_fade(
+    pcm: bytes,
+    *,
+    channels: int,
+    fade_in_frames: int = 0,
+    fade_out_frames: int = 0,
+) -> bytes:
+    if not pcm:
+        return pcm
+
+    arr = np.frombuffer(pcm, dtype="<i2").copy()
+
+    if channels <= 0:
+        return pcm
+
+    usable_samples = (arr.size // channels) * channels
+    if usable_samples <= 0:
+        return pcm
+
+    prefix = arr[:usable_samples].reshape(-1, channels)
+    frame_count = prefix.shape[0]
+
+    if fade_in_frames > 0:
+        n = min(frame_count, fade_in_frames)
+        if n > 0:
+            gain = np.linspace(0.0, 1.0, n, endpoint=True, dtype=np.float32)[:, None]
+            prefix[:n] = np.clip(
+                prefix[:n].astype(np.float32) * gain,
+                -32768,
+                32767,
+            ).astype(np.int16)
+
+    if fade_out_frames > 0:
+        n = min(frame_count, fade_out_frames)
+        if n > 0:
+            gain = np.linspace(1.0, 0.0, n, endpoint=True, dtype=np.float32)[:, None]
+            prefix[-n:] = np.clip(
+                prefix[-n:].astype(np.float32) * gain,
+                -32768,
+                32767,
+            ).astype(np.int16)
+
+    arr[:usable_samples] = prefix.reshape(-1)
+    return arr.astype("<i2", copy=False).tobytes()
 
 
 def _last_boundary_before(
@@ -883,27 +1004,70 @@ async def session_pcm_stream(session_id: str):
         first_emit_done = False
         start_buffer_bytes = 0
 
+        fade_in_applied = False
+        sample_rate = None
+        channels = None
+        bits_per_sample = None
+        frame_bytes = 2
+        tail_hold_bytes = 0
+        fade_in_bytes = 0
+        fade_out_bytes = 0
+
         async def flush_pending(force: bool = False) -> AsyncGenerator[bytes, None]:
-            nonlocal first_emit_done
+            nonlocal first_emit_done, fade_in_applied
 
             while True:
                 if not pending_pcm:
                     return
+
+                # Перед первой отдачей применить fade-in к началу commit audio.
+                if (
+                    config.playback.boundary_smoothing_enabled
+                    and not fade_in_applied
+                    and fade_in_bytes > 0
+                    and len(pending_pcm) >= fade_in_bytes
+                ):
+                    faded = _apply_pcm16_fade(
+                        bytes(pending_pcm[:fade_in_bytes]),
+                        channels=channels,
+                        fade_in_frames=int(
+                            sample_rate * config.playback.fade_in_ms / 1000.0
+                        ),
+                        fade_out_frames=0,
+                    )
+                    pending_pcm[:fade_in_bytes] = faded
+                    fade_in_applied = True
 
                 threshold = target_emit_bytes
 
                 if not first_emit_done:
                     threshold = max(target_emit_bytes, start_buffer_bytes)
 
-                if not force and len(pending_pcm) < threshold:
+                threshold = _align_down(threshold, frame_bytes)
+                if threshold <= 0:
+                    threshold = frame_bytes
+
+                protected_tail = 0 if force else tail_hold_bytes
+                available = len(pending_pcm) - protected_tail
+
+                if available <= 0:
                     return
 
-                if len(pending_pcm) >= threshold:
-                    out = bytes(pending_pcm[:threshold])
-                    del pending_pcm[:threshold]
+                if not force and available < threshold:
+                    return
+
+                if force:
+                    out_len = len(pending_pcm)
                 else:
-                    out = bytes(pending_pcm)
-                    pending_pcm.clear()
+                    out_len = min(threshold, available)
+
+                out_len = _align_down(out_len, frame_bytes)
+
+                if out_len <= 0:
+                    return
+
+                out = bytes(pending_pcm[:out_len])
+                del pending_pcm[:out_len]
 
                 pcm_seq = rec.next_pcm_seq
                 rec.next_pcm_seq += 1
@@ -971,6 +1135,34 @@ async def session_pcm_stream(session_id: str):
                                 f"unsupported bits_per_sample={bits_per_sample}"
                             )
 
+                        frame_bytes = channels * (bits_per_sample // 8)
+
+                        fade_in_bytes = _align_down(
+                            _pcm_bytes_for_duration_ms(
+                                sample_rate,
+                                channels,
+                                bits_per_sample,
+                                config.playback.fade_in_ms,
+                            ),
+                            frame_bytes,
+                        )
+
+                        fade_out_bytes = _align_down(
+                            _pcm_bytes_for_duration_ms(
+                                sample_rate,
+                                channels,
+                                bits_per_sample,
+                                config.playback.fade_out_ms,
+                            ),
+                            frame_bytes,
+                        )
+
+                        tail_hold_bytes = (
+                            fade_out_bytes
+                            if config.playback.boundary_smoothing_enabled
+                            else 0
+                        )
+
                         current_audio_meta = {
                             "sample_rate": sample_rate,
                             "channels": channels,
@@ -984,8 +1176,9 @@ async def session_pcm_stream(session_id: str):
                             config.playback.start_buffer_ms,
                         )
 
-                        if start_buffer_bytes % 2 != 0:
-                            start_buffer_bytes += 1
+                        start_buffer_bytes = _align_down(
+                            start_buffer_bytes, frame_bytes
+                        )
 
                         header_sent = True
 
@@ -1026,6 +1219,55 @@ async def session_pcm_stream(session_id: str):
         if not header_sent:
             raise RuntimeError("upstream finished before WAV data header was parsed")
 
+        boundary_kind, pause_ms = _pause_ms_for_commit(
+            commit_item["text"],
+            commit_item["reason"],
+            config.playback,
+        )
+
+        if (
+            config.playback.boundary_smoothing_enabled
+            and pending_pcm
+            and fade_out_bytes > 0
+        ):
+            # fade-out только на реальном аудио, ДО добавления тишины
+            tail_len = min(len(pending_pcm), fade_out_bytes)
+            tail_len = _align_down(tail_len, frame_bytes)
+
+            if tail_len > 0:
+                start = len(pending_pcm) - tail_len
+                faded_tail = _apply_pcm16_fade(
+                    bytes(pending_pcm[start:]),
+                    channels=channels,
+                    fade_in_frames=0,
+                    fade_out_frames=int(
+                        sample_rate * config.playback.fade_out_ms / 1000.0
+                    ),
+                )
+                pending_pcm[start:] = faded_tail
+
+        if pause_ms > 0:
+            pending_pcm.extend(
+                _pcm_silence_bytes(
+                    sample_rate,
+                    channels,
+                    bits_per_sample,
+                    pause_ms,
+                )
+            )
+
+            yield await emit(
+                {
+                    "type": "pause",
+                    "req_id": req_id,
+                    "session_id": rec.session_id,
+                    "commit_seq": commit_item["seq"],
+                    "boundary": boundary_kind,
+                    "pause_ms": pause_ms,
+                }
+            )
+            await asyncio.sleep(0)
+
         if config.playback.stop_grace_ms > 0:
             await asyncio.sleep(config.playback.stop_grace_ms / 1000.0)
 
@@ -1045,6 +1287,10 @@ async def session_pcm_stream(session_id: str):
                 "session_id": rec.session_id,
                 "commit_seq": commit_item["seq"],
                 "upstream_bytes": upstream_bytes,
+                "boundary": boundary_kind,
+                "pause_ms": pause_ms,
+                "fade_in_ms": config.playback.fade_in_ms,
+                "fade_out_ms": config.playback.fade_out_ms,
             }
         )
 
@@ -1155,27 +1401,70 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
         start_buffer_bytes = 0
         first_emit_done = False
 
+        fade_in_applied = False
+        sample_rate = None
+        channels = None
+        bits_per_sample = None
+        frame_bytes = 2
+        tail_hold_bytes = 0
+        fade_in_bytes = 0
+        fade_out_bytes = 0
+
         async def flush_pending(force: bool = False) -> AsyncGenerator[bytes, None]:
-            nonlocal pcm_seq, first_emit_done
+            nonlocal pcm_seq, first_emit_done, fade_in_applied
 
             while True:
                 if not pending_pcm:
                     return
+
+                # Перед первой отдачей применить fade-in к началу audio.
+                if (
+                    config.playback.boundary_smoothing_enabled
+                    and not fade_in_applied
+                    and fade_in_bytes > 0
+                    and len(pending_pcm) >= fade_in_bytes
+                ):
+                    faded = _apply_pcm16_fade(
+                        bytes(pending_pcm[:fade_in_bytes]),
+                        channels=channels,
+                        fade_in_frames=int(
+                            sample_rate * config.playback.fade_in_ms / 1000.0
+                        ),
+                        fade_out_frames=0,
+                    )
+                    pending_pcm[:fade_in_bytes] = faded
+                    fade_in_applied = True
 
                 threshold = target_emit_bytes
 
                 if not first_emit_done:
                     threshold = max(target_emit_bytes, start_buffer_bytes)
 
-                if not force and len(pending_pcm) < threshold:
+                threshold = _align_down(threshold, frame_bytes)
+                if threshold <= 0:
+                    threshold = frame_bytes
+
+                protected_tail = 0 if force else tail_hold_bytes
+                available = len(pending_pcm) - protected_tail
+
+                if available <= 0:
                     return
 
-                if len(pending_pcm) >= threshold:
-                    out = bytes(pending_pcm[:threshold])
-                    del pending_pcm[:threshold]
+                if not force and available < threshold:
+                    return
+
+                if force:
+                    out_len = len(pending_pcm)
                 else:
-                    out = bytes(pending_pcm)
-                    pending_pcm.clear()
+                    out_len = min(threshold, available)
+
+                out_len = _align_down(out_len, frame_bytes)
+
+                if out_len <= 0:
+                    return
+
+                out = bytes(pending_pcm[:out_len])
+                del pending_pcm[:out_len]
 
                 yield await emit(
                     {
@@ -1224,6 +1513,34 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
                         sample_rate, channels, bits_per_sample, data_offset = parsed
 
                         header_sent = True
+                        frame_bytes = channels * (bits_per_sample // 8)
+
+                        fade_in_bytes = _align_down(
+                            _pcm_bytes_for_duration_ms(
+                                sample_rate,
+                                channels,
+                                bits_per_sample,
+                                config.playback.fade_in_ms,
+                            ),
+                            frame_bytes,
+                        )
+
+                        fade_out_bytes = _align_down(
+                            _pcm_bytes_for_duration_ms(
+                                sample_rate,
+                                channels,
+                                bits_per_sample,
+                                config.playback.fade_out_ms,
+                            ),
+                            frame_bytes,
+                        )
+
+                        tail_hold_bytes = (
+                            fade_out_bytes
+                            if config.playback.boundary_smoothing_enabled
+                            else 0
+                        )
+
                         start_buffer_bytes = _pcm_bytes_for_duration_ms(
                             sample_rate,
                             channels,
@@ -1231,8 +1548,9 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
                             config.playback.start_buffer_ms,
                         )
 
-                        if start_buffer_bytes % 2 != 0:
-                            start_buffer_bytes += 1
+                        start_buffer_bytes = _align_down(
+                            start_buffer_bytes, frame_bytes
+                        )
 
                         yield await emit(
                             {
@@ -1259,6 +1577,52 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
                         async for event in flush_pending():
                             yield event
 
+        boundary_kind, pause_ms = _pause_ms_for_commit(
+            text,
+            "force",
+            config.playback,
+        )
+
+        if (
+            config.playback.boundary_smoothing_enabled
+            and pending_pcm
+            and fade_out_bytes > 0
+        ):
+            tail_len = min(len(pending_pcm), fade_out_bytes)
+            tail_len = _align_down(tail_len, frame_bytes)
+
+            if tail_len > 0:
+                start = len(pending_pcm) - tail_len
+                faded_tail = _apply_pcm16_fade(
+                    bytes(pending_pcm[start:]),
+                    channels=channels,
+                    fade_in_frames=0,
+                    fade_out_frames=int(
+                        sample_rate * config.playback.fade_out_ms / 1000.0
+                    ),
+                )
+                pending_pcm[start:] = faded_tail
+
+        if pause_ms > 0:
+            pending_pcm.extend(
+                _pcm_silence_bytes(
+                    sample_rate,
+                    channels,
+                    bits_per_sample,
+                    pause_ms,
+                )
+            )
+
+            yield await emit(
+                {
+                    "type": "pause",
+                    "req_id": req_id,
+                    "boundary": boundary_kind,
+                    "pause_ms": pause_ms,
+                }
+            )
+            await asyncio.sleep(0)
+
         if config.playback.stop_grace_ms > 0:
             await asyncio.sleep(config.playback.stop_grace_ms / 1000.0)
 
@@ -1269,6 +1633,8 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
             {
                 "type": "done",
                 "req_id": req_id,
+                "boundary": boundary_kind,
+                "pause_ms": pause_ms,
             }
         )
 

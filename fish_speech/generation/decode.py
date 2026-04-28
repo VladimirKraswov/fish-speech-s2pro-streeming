@@ -396,7 +396,7 @@ def generate(
     )
     seq[:, T : T + 1] = first_token
 
-    input_pos = torch.tensor([T], device=device, dtype=torch.int)
+    input_pos = torch.tensor([T], device=device, dtype=torch.long)
     stream_chunk_size = sampling_kwargs.pop("stream_chunk_size", None)
     initial_stream_chunk_size = sampling_kwargs.pop("initial_stream_chunk_size", None)
     compile = sampling_kwargs.pop("compile", False)

@@ -50,7 +50,9 @@ class ReferenceLoader:
         # Load the references audio and text by id.
         # Each reference can be: (a) .wav + .lab → encode at load, or (b) .codes.pt + .lab → load pre-encoded (no encoder run).
         ref_folder = self.references_dir / id
-        ref_folder.mkdir(parents=True, exist_ok=True)
+        if not ref_folder.is_dir():
+            raise FileNotFoundError(f"Reference ID '{id}' does not exist")
+
         ref_audios = list_files(
             ref_folder, AUDIO_EXTENSIONS, recursive=True, sort=False
         )

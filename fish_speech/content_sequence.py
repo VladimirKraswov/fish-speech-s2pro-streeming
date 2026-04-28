@@ -200,14 +200,18 @@ class ContentSequence:
 
                 tokens = torch.tensor(tokens, dtype=torch.long)
             elif isinstance(part, VQPart):
-                # Critical Optimization: Vectorized mapping
-                # Instead of loop lookup: [tokenizer.semantic_id_to_token_id[i] for i in codes]
-                # We use arithmetic offset: code + semantic_begin_id
-                # This assumes semantic tokens are contiguous in the vocab (DualAR requirement)
-                curr_codes = part.codes.clone().to(torch.int)
+                curr_codes = part.codes.clone().to(torch.long)
+                semantic_codes = curr_codes[0]
 
-                # Use int64 (long) for token IDs to avoid overflow or type mismatch in embedding
-                tokens = (curr_codes[0] + tokenizer.semantic_begin_id).to(torch.long)
+                if (semantic_codes < 0).any() or (
+                    semantic_codes >= tokenizer.semantic_map_tensor.numel()
+                ).any():
+                    raise ValueError("Semantic VQ code out of tokenizer semantic range")
+
+                semantic_map = tokenizer.semantic_map_tensor.to(
+                    device=semantic_codes.device
+                )
+                tokens = semantic_map[semantic_codes].to(torch.long)
 
                 vq_parts.append(curr_codes)
                 vq_require_losses.append(part.cal_loss)

@@ -515,9 +515,9 @@ class BaseTransformer(nn.Module):
                 f"Injected Semantic IDs into Config: {config.semantic_begin_id}-{config.semantic_end_id}"
             )
         except Exception as e:
-            logger.warning(
-                f"Failed to load tokenizer for config injection: {e}. Semantic IDs might be 0."
-            )
+            raise RuntimeError(
+                f"Failed to load tokenizer from {path}; tokenizer is required for Fish Speech inference"
+            ) from e
 
         match config.model_type:
             case "naive":

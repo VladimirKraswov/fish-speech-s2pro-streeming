@@ -205,6 +205,8 @@ export function App() {
   const abortController = useRef<AbortController | null>(null);
   const simulator = useRef<LLMSimulator | null>(null);
 
+  const [speedMultiplier, setSpeedMultiplier] = useState(1.0);
+
   const log = (message: string) => {
     const time = new Date().toLocaleTimeString();
     setLogs((prev) => [...prev.slice(-180), `[${time}] ${message}`]);
@@ -393,6 +395,7 @@ export function App() {
       minSize,
       maxSize,
       interval: intervalMs,
+      speedMultiplier,
       onChunk: async (chunk) => {
         try {
           const data = await client.current.appendText(sessionId, chunk);
@@ -490,42 +493,35 @@ export function App() {
 
           <div class="controls-grid">
             <label>
-              Mode
+              Режим эмуляции
               <select value={mode} onChange={(e) => setMode((e.currentTarget as HTMLSelectElement).value as ChunkMode)}>
-                <option value="chars">Chars</option>
-                <option value="words">Words</option>
-                <option value="sentences">Sentences</option>
+                <option value="tokens">Tokens (самый реалистичный)</option>
+                <option value="words">По словам</option>
+                <option value="chars">По символам</option>
               </select>
             </label>
 
             <label>
-              Min
-              <input
-                type="number"
-                value={minSize}
-                min="1"
-                onInput={(e) => setMinSize(Number((e.currentTarget as HTMLInputElement).value))}
-              />
-            </label>
-
-            <label>
-              Max
-              <input
-                type="number"
-                value={maxSize}
-                min="1"
-                onInput={(e) => setMaxSize(Number((e.currentTarget as HTMLInputElement).value))}
-              />
-            </label>
-
-            <label>
-              Interval ms
+              Интервал (мс)
               <input
                 type="number"
                 value={intervalMs}
                 min="10"
+                step="10"
                 onInput={(e) => setIntervalMs(Number((e.currentTarget as HTMLInputElement).value))}
               />
+            </label>
+
+            <label>
+              Скорость
+              <select 
+                value={speedMultiplier} 
+                onChange={(e) => setSpeedMultiplier(Number((e.currentTarget as HTMLSelectElement).value))}
+              >
+                <option value={0.6}>Быстро</option>
+                <option value={1.0}>Нормально</option>
+                <option value={1.4}>Медленно</option>
+              </select>
             </label>
           </div>
 

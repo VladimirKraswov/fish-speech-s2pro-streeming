@@ -240,7 +240,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                             else Exception("Unknown error")
                         ),
                     )
-                    break
+                    return
 
                 needs_ack = ack_queue is not None
                 try:
@@ -429,7 +429,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         Send a request to the LLAMA model to generate the symbolic tokens.
         """
 
-        stream_tokens = bool(req.stream_tokens)
+        stream_tokens = bool(req.stream_tokens or req.stream_audio)
         request = dict(
             device=self.decoder_model.device,
             req_tag=req_tag,

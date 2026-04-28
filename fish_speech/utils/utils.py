@@ -138,11 +138,6 @@ def set_seed(seed: int):
 def enforce_tags(cfg, save_to_file=False):
     pass
 
-def print_config_tree(cfg, resolve=False, save_to_file=False):
-    pass
-
-def enforce_tags(cfg, save_to_file=False):
-    pass
 
 def print_config_tree(cfg, resolve=False, save_to_file=False):
     pass

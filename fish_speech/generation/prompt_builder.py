@@ -490,7 +490,13 @@ def generate_committed_segments(
                     model_size * tokens_sec / 1e9,
                 )
 
-                codes = y[1:, prompt_length:-1].clone()
+                generated = y[:, prompt_length:]
+                main_tokens = generated[0]
+                semantic_mask = (
+                    (main_tokens >= tokenizer.semantic_begin_id)
+                    & (main_tokens <= tokenizer.semantic_end_id)
+                )
+                codes = generated[1:, semantic_mask].clone()
                 assert (codes >= 0).all(), f"Negative code found: {codes}"
 
                 code_frames = int(codes.shape[-1])

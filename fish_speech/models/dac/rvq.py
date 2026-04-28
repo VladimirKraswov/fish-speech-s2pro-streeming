@@ -351,6 +351,7 @@ class DownsampleResidualVectorQuantize(nn.Module):
     #     return indices
     #
     def decode(self, indices: torch.Tensor):
+        indices = indices.clone()
         # indices = rearrange(indices, "b (g r) l -> g b l r", g=self.residual_fsq.groups)
         indices[:, 0] = torch.clamp(
             indices[:, 0], max=self.semantic_quantizer.codebook_size - 1

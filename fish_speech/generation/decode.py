@@ -401,6 +401,13 @@ def generate(
     initial_stream_chunk_size = sampling_kwargs.pop("initial_stream_chunk_size", None)
     compile = sampling_kwargs.pop("compile", False)
 
+    im_end_id = model.tokenizer.get_token_id(IM_END_TOKEN)
+    if first_token[0, 0] == im_end_id:
+        if stream_chunk_size is not None:
+            return _iter_no_grad(iter([]))
+        else:
+            return seq[:, : T + 1]
+
     decode_iter = decode_n_tokens(
         model,
         first_token.view(1, codebook_dim, -1),

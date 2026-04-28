@@ -155,13 +155,18 @@ class ReferenceLoader:
 
         return prompt_tokens, prompt_texts
 
-    def load_audio(self, reference_audio: bytes | str, sr: int):
+    def load_audio(self, reference_audio: bytes | str | bytearray, sr: int):
         """
         Load the audio data from a file or bytes.
         """
-        if len(reference_audio) > 255 or not Path(reference_audio).exists():
-            audio_data = reference_audio
-            reference_audio = io.BytesIO(audio_data)
+        if isinstance(reference_audio, (bytes, bytearray)):
+            reference_audio = io.BytesIO(reference_audio)
+        elif isinstance(reference_audio, (str, Path)):
+            audio_path = Path(reference_audio)
+            if len(str(audio_path)) > 255 or not audio_path.exists():
+                reference_audio = io.BytesIO(str(reference_audio).encode("utf-8"))
+        else:
+            reference_audio = io.BytesIO(reference_audio)
 
         waveform, original_sr = torchaudio.load(reference_audio, backend=self.backend)
 

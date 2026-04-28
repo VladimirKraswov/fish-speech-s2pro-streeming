@@ -211,6 +211,8 @@ class ContentSequence:
 
                 vq_parts.append(curr_codes)
                 vq_require_losses.append(part.cal_loss)
+            elif isinstance(part, AudioPart):
+                raise NotImplementedError("AudioPart is not supported by encode() yet")
             else:
                 raise ValueError(f"Unsupported part type: {type(part)}")
 
@@ -220,18 +222,12 @@ class ContentSequence:
             if isinstance(part, VQPart):
                 vq_masks.append(torch.ones_like(tokens, dtype=torch.bool))
                 audio_masks.append(torch.zeros_like(tokens, dtype=torch.bool))
-            elif isinstance(part, AudioPart):
-                vq_masks.append(torch.zeros_like(tokens, dtype=torch.bool))
-                audio_mask = torch.ones_like(tokens, dtype=torch.bool)
-                audio_mask[0] = False  # Skip start token
-                audio_mask[-1] = False  # Skip end token
-                audio_masks.append(audio_mask)
             else:
                 vq_masks.append(torch.zeros_like(tokens, dtype=torch.bool))
                 audio_masks.append(torch.zeros_like(tokens, dtype=torch.bool))
 
             # Set labels based on whether we want to calculate loss for this part
-            if part.cal_loss and not isinstance(part, AudioPart):
+            if part.cal_loss:
                 all_labels.append(tokens.clone())
             else:
                 all_labels.append(torch.full_like(tokens, -100))

@@ -16,16 +16,16 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
   const base: ProxyConfig = {
     commit: {
       first: {
-        min_chars: 75,
-        target_chars: 150,
-        max_chars: 230,
+        min_chars: 70,
+        target_chars: 140,
+        max_chars: 210,
         max_wait_ms: 520,
         allow_partial_after_ms: 1200,
       },
       next: {
-        min_chars: 100,
-        target_chars: 210,
-        max_chars: 320,
+        min_chars: 90,
+        target_chars: 180,
+        max_chars: 250,
         max_wait_ms: 850,
         allow_partial_after_ms: 1800,
       },
@@ -50,9 +50,9 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
       stream_chunk_size: 20,
       stateful_synthesis: true,
       stateful_fallback_to_stateless: false,
-      stateful_history_turns: 2,
-      stateful_history_chars: 320,
-      stateful_history_code_frames: 420,
+      stateful_history_turns: 1,
+      stateful_history_chars: 180,
+      stateful_history_code_frames: 120,
     },
     playback: {
       target_emit_bytes: 32768,
@@ -67,17 +67,17 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
 
   if (kind === 'lowLatency') {
     base.commit.first = {
-      min_chars: 55,
-      target_chars: 115,
-      max_chars: 180,
+      min_chars: 50,
+      target_chars: 105,
+      max_chars: 170,
       max_wait_ms: 360,
       allow_partial_after_ms: 850,
     };
 
     base.commit.next = {
-      min_chars: 75,
-      target_chars: 155,
-      max_chars: 240,
+      min_chars: 70,
+      target_chars: 145,
+      max_chars: 220,
       max_wait_ms: 650,
       allow_partial_after_ms: 1350,
     };
@@ -94,9 +94,10 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
     base.tts.temperature = 0.69;
     base.tts.initial_stream_chunk_size = 22;
     base.tts.stream_chunk_size = 16;
-    base.tts.stateful_history_turns = 2;
-    base.tts.stateful_history_chars = 260;
-    base.tts.stateful_history_code_frames = 340;
+
+    base.tts.stateful_history_turns = 1;
+    base.tts.stateful_history_chars = 140;
+    base.tts.stateful_history_code_frames = 96;
 
     base.playback.target_emit_bytes = 24576;
     base.playback.start_buffer_ms = 300;
@@ -105,17 +106,17 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
 
   if (kind === 'stable') {
     base.commit.first = {
-      min_chars: 100,
-      target_chars: 210,
-      max_chars: 330,
+      min_chars: 85,
+      target_chars: 165,
+      max_chars: 230,
       max_wait_ms: 800,
       allow_partial_after_ms: 1700,
     };
 
     base.commit.next = {
-      min_chars: 140,
-      target_chars: 280,
-      max_chars: 420,
+      min_chars: 105,
+      target_chars: 210,
+      max_chars: 250,
       max_wait_ms: 1200,
       allow_partial_after_ms: 2400,
     };
@@ -126,15 +127,16 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
     base.commit.carry_incomplete_tail = true;
 
     base.tts.max_new_tokens = 320;
-    base.tts.chunk_length = 240;
+    base.tts.chunk_length = 220;
     base.tts.top_p = 0.83;
     base.tts.repetition_penalty = 1.04;
     base.tts.temperature = 0.7;
     base.tts.initial_stream_chunk_size = 36;
     base.tts.stream_chunk_size = 28;
-    base.tts.stateful_history_turns = 2;
-    base.tts.stateful_history_chars = 420;
-    base.tts.stateful_history_code_frames = 520;
+
+    base.tts.stateful_history_turns = 1;
+    base.tts.stateful_history_chars = 220;
+    base.tts.stateful_history_code_frames = 160;
 
     base.playback.target_emit_bytes = 49152;
     base.playback.start_buffer_ms = 650;

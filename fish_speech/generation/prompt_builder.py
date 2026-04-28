@@ -57,6 +57,8 @@ def _select_generated_history(
         return []
 
     if policy == "last_segment":
+        if max_history_segments <= 0:
+            return []
         return generated_history[-max_history_segments:]
 
     if policy == "tail_frames":

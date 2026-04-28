@@ -40,7 +40,7 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
       normalize: true,
       use_memory_cache: 'on',
       seed: null,
-      max_new_tokens: 320,
+      max_new_tokens: 300,
       chunk_length: 220,
       top_p: 0.82,
       repetition_penalty: 1.03,
@@ -53,6 +53,8 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
       stateful_history_turns: 1,
       stateful_history_chars: 180,
       stateful_history_code_frames: 120,
+      stateful_reset_every_commits: 4,
+      stateful_reset_every_chars: 800,
     },
     playback: {
       target_emit_bytes: 32768,
@@ -107,6 +109,8 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
     base.tts.stateful_history_turns = 1;
     base.tts.stateful_history_chars = 140;
     base.tts.stateful_history_code_frames = 96;
+    base.tts.stateful_reset_every_commits = 3;
+    base.tts.stateful_reset_every_chars = 650;
 
     base.playback.target_emit_bytes = 24576;
     base.playback.start_buffer_ms = 300;
@@ -142,7 +146,7 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
     base.commit.flush_on_newline = true;
     base.commit.carry_incomplete_tail = true;
 
-    base.tts.max_new_tokens = 320;
+    base.tts.max_new_tokens = 300;
     base.tts.chunk_length = 220;
     base.tts.top_p = 0.83;
     base.tts.repetition_penalty = 1.04;
@@ -153,6 +157,8 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
     base.tts.stateful_history_turns = 1;
     base.tts.stateful_history_chars = 220;
     base.tts.stateful_history_code_frames = 160;
+    base.tts.stateful_reset_every_commits = 5;
+    base.tts.stateful_reset_every_chars = 1000;
 
     base.playback.target_emit_bytes = 32768; // Reduced to 32768 to avoid validation issues if limit was lower, but Step 1 increased it.
     base.playback.start_buffer_ms = 650;
@@ -240,6 +246,10 @@ export function App() {
   const onStreamEvent = (event: StreamEvent) => {
     if (event.type === 'session_start') {
       log(`pcm stream opened, target_emit_bytes=${event.target_emit_bytes ?? 'n/a'}`);
+    }
+
+    if (event.type === 'upstream_reset') {
+      log(`upstream synthesis reset at commit #${event.commit_seq}: ${event.reason}`);
     }
 
     if (event.type === 'commit_start') {

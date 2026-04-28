@@ -34,6 +34,8 @@ export interface ProxyConfig {
     stateful_history_turns?: number;
     stateful_history_chars?: number;
     stateful_history_code_frames?: number;
+    stateful_reset_every_commits?: number;
+    stateful_reset_every_chars?: number;
   };
   playback: {
     target_emit_bytes: number;
@@ -137,6 +139,14 @@ export type StreamEvent =
       type: 'session_aborted';
       session_id: string;
       req_id?: string;
+    }
+  | {
+      type: 'upstream_reset';
+      session_id?: string;
+      commit_seq?: number;
+      reason?: string;
+      old_synthesis_session_id?: string | null;
+      new_synthesis_session_id?: string | null;
     }
   | {
       type: 'error';

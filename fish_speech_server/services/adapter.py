@@ -133,7 +133,7 @@ def stateful_tts_to_driver_request(
     for continuity while keeping the speaker reference separate.
     """
     from fish_speech_server.services.continuation import (
-        select_history_turns_for_continuation,
+        select_continuation_parts_for_prompt,
     )
 
     driver_req = api_tts_to_driver_request(req)
@@ -141,12 +141,12 @@ def stateful_tts_to_driver_request(
     driver_req.generation.stream_tokens = True
     driver_req.segments = [req.text] if req.text.strip() else []
 
-    history_turns = select_history_turns_for_continuation(context)
-    if not history_turns:
+    continuation_parts = select_continuation_parts_for_prompt(context)
+    if not continuation_parts:
         return driver_req
 
     # Pass acoustic continuation separately from the speaker reference.
-    driver_req.continuation_text = [t.text for t in history_turns]
-    driver_req.continuation_tokens = [t.codes for t in history_turns]
+    driver_req.continuation_text = [part.text for part in continuation_parts]
+    driver_req.continuation_tokens = [part.codes for part in continuation_parts]
 
     return driver_req

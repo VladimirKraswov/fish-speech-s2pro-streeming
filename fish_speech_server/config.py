@@ -91,6 +91,8 @@ class ProxyTTSConfig(BaseModel):
     stateful_history_turns: int = Field(1, ge=1, le=4)
     stateful_history_chars: int = Field(160, ge=1, le=1000)
     stateful_history_code_frames: int = Field(260, ge=0, le=2000)
+    stateful_reset_every_commits: int = Field(0, ge=0, le=1000)
+    stateful_reset_every_chars: int = Field(0, ge=0, le=100_000)
 
     @field_validator("format")
     @classmethod

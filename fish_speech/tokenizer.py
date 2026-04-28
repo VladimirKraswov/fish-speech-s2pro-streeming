@@ -86,14 +86,17 @@ class FishTokenizer:
             self.semantic_map_tensor[k] = v
 
         # token_id -> code_idx
+        # Use len(self._tokenizer) instead of self.vocab_size because special tokens
+        # are added to the vocabulary and increase its size beyond the base vocab_size.
+        total_vocab_size = len(self._tokenizer)
         self.semantic_token_to_code = torch.full(
-            (self.vocab_size,), -1, dtype=torch.long
+            (total_vocab_size,), -1, dtype=torch.long
         )
         for k, v in self.semantic_id_to_token_id.items():
             self.semantic_token_to_code[v] = k
 
         # bool mask over token ids
-        self.semantic_token_mask = torch.zeros(self.vocab_size, dtype=torch.bool)
+        self.semantic_token_mask = torch.zeros(total_vocab_size, dtype=torch.bool)
         self.semantic_token_mask[valid_ids] = True
 
         logger.info(

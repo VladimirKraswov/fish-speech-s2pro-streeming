@@ -56,7 +56,7 @@ class CommitPolicyConfig(BaseModel):
     first: CommitStageConfig
     next: CommitStageConfig
     flush_on_sentence_punctuation: bool = True
-    flush_on_clause_punctuation: bool = True
+    flush_on_clause_punctuation: bool = False
     flush_on_newline: bool = True
     carry_incomplete_tail: bool = True
 
@@ -84,8 +84,10 @@ class ProxyTTSConfig(BaseModel):
     stateful_synthesis: bool = True
     stateful_fallback_to_stateless: bool = False
 
-    # Для длинного текста лучше держать только последний акустический кусок.
-    # Иначе prompt быстро раздувается, а модель начинает путаться/повторять/пропускать.
+    # Важно для длинного текста:
+    # держим небольшой акустический хвост, а не всю историю.
+    # Если держать много history, prompt раздувается, и модель начинает
+    # пропускать слова/куски или повторять.
     stateful_history_turns: int = Field(1, ge=1, le=4)
     stateful_history_chars: int = Field(160, ge=1, le=1000)
     stateful_history_code_frames: int = Field(260, ge=0, le=2000)
@@ -116,9 +118,9 @@ class ProxyTTSConfig(BaseModel):
 class PlaybackConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    target_emit_bytes: int = Field(4096, ge=512, le=32768)
-    start_buffer_ms: int = Field(90, ge=0, le=5000)
-    stop_grace_ms: int = Field(40, ge=0, le=5000)
+    target_emit_bytes: int = Field(8192, ge=512, le=32768)
+    start_buffer_ms: int = Field(180, ge=0, le=5000)
+    stop_grace_ms: int = Field(100, ge=0, le=5000)
 
     @field_validator("target_emit_bytes")
     @classmethod
@@ -131,7 +133,7 @@ class PlaybackConfig(BaseModel):
 class SessionRuntimeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    max_buffer_chars: int = Field(4000, ge=256, le=100_000)
+    max_buffer_chars: int = Field(12000, ge=256, le=100_000)
     auto_close_on_finish: bool = False
 
 

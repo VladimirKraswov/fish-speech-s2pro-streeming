@@ -79,7 +79,8 @@ def list_files(
     if not path.exists():
         raise FileNotFoundError(f"Directory {path} does not exist.")
 
-    files = [file for ext in extensions for file in path.rglob(f"*{ext}")]
+    walker = path.rglob if recursive else path.glob
+    files = [file for ext in extensions for file in walker(f"*{ext}")]
 
     if sort:
         files = natsorted(files)

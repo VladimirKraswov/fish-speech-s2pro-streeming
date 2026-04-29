@@ -87,15 +87,68 @@ class ReferenceLoader:
                 if codes_path.exists():
                     # Pre-encoded: load from disk (no encoder run). File must be tensor shape (num_codebooks, T) from DAC encode.
                     # map_location="cpu" = put tensor in RAM (worker will .to(device) later). Loading to GPU here would save one tiny copy but is negligible for KB-sized tensors.
-                    loaded = torch.load(
-                        codes_path, map_location="cpu", weights_only=True
-                    )
-                    prompt_tokens.append(
-                        loaded if isinstance(loaded, torch.Tensor) else loaded[0]
-                    )
-                    logger.info(
-                        "Loaded pre-encoded reference {} from {}", stem, codes_path.name
-                    )
+                    try:
+                        loaded = torch.load(
+                            codes_path, map_location="cpu", weights_only=True
+                        )
+                        if isinstance(loaded, (tuple, list)):
+                            loaded = loaded[0]
+
+                        if not isinstance(loaded, torch.Tensor):
+                            raise TypeError(
+                                f"Expected torch.Tensor, got {type(loaded).__name__}"
+                            )
+
+                        # Standardize to [num_codebooks, T]
+                        if loaded.ndim == 3:
+                            if loaded.shape[0] == 1:
+                                loaded = loaded[0]
+                            else:
+                                raise ValueError(
+                                    f"Unexpected 3D tensor shape {loaded.shape}, "
+                                    f"expected [1, num_codebooks, T] or [num_codebooks, T]"
+                                )
+
+                        if loaded.ndim != 2:
+                            raise ValueError(
+                                f"Unexpected tensor ndim {loaded.ndim}, shape {loaded.shape}, "
+                                f"expected [num_codebooks, T]"
+                            )
+
+                        if loaded.size(-1) == 0:
+                            raise ValueError("Acoustic tensor is empty (T=0)")
+
+                        # Final validation of num_codebooks if possible
+                        if (
+                            hasattr(self, "decoder_model")
+                            and hasattr(self.decoder_model, "config")
+                            and hasattr(self.decoder_model.config, "num_codebooks")
+                        ):
+                            expected_cb = self.decoder_model.config.num_codebooks
+                            if loaded.shape[0] != expected_cb:
+                                logger.warning(
+                                    "Reference {} codebook count mismatch: got {}, expected {}",
+                                    stem,
+                                    loaded.shape[0],
+                                    expected_cb,
+                                )
+
+                        prompt_tokens.append(loaded.long().cpu())
+                        logger.info(
+                            "Loaded pre-encoded reference {} from {} (shape={})",
+                            stem,
+                            codes_path.name,
+                            loaded.shape,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "Failed to load pre-encoded reference from {}: {}",
+                            codes_path,
+                            e,
+                        )
+                        raise ValueError(
+                            f"Invalid pre-encoded reference at {codes_path}: {e}"
+                        ) from e
                 elif audio_path is not None:
                     prompt_tokens.append(
                         self.encode_reference(

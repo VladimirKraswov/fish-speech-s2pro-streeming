@@ -316,6 +316,14 @@ class ContentSequence:
 
             # Values[0] is already the Main Token ID (Semantic Begin + Code)
             # Values[1:] should be the codes themselves
+            # Ensure shape matches: all_vq_codes.shape[-1] == encoded.vq_mask_tokens.sum()
+            num_vq_tokens = encoded.vq_mask_tokens.sum().item()
+            if all_vq_codes.shape[-1] != num_vq_tokens:
+                raise ValueError(
+                    f"VQ codes and mask mismatch: codes.T={all_vq_codes.shape[-1]}, "
+                    f"mask={num_vq_tokens}"
+                )
+
             values[1:, encoded.vq_mask_tokens] = all_vq_codes.to(dtype=torch.long)
 
         if encoded.audio_parts is not None and len(encoded.audio_parts) > 0:

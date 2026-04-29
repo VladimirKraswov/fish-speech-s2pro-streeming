@@ -402,10 +402,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                 )
             elif req.stream_audio:
                 _mark("stream_done", total_segments=len(segments))
-                finished_normally = True
-                self._maybe_cleanup_after_success()
-                return None
-            else:
+            elif not req.stream_audio:
                 audio = np.concatenate(segments, axis=0)
                 _mark("yield_final", total_samples=len(audio), segments=len(segments))
                 yield InferenceResult(
@@ -474,6 +471,11 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         left_context_codes: torch.Tensor | None,
         max_context_frames: int,
     ) -> tuple[np.ndarray, torch.Tensor | None, int]:
+        """
+        Decodes new VQ codes by prepending a small context from previous codes
+        to ensure acoustic continuity. Returns the new audio segment, updated
+        context for the next chunk, and the full size of the decoded buffer.
+        """
         new_codes_cpu = new_codes.detach().cpu()
 
         if left_context_codes is not None and left_context_codes.numel() > 0:
@@ -488,15 +490,21 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             GenerateResponse(action="sample", codes=decode_codes)
         )
 
-        frame_samples = int(getattr(self.decoder_model, "frame_length", 2048))
+        # DAC uses a specific hop length / frame length for its VQ codebooks.
+        # We must align the cropping precisely to this boundary.
+        frame_samples = int(getattr(self.decoder_model, "frame_length", 512))
         context_samples = context_frames * frame_samples
 
         if decoded.size > context_samples:
             decoded_new = decoded[context_samples:]
         else:
-            decoded_new = decoded
+            # If the decoded segment is smaller than context_samples, it means
+            # the decoder didn't produce enough samples or the frame_length is wrong.
+            # We return empty segment to avoid glitches.
+            decoded_new = np.zeros(0, dtype=np.float32)
 
         if max_context_frames > 0:
+            # Take the end of current decoded codes as the context for the next segment.
             next_context = decode_codes_cpu[:, -max_context_frames:].contiguous()
         else:
             next_context = None

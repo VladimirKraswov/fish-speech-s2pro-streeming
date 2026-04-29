@@ -28,14 +28,12 @@ if hasattr(torch._inductor.config, "fx_graph_cache"):
 
 def _to_normal_tensor(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     """
-    Copy tensor so it is not an inference tensor (AOT fails on inplace into inference tensors).
-    detach().clone() inside inference_mode(False) can still yield inference tensors in some PyTorch
-    versions; roundtrip via CPU forces a new allocation and clears the flag.
+    Copy tensor so it is not an inference tensor.
+    Avoids CPU roundtrip for performance.
     """
     if t is None:
         return None
-    with torch.inference_mode(False):
-        return t.detach().cpu().clone().to(t.device)
+    return t.detach().clone()
 
 
 def _iter_no_grad(iterator: Iterator[torch.Tensor]) -> Iterator[torch.Tensor]:
@@ -170,28 +168,21 @@ def decode_n_tokens(
     Generate tokens autoregressively.
     """
 
-    need_normal_state = bool(stream_chunk_size is not None and compile)
+    cur_token = cur_token.detach().clone()
+    input_pos = input_pos.detach().clone()
+    temperature = temperature.detach().clone()
+    top_p = top_p.detach().clone()
+    semantic_logit_bias = semantic_logit_bias.detach().clone()
 
-    if need_normal_state:
-        cur_token = cast(torch.Tensor, _to_normal_tensor(cur_token))
-        input_pos = cast(torch.Tensor, _to_normal_tensor(input_pos))
-        temperature = cast(torch.Tensor, _to_normal_tensor(temperature))
-        top_p = cast(torch.Tensor, _to_normal_tensor(top_p))
-        semantic_logit_bias = cast(torch.Tensor, _to_normal_tensor(semantic_logit_bias))
-        if audio_masks is not None:
-            audio_masks = _to_normal_tensor(audio_masks)
-        if audio_parts is not None:
-            audio_parts = _to_normal_tensor(audio_parts)
+    if audio_masks is not None:
+        audio_masks = audio_masks.detach().clone()
+    if audio_parts is not None:
+        audio_parts = audio_parts.detach().clone()
 
-    _prev_zeros = torch.zeros(
+    previous_tokens = torch.zeros(
         (model.config.num_codebooks + 1, RAS_WIN_SIZE),
         dtype=torch.int,
         device=cur_token.device,
-    )
-    previous_tokens = (
-        cast(torch.Tensor, _to_normal_tensor(_prev_zeros))
-        if need_normal_state
-        else _prev_zeros
     )
 
     new_tokens: list[torch.Tensor] = []
@@ -204,13 +195,7 @@ def decode_n_tokens(
         stream_chunk_size = max(1, int(stream_chunk_size))
 
         if initial_token_chunk is not None:
-            if need_normal_state:
-                initial_token_chunk = cast(
-                    torch.Tensor, _to_normal_tensor(initial_token_chunk)
-                )
-            else:
-                initial_token_chunk = initial_token_chunk.detach().clone()
-            new_tokens.append(initial_token_chunk)
+            new_tokens.append(initial_token_chunk.detach().clone())
 
     im_end_id = model.tokenizer.get_token_id(IM_END_TOKEN)
     do_stream_log = stream_chunk_size is not None
@@ -261,28 +246,15 @@ def decode_n_tokens(
             )
             raise
 
-        if need_normal_state:
-            next_token = cast(torch.Tensor, _to_normal_tensor(next_token))
-            input_pos = cast(torch.Tensor, _to_normal_tensor(input_pos + 1))
-            cur_token = cast(
-                torch.Tensor,
-                _to_normal_tensor(
-                    next_token.view(1, model.config.num_codebooks + 1, -1)
-                ),
-            )
-            previous_tokens = cast(
-                torch.Tensor, _to_normal_tensor(previous_tokens.roll(-1, dims=1))
-            )
-            prev_col = next_token.view(model.config.num_codebooks + 1, -1)[:, 0]
-            previous_tokens[:, -1].copy_(prev_col)
-        else:
-            next_token = next_token.detach().clone()
-            input_pos = (input_pos + 1).detach().clone()
-            cur_token = next_token.view(1, model.config.num_codebooks + 1, -1).clone()
-            previous_tokens = previous_tokens.roll(-1, dims=1)
-            previous_tokens[:, -1] = next_token.view(
-                model.config.num_codebooks + 1, -1
-            )[:, 0].clone()
+        next_token = next_token.detach().clone()
+        input_pos = (input_pos + 1).detach().clone()
+        cur_token = next_token.view(1, model.config.num_codebooks + 1, -1).clone()
+
+        # Update previous tokens for RAS window without inplace operations
+        prev_col = next_token.view(model.config.num_codebooks + 1, -1)[:, :1]
+        previous_tokens = torch.cat(
+            [previous_tokens[:, 1:], prev_col], dim=1
+        ).detach().clone()
 
         new_tokens.append(next_token)
 
@@ -334,6 +306,9 @@ def generate(
     """
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
     """
+
+    if num_samples != 1:
+        raise ValueError("num_samples > 1 is not supported in this inference path")
 
     T = prompt.size(1)
     prompt = prompt[None].repeat(num_samples, 1, 1)

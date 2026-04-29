@@ -27,7 +27,7 @@ class ModelConfig(BaseModel):
     precision: str = "bfloat16"
     compile: bool = True
     cache_max_seq_len: int = Field(768, ge=1)
-    max_new_tokens_cap: int = Field(128, ge=1)
+    max_new_tokens_cap: int = Field(256, ge=1)
     sdpa_math: bool = False
 
     cleanup_after_request: bool = False
@@ -43,8 +43,8 @@ class ModelConfig(BaseModel):
 
     # Long-form settings
     long_form_auto_split: bool = True
-    long_form_target_chars: int = Field(220, ge=40)
-    long_form_max_chars: int = Field(320, ge=80)
+    long_form_target_chars: int = Field(160, ge=40)
+    long_form_max_chars: int = Field(240, ge=80)
     long_form_context_policy: str = "tail_frames"
     long_form_tail_frames: int = Field(48, ge=0)
     long_form_max_history_segments: int = Field(1, ge=0)

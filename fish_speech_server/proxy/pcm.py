@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -98,6 +99,90 @@ class SessionFlushRequest(BaseModel):
 class SessionFinishRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     reason: str = Field("input_finished", min_length=1, max_length=200)
+
+
+@dataclass
+class IntroCacheEntry:
+    key: str
+    created_at: float
+    expires_at: float
+    audio_meta: dict[str, Any]
+    pcm: bytes
+    text: str
+
+
+class IntroCache:
+    def __init__(self) -> None:
+        self._items: dict[str, IntroCacheEntry] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._lock = asyncio.Lock()
+
+    async def get_or_create(
+        self,
+        *,
+        key: str,
+        text: str,
+        config: ProxyConfig,
+        client: httpx.AsyncClient,
+    ) -> IntroCacheEntry | None:
+        if not config.intro_cache.enabled or not text.strip():
+            return None
+
+        now = time.time()
+
+        async with self._lock:
+            entry = self._items.get(key)
+            if entry and entry.expires_at > now:
+                return entry
+
+            if key not in self._locks:
+                self._locks[key] = asyncio.Lock()
+            lock = self._locks[key]
+
+        async with lock:
+            async with self._lock:
+                entry = self._items.get(key)
+                if entry and entry.expires_at > now:
+                    return entry
+
+            try:
+                entry = await _generate_intro_cache_entry(
+                    key=key,
+                    text=text,
+                    config=config,
+                    client=client,
+                )
+            except Exception as exc:
+                logger.error(
+                    "failed to generate intro cache for key=%s: %s", key[:8], exc
+                )
+                raise
+
+            async with self._lock:
+                if (
+                    len(self._items) >= config.intro_cache.max_entries
+                    and key not in self._items
+                ):
+                    oldest_key = min(
+                        self._items.keys(), key=lambda k: self._items[k].created_at
+                    )
+                    self._items.pop(oldest_key, None)
+                    self._locks.pop(oldest_key, None)
+
+                self._items[key] = entry
+                return entry
+
+    async def clear(self) -> None:
+        async with self._lock:
+            self._items.clear()
+            self._locks.clear()
+            logger.info("intro cache cleared")
+
+    def list_entries(self) -> list[IntroCacheEntry]:
+        return list(self._items.values())
+
+    def count(self) -> int:
+        return len(self._items)
 
 
 @dataclass
@@ -260,6 +345,7 @@ class SessionStore:
 
 
 session_store = SessionStore()
+intro_cache = IntroCache()
 
 
 def _schedule_close_upstream_synthesis_session(
@@ -590,6 +676,234 @@ def _right_trim_committed(text: str) -> str:
 
 def _normalize_tail_after_commit(text: str) -> str:
     return text.lstrip()
+
+
+def _intro_cache_key(config: ProxyConfig) -> str:
+    tts = config.tts
+    payload = {
+        "text": config.intro_cache.text,
+        "reference_id": tts.reference_id or config.default_reference_id,
+        "seed": tts.seed,
+        "normalize": tts.normalize,
+        "use_memory_cache": tts.use_memory_cache,
+        "max_new_tokens": tts.max_new_tokens,
+        "chunk_length": tts.chunk_length,
+        "top_p": tts.top_p,
+        "repetition_penalty": tts.repetition_penalty,
+        "temperature": tts.temperature,
+        "stream_tokens": tts.stream_tokens,
+        "initial_stream_chunk_size": tts.initial_stream_chunk_size,
+        "stream_chunk_size": tts.stream_chunk_size,
+        "upstream_url": UPSTREAM_TTS_URL,
+    }
+    dump = json.dumps(payload, sort_keys=True)
+    return hashlib.sha256(dump.encode("utf-8")).hexdigest()
+
+
+async def _generate_intro_cache_entry(
+    *,
+    key: str,
+    text: str,
+    config: ProxyConfig,
+    client: httpx.AsyncClient,
+) -> IntroCacheEntry:
+    payload = build_upstream_payload(text=text, config=config, commit_seq=1)
+
+    logger.info(
+        "generating intro cache key=%s text=%r ref=%s",
+        key[:8],
+        text[:100],
+        payload["reference_id"],
+    )
+
+    # force stateless /v1/tts
+    url = UPSTREAM_TTS_URL
+
+    async with client.stream(
+        "POST",
+        url,
+        json=payload,
+        headers=_auth_headers(),
+    ) as upstream:
+        if upstream.status_code != 200:
+            text_body = await upstream.aread()
+            msg = text_body.decode("utf-8", errors="replace")
+            raise RuntimeError(f"intro generation failed status={upstream.status_code}: {msg}")
+
+        header_buffer = bytearray()
+        pcm_buffer = bytearray()
+        header_sent = False
+        parsed_meta = None
+        data_offset = 0
+
+        async for chunk in upstream.aiter_raw(1024):
+            if not header_sent:
+                header_buffer.extend(chunk)
+                parsed = _parse_wav_header(header_buffer)
+                if parsed:
+                    sample_rate, channels, bits_per_sample, data_offset = parsed
+                    if bits_per_sample != 16:
+                        raise RuntimeError(f"unsupported bits_per_sample={bits_per_sample}")
+                    parsed_meta = {
+                        "sample_rate": sample_rate,
+                        "channels": channels,
+                        "sample_width": bits_per_sample // 8,
+                    }
+                    pcm_buffer.extend(header_buffer[data_offset:])
+                    header_sent = True
+            else:
+                pcm_buffer.extend(chunk)
+
+    if not header_sent or parsed_meta is None:
+        raise RuntimeError("upstream finished before WAV data header was parsed")
+
+    pcm = bytes(pcm_buffer)
+    if not pcm:
+        raise RuntimeError("upstream returned empty PCM for intro")
+
+    now = time.time()
+    return IntroCacheEntry(
+        key=key,
+        created_at=now,
+        expires_at=now + config.intro_cache.ttl_sec,
+        audio_meta=parsed_meta,
+        pcm=pcm,
+        text=text,
+    )
+
+
+async def emit_intro_cache(
+    *,
+    rec: SessionRecord,
+    config: ProxyConfig,
+    client: httpx.AsyncClient,
+    req_id: str,
+) -> AsyncGenerator[bytes, None]:
+    async def emit(obj: dict[str, Any]) -> bytes:
+        return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+
+    key = _intro_cache_key(config)
+    entry = await intro_cache.get_or_create(
+        key=key,
+        text=config.intro_cache.text,
+        config=config,
+        client=client,
+    )
+
+    if entry is None:
+        return
+
+    # Check if meta matches if already set
+    if rec.audio_meta is not None:
+        for k, v in entry.audio_meta.items():
+            if rec.audio_meta.get(k) != v:
+                logger.warning("intro meta mismatch session=%s", rec.session_id[:8])
+                yield await emit(
+                    {
+                        "type": "intro_error",
+                        "session_id": rec.session_id,
+                        "message": "intro audio format mismatch with session format",
+                    }
+                )
+                return
+
+    yield await emit(
+        {
+            "type": "intro_start",
+            "req_id": req_id,
+            "session_id": rec.session_id,
+            "cache_key": entry.key,
+            "text_preview": entry.text[:180],
+            "text_len": len(entry.text),
+        }
+    )
+
+    if rec.audio_meta is None:
+        rec.audio_meta = entry.audio_meta
+        yield await emit(
+            {
+                "type": "meta",
+                "session_id": rec.session_id,
+                "commit_seq": 0,
+                **rec.audio_meta,
+            }
+        )
+
+    pcm = entry.pcm
+    frame_bytes = rec.audio_meta["channels"] * rec.audio_meta["sample_width"]
+    chunk_size = config.intro_cache.emit_bytes
+    chunk_size = _align_down(chunk_size, frame_bytes)
+    if chunk_size <= 0:
+        chunk_size = frame_bytes
+
+    total_emitted = 0
+    for i in range(0, len(pcm), chunk_size):
+        chunk = pcm[i : i + chunk_size]
+        if not chunk:
+            continue
+
+        pcm_seq = rec.next_pcm_seq
+        rec.next_pcm_seq += 1
+        total_emitted += len(chunk)
+
+        yield await emit(
+            {
+                "type": "pcm",
+                "req_id": req_id,
+                "session_id": rec.session_id,
+                "commit_seq": 0,
+                "seq": pcm_seq,
+                "first_pcm_for_commit": (i == 0),
+                "intro": True,
+                "data": base64.b64encode(chunk).decode("ascii"),
+            }
+        )
+        await asyncio.sleep(0)
+
+    if config.intro_cache.pause_after_ms > 0:
+        pause_ms = config.intro_cache.pause_after_ms
+        silence = _pcm_silence_bytes(
+            sample_rate=rec.audio_meta["sample_rate"],
+            channels=rec.audio_meta["channels"],
+            bits_per_sample=rec.audio_meta["sample_width"] * 8,
+            duration_ms=pause_ms,
+        )
+        if silence:
+            pcm_seq = rec.next_pcm_seq
+            rec.next_pcm_seq += 1
+            yield await emit(
+                {
+                    "type": "pcm",
+                    "req_id": req_id,
+                    "session_id": rec.session_id,
+                    "commit_seq": 0,
+                    "seq": pcm_seq,
+                    "first_pcm_for_commit": False,
+                    "intro": True,
+                    "data": base64.b64encode(silence).decode("ascii"),
+                }
+            )
+
+        yield await emit(
+            {
+                "type": "pause",
+                "req_id": req_id,
+                "session_id": rec.session_id,
+                "commit_seq": 0,
+                "boundary": "intro",
+                "pause_ms": pause_ms,
+            }
+        )
+
+    yield await emit(
+        {
+            "type": "intro_done",
+            "req_id": req_id,
+            "session_id": rec.session_id,
+            "cache_key": entry.key,
+            "pcm_bytes": total_emitted,
+        }
+    )
 
 
 def _safe_hard_cut(text: str, limit: int, min_keep: int) -> int:
@@ -1114,6 +1428,36 @@ async def health() -> dict[str, Any]:
     return {"ok": True, **stats}
 
 
+@app.get("/intro-cache/stats")
+async def intro_cache_stats() -> JSONResponse:
+    now = time.time()
+    entries = intro_cache.list_entries()
+    return JSONResponse(
+        {
+            "ok": True,
+            "entries": len(entries),
+            "max_entries": _RUNTIME.proxy.intro_cache.max_entries,
+            "items": [
+                {
+                    "key": entry.key,
+                    "age_sec": round(now - entry.created_at, 1),
+                    "expires_in_sec": round(max(0, entry.expires_at - now), 1),
+                    "pcm_bytes": len(entry.pcm),
+                    "text_preview": entry.text[:180],
+                    "audio_meta": entry.audio_meta,
+                }
+                for entry in entries
+            ],
+        }
+    )
+
+
+@app.post("/intro-cache/clear")
+async def intro_cache_clear() -> JSONResponse:
+    await intro_cache.clear()
+    return JSONResponse({"ok": True, "message": "intro cache cleared"})
+
+
 @app.post("/session/open")
 async def session_open(req: SessionOpenRequest) -> JSONResponse:
     config = normalize_config(req.config_text)
@@ -1151,12 +1495,35 @@ async def session_open(req: SessionOpenRequest) -> JSONResponse:
                     detail=f"failed to open upstream synthesis session: {exc}",
                 )
 
+    if (
+        config.intro_cache.enabled
+        and config.intro_cache.warm_on_session_open
+        and config.intro_cache.text.strip()
+    ):
+        try:
+            async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
+                await intro_cache.get_or_create(
+                    key=_intro_cache_key(config),
+                    text=config.intro_cache.text,
+                    config=config,
+                    client=client,
+                )
+        except Exception as exc:
+            if not config.intro_cache.ignore_errors:
+                await session_store.close(rec.session_id)
+                raise HTTPException(
+                    502,
+                    detail=f"failed to warm intro cache: {exc}",
+                )
+            logger.warning("failed to warm intro cache for session %s: %s", rec.session_id[:8], exc)
+
     logger.info(
-        "session open id=%s ref=%s emit_bytes=%s stateful=%s",
+        "session open id=%s ref=%s emit_bytes=%s stateful=%s intro_warm=%s",
         rec.session_id[:8],
         config.tts.reference_id,
         config.playback.target_emit_bytes,
         bool(rec.synthesis_session_id),
+        config.intro_cache.warm_on_session_open,
     )
 
     return JSONResponse(
@@ -1819,6 +2186,28 @@ async def session_pcm_stream(session_id: str):
 
             try:
                 async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
+                    if config.intro_cache.enabled and config.intro_cache.text.strip():
+                        try:
+                            async for event in emit_intro_cache(
+                                rec=rec,
+                                config=config,
+                                client=client,
+                                req_id=req_id,
+                            ):
+                                yield event
+                        except Exception as exc:
+                            if not config.intro_cache.ignore_errors:
+                                raise
+                            logger.warning("intro emission failed for session %s: %s", session_id[:8], exc)
+                            yield await emit(
+                                {
+                                    "type": "intro_error",
+                                    "req_id": req_id,
+                                    "session_id": rec.session_id,
+                                    "message": f"intro emission failed: {exc}",
+                                }
+                            )
+
                     while True:
                         item = await rec.commit_queue.get()
 

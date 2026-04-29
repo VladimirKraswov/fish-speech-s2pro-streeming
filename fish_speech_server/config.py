@@ -165,6 +165,36 @@ class SessionRuntimeConfig(BaseModel):
     auto_close_on_finish: bool = False
 
 
+class IntroCacheConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+
+    # Текст, который будет синтезироваться и кэшироваться.
+    # Например: "..."
+    text: str = ""
+
+    # Максимум записей в памяти proxy.
+    max_entries: int = Field(16, ge=1, le=256)
+
+    # TTL записи в секундах.
+    ttl_sec: int = Field(3600, ge=1, le=86400)
+
+    # Если true — при /session/open сразу прогревать intro cache.
+    # Если false — lazy generate при первом /pcm-stream.
+    warm_on_session_open: bool = False
+
+    # Если true — при ошибке генерации intro не валить session,
+    # а просто пропустить intro и продолжить обычный stream.
+    ignore_errors: bool = True
+
+    # Размер PCM чанка для отдачи intro.
+    emit_bytes: int = Field(8192, ge=512, le=65536)
+
+    # Пауза после intro перед первым реальным commit.
+    pause_after_ms: int = Field(0, ge=0, le=3000)
+
+
 class ProxyConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -177,6 +207,7 @@ class ProxyConfig(BaseModel):
     tts: ProxyTTSConfig
     playback: PlaybackConfig
     session: SessionRuntimeConfig
+    intro_cache: IntroCacheConfig = Field(default_factory=IntroCacheConfig)
 
     @model_validator(mode="after")
     def normalize_reference_id(self) -> "ProxyConfig":

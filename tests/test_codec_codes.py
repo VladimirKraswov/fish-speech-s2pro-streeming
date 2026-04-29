@@ -12,6 +12,7 @@ from fish_speech.codec.codes import (
     load_codes_pt,
     normalize_codes,
     save_codes_pt,
+    validate_codes_for_decoder,
 )
 
 
@@ -52,14 +53,14 @@ def test_normalize_codes():
         normalize_codes(None)
 
     # wrong shape [2, 9, 10] -> ValueError
-    with pytest.raises(ValueError, match="Unexpected 3D tensor shape"):
+    with pytest.raises(ValueError, match="unexpected 3D shape"):
         normalize_codes(torch.zeros(2, 9, 10))
 
-    with pytest.raises(ValueError, match="Unexpected tensor ndim"):
+    with pytest.raises(ValueError, match="unexpected ndim"):
         normalize_codes(torch.zeros(10))
 
     # empty T [9, 0] -> ValueError
-    with pytest.raises(ValueError, match="is empty"):
+    with pytest.raises(ValueError, match="zero frames"):
         normalize_codes(torch.zeros(9, 0))
 
     # expected_codebooks mismatch -> ValueError
@@ -72,6 +73,7 @@ def test_crop_codes_tail():
     t = torch.zeros(9, 100)
     cropped = crop_codes_tail(t, 20)
     assert cropped.shape == (9, 20)
+    assert cropped.data_ptr() != t.data_ptr()
 
     # Shorter than max_frames
     cropped = crop_codes_tail(t, 200)
@@ -103,6 +105,23 @@ def test_load_from_bytes():
 
     loaded = load_codes_pt(data)
     assert torch.equal(t, loaded)
+
+
+def test_load_dict_and_tuple_payloads():
+    t = torch.randint(0, 100, (9, 50))
+
+    for payload in ({"codes": t}, {"tokens": t}, {"indices": t}, (t, "meta")):
+        buf = io.BytesIO()
+        torch.save(payload, buf)
+        loaded = load_codes_pt(buf)
+        assert torch.equal(t, loaded)
+
+
+def test_reject_empty_and_batch_gt_one():
+    with pytest.raises(ValueError, match="is empty"):
+        normalize_codes([])
+    with pytest.raises(ValueError, match="unexpected 3D shape"):
+        normalize_codes(torch.zeros(2, 9, 10))
 
 
 class MockQuantizer:
@@ -140,3 +159,43 @@ def test_expected_codebooks_from_decoder():
         pass
 
     assert expected_codebooks_from_decoder(Empty()) is None
+
+
+class MockCodebook:
+    def __init__(self, codebook_size, n_codebooks=None):
+        self.codebook_size = codebook_size
+        self.n_codebooks = n_codebooks
+
+
+class MockDownsampleDecoder:
+    def __init__(self):
+        self.quantizer = type(
+            "DownsampleResidualVectorQuantize",
+            (),
+            {
+                "semantic_quantizer": MockCodebook(codebook_size=4096),
+                "quantizer": MockCodebook(codebook_size=1024, n_codebooks=8),
+            },
+        )()
+
+
+def test_validate_codes_for_decoder_ranges():
+    decoder = MockDownsampleDecoder()
+    codes = torch.zeros((9, 10), dtype=torch.long)
+    codes[0, 0] = 4095
+    codes[1, 0] = 1023
+    out = validate_codes_for_decoder(codes, decoder, name="intro")
+    assert out.shape == (9, 10)
+
+    bad_semantic = codes.clone()
+    bad_semantic[0, 0] = 4096
+    with pytest.raises(ValueError, match="intro semantic codes out of range"):
+        validate_codes_for_decoder(bad_semantic, decoder, name="intro")
+
+    bad_acoustic = codes.clone()
+    bad_acoustic[1, 0] = -1
+    with pytest.raises(ValueError, match="intro acoustic codes out of range"):
+        validate_codes_for_decoder(bad_acoustic, decoder, name="intro")
+
+    with pytest.raises(ValueError, match="codebook count mismatch"):
+        validate_codes_for_decoder(torch.zeros((8, 10)), decoder, name="intro")

@@ -10,11 +10,10 @@ import struct
 import time
 import uuid
 from dataclasses import dataclass, field
-
 from typing import Any, AsyncGenerator, Optional, Tuple
 
 import httpx
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
@@ -33,6 +32,8 @@ if os.getenv("UPSTREAM_TTS_URL"):
     UPSTREAM_TTS_URL = os.getenv("UPSTREAM_TTS_URL")
 
 UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=None)
+FISH_API_KEY = os.getenv("FISH_API_KEY", "").strip()
+
 DEFAULT_REFERENCE_ID = _RUNTIME.proxy.default_reference_id
 SESSION_TTL_SEC = _RUNTIME.proxy.session_ttl_sec
 SESSION_MAX_COUNT = _RUNTIME.proxy.session_max_count
@@ -59,6 +60,18 @@ SHORT_COMPLETE_SENTENCE_MIN_CHARS = 24
 FIRST_COMMIT_TTFA_MIN_CHARS = 6
 
 DEFAULT_SESSION_CONFIG = _RUNTIME.proxy.model_dump(mode="python")
+
+
+def _auth_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
+    headers: dict[str, str] = {}
+
+    if FISH_API_KEY:
+        headers["Authorization"] = f"Bearer {FISH_API_KEY}"
+
+    if extra:
+        headers.update(extra)
+
+    return headers
 
 
 class SessionOpenRequest(BaseModel):
@@ -123,19 +136,43 @@ class SessionStore:
 
     async def cleanup(self) -> None:
         now = time.time()
-        async with self._lock:
-            expired = []
-            for sid, rec in list(self._items.items()):
-                if rec.expires_at <= now and not rec.stream_started:
-                    expired.append(sid)
-                elif rec.expires_at <= now and rec.stream_finished:
-                    expired.append(sid)
+        expired_records: list[SessionRecord] = []
 
-            for sid in expired:
+        async with self._lock:
+            expired_ids = []
+
+            for sid, rec in list(self._items.items()):
+                should_expire = False
+
+                if rec.expires_at <= now and not rec.stream_started:
+                    should_expire = True
+                elif rec.expires_at <= now and rec.stream_finished:
+                    should_expire = True
+
+                if should_expire:
+                    expired_ids.append(sid)
+                    expired_records.append(rec)
+
+            for sid in expired_ids:
                 self._items.pop(sid, None)
 
-            if expired:
-                logger.info("session cleanup removed=%s", len(expired))
+            if expired_ids:
+                logger.info("session cleanup removed=%s", len(expired_ids))
+
+        for rec in expired_records:
+            rec.closed = True
+            _cancel_commit_timer(rec)
+
+            try:
+                rec.commit_queue.put_nowait({"type": "abort"})
+            except Exception:
+                pass
+
+            if rec.synthesis_session_id:
+                _schedule_close_upstream_synthesis_session(
+                    rec.synthesis_session_id,
+                    reason="expired",
+                )
 
     async def create(
         self,
@@ -225,9 +262,42 @@ class SessionStore:
 session_store = SessionStore()
 
 
+def _schedule_close_upstream_synthesis_session(
+    synthesis_session_id: str | None,
+    *,
+    reason: str,
+) -> None:
+    if not synthesis_session_id:
+        return
+
+    async def runner() -> None:
+        try:
+            async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
+                await _close_upstream_synthesis_session(
+                    client,
+                    synthesis_session_id,
+                    reason=reason,
+                )
+        except Exception as exc:
+            logger.warning(
+                "failed to schedule-close upstream synthesis session %s reason=%s: %s",
+                synthesis_session_id[:8],
+                reason,
+                exc,
+            )
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    loop.create_task(runner())
+
+
 def _cancel_commit_timer(rec: SessionRecord) -> None:
     task = rec.commit_timer_task
     rec.commit_timer_task = None
+
     if task is not None and not task.done():
         task.cancel()
 
@@ -239,6 +309,7 @@ def _ensure_commit_timer(rec: SessionRecord) -> None:
         return
     if rec.commit_timer_task is not None and not rec.commit_timer_task.done():
         return
+
     rec.commit_timer_task = asyncio.create_task(_commit_timer_loop(rec.session_id))
 
 
@@ -257,9 +328,8 @@ def _extract_timed_commit(
     is_first_commit = next_commit_seq == 1
     ttfa_min_chars = _first_commit_min_chars(stage)
 
-    # First threshold:
-    # After max_wait_ms, commit only if we have at least min_chars.
     wait_min_chars = ttfa_min_chars if is_first_commit else stage.min_chars
+
     if elapsed_ms >= stage.max_wait_ms and text_len >= wait_min_chars:
         if is_first_commit:
             cut = _safe_partial_cut_for_ttfa(
@@ -268,6 +338,7 @@ def _extract_timed_commit(
                 max_chars=stage.max_chars,
                 allow_inside_word=False,
             )
+
             if cut is None:
                 if elapsed_ms < stage.allow_partial_after_ms:
                     return [], buffer_text
@@ -306,8 +377,6 @@ def _extract_timed_commit(
             if piece:
                 return [(piece, reason)], remainder
 
-    # Second threshold:
-    # After allow_partial_after_ms, commit even if min_chars was not reached.
     if elapsed_ms >= stage.allow_partial_after_ms:
         if is_first_commit:
             cut = _safe_partial_cut_for_ttfa(
@@ -316,6 +385,7 @@ def _extract_timed_commit(
                 max_chars=stage.max_chars,
                 allow_inside_word=True,
             )
+
             if cut is None:
                 return [], buffer_text
 
@@ -424,7 +494,7 @@ def build_upstream_payload(
     commit_seq: int | None = None,
 ) -> dict[str, Any]:
     tts = config.tts
-    reference_id = tts.reference_id.strip() or config.default_reference_id
+    reference_id = (tts.reference_id or "").strip() or config.default_reference_id
 
     payload = {
         "text": text,
@@ -523,12 +593,6 @@ def _normalize_tail_after_commit(text: str) -> str:
 
 
 def _safe_hard_cut(text: str, limit: int, min_keep: int) -> int:
-    """
-    Не режем слово посередине при hard_limit.
-
-    Если до limit есть пробел после min_keep — режем по последнему пробелу.
-    Если нормального пробела нет — режем ровно по limit.
-    """
     if len(text) <= limit:
         return len(text)
 
@@ -567,7 +631,6 @@ def _safe_partial_cut_for_ttfa(
     if limit < min_chars and not allow_inside_word:
         return None
 
-    # punctuation candidates: only end >= min_chars
     punctuation_candidates: list[int] = []
     for match in SENTENCE_BOUNDARY_RE.finditer(prefix):
         punctuation_candidates.append(match.end())
@@ -580,7 +643,6 @@ def _safe_partial_cut_for_ttfa(
     if valid_punctuation:
         return min(valid_punctuation), "ttfa_boundary"
 
-    # whitespace candidates: only end >= min_chars
     for match in re.finditer(r"\s+", prefix):
         end = match.end()
         if min_chars <= end <= limit:
@@ -626,6 +688,7 @@ def _pcm_silence_bytes(
 ) -> bytes:
     if duration_ms <= 0:
         return b""
+
     frame_bytes = channels * (bits_per_sample // 8)
     frames = int(sample_rate * duration_ms / 1000.0)
     return b"\x00" * (frames * frame_bytes)
@@ -698,7 +761,7 @@ def _apply_pcm16_fade(
     if channels <= 0:
         return pcm
 
-    frame_bytes = channels * 2  # PCM16 little-endian
+    frame_bytes = channels * 2
     usable_len = len(pcm) - (len(pcm) % frame_bytes)
 
     if usable_len <= 0:
@@ -817,6 +880,7 @@ def _extract_commits(
                 max_chars=stage.max_chars,
                 allow_inside_word=False,
             )
+
             if cut is None:
                 break
 
@@ -923,7 +987,7 @@ async def _open_upstream_synthesis_session(
     resp = await client.post(
         UPSTREAM_TTS_URL.replace("/v1/tts", "/v1/synthesis/sessions/open"),
         json=open_payload,
-        headers={"Accept": "application/json"},
+        headers=_auth_headers({"Accept": "application/json"}),
     )
 
     if resp.status_code != 200:
@@ -942,6 +1006,8 @@ async def _open_upstream_synthesis_session(
 async def _close_upstream_synthesis_session(
     client: httpx.AsyncClient,
     synthesis_session_id: str | None,
+    *,
+    reason: str = "close",
 ) -> None:
     if not synthesis_session_id:
         return
@@ -950,12 +1016,13 @@ async def _close_upstream_synthesis_session(
         await client.post(
             UPSTREAM_TTS_URL.replace("/v1/tts", "/v1/synthesis/sessions/close"),
             json=synthesis_session_id,
-            headers={"Accept": "application/json"},
+            headers=_auth_headers({"Accept": "application/json"}),
         )
     except Exception as exc:
         logger.warning(
-            "failed to close upstream synthesis session %s during reset: %s",
+            "failed to close upstream synthesis session %s reason=%s: %s",
             synthesis_session_id[:8],
+            reason,
             exc,
         )
 
@@ -1037,6 +1104,7 @@ async def root() -> dict[str, Any]:
         "version": app.version,
         "upstream_tts_url": UPSTREAM_TTS_URL,
         "default_reference_id": DEFAULT_REFERENCE_ID,
+        "auth_enabled": bool(FISH_API_KEY),
     }
 
 
@@ -1055,7 +1123,9 @@ async def session_open(req: SessionOpenRequest) -> JSONResponse:
         try:
             async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
                 rec.synthesis_session_id = await _open_upstream_synthesis_session(
-                    client, rec, config
+                    client,
+                    rec,
+                    config,
                 )
 
                 logger.info(
@@ -1283,18 +1353,11 @@ async def session_close(req: SessionCloseRequest) -> JSONResponse:
     rec = await session_store.get(req.session_id, touch=False)
 
     if rec and rec.synthesis_session_id:
-        try:
-            async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
-                await client.post(
-                    UPSTREAM_TTS_URL.replace("/v1/tts", "/v1/synthesis/sessions/close"),
-                    json=rec.synthesis_session_id,
-                    headers={"Accept": "application/json"},
-                )
-        except Exception as exc:
-            logger.warning(
-                "failed to close upstream synthesis session %s: %s",
+        async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
+            await _close_upstream_synthesis_session(
+                client,
                 rec.synthesis_session_id,
-                exc,
+                reason="manual_close",
             )
 
     removed = await session_store.close(req.session_id)
@@ -1331,6 +1394,7 @@ async def session_pcm_stream(session_id: str):
     ) -> AsyncGenerator[bytes, None]:
         commit_seq = int(commit_item["seq"])
         is_first_commit = commit_seq == 1
+
         effective_target_emit_bytes = (
             config.playback.first_commit_target_emit_bytes
             if is_first_commit
@@ -1343,15 +1407,16 @@ async def session_pcm_stream(session_id: str):
         )
 
         should_reset, reset_reason = _should_reset_upstream_session(
-            rec, config, commit_item
+            rec,
+            config,
+            commit_item,
         )
 
         if should_reset:
             old_id = rec.synthesis_session_id
+
             try:
-                new_id = await _open_upstream_synthesis_session(
-                    client, rec, config
-                )
+                new_id = await _open_upstream_synthesis_session(client, rec, config)
                 rec.synthesis_session_id = new_id
                 rec.chars_since_upstream_reset = 0
                 rec.last_upstream_reset_commit_seq = commit_item["seq"]
@@ -1376,8 +1441,11 @@ async def session_pcm_stream(session_id: str):
                     }
                 )
 
-                # Best-effort close old session
-                await _close_upstream_synthesis_session(client, old_id)
+                await _close_upstream_synthesis_session(
+                    client,
+                    old_id,
+                    reason=reset_reason,
+                )
 
             except Exception as exc:
                 logger.warning(
@@ -1424,9 +1492,9 @@ async def session_pcm_stream(session_id: str):
         start_buffer_bytes = 0
 
         fade_in_applied = False
-        sample_rate = None
-        channels = None
-        bits_per_sample = None
+        sample_rate = 0
+        channels = 0
+        bits_per_sample = 0
         frame_bytes = 2
         tail_hold_bytes = 0
         fade_in_bytes = 0
@@ -1439,7 +1507,6 @@ async def session_pcm_stream(session_id: str):
                 if not pending_pcm:
                     return
 
-                # Перед первой отдачей применить fade-in к началу commit audio.
                 if (
                     config.playback.boundary_smoothing_enabled
                     and not fade_in_applied
@@ -1532,7 +1599,12 @@ async def session_pcm_stream(session_id: str):
             commit_item["text"][:180],
         )
 
-        async with client.stream("POST", url, json=payload) as upstream:
+        async with client.stream(
+            "POST",
+            url,
+            json=payload,
+            headers=_auth_headers(),
+        ) as upstream:
             if upstream.status_code != 200:
                 text_body = await upstream.aread()
                 msg = text_body.decode("utf-8", errors="replace")
@@ -1598,10 +1670,7 @@ async def session_pcm_stream(session_id: str):
                         bits_per_sample,
                         effective_start_buffer_ms,
                     )
-
-                    start_buffer_bytes = _align_down(
-                        start_buffer_bytes, frame_bytes
-                    )
+                    start_buffer_bytes = _align_down(start_buffer_bytes, frame_bytes)
 
                     header_sent = True
 
@@ -1653,7 +1722,6 @@ async def session_pcm_stream(session_id: str):
             and pending_pcm
             and fade_out_bytes > 0
         ):
-            # fade-out только на реальном аудио, ДО добавления тишины
             tail_len = min(len(pending_pcm), fade_out_bytes)
             tail_len = _align_down(tail_len, frame_bytes)
 
@@ -1809,7 +1877,15 @@ async def session_pcm_stream(session_id: str):
             )
 
             if config.session.auto_close_on_finish:
-                await session_store.close(rec.session_id)
+                try:
+                    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
+                        await _close_upstream_synthesis_session(
+                            client,
+                            rec.synthesis_session_id,
+                            reason="auto_close_on_finish",
+                        )
+                finally:
+                    await session_store.close(rec.session_id)
 
     return StreamingResponse(
         body_iter(),
@@ -1841,9 +1917,9 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
         first_emit_done = False
 
         fade_in_applied = False
-        sample_rate = None
-        channels = None
-        bits_per_sample = None
+        sample_rate = 0
+        channels = 0
+        bits_per_sample = 0
         frame_bytes = 2
         tail_hold_bytes = 0
         fade_in_bytes = 0
@@ -1856,7 +1932,6 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
                 if not pending_pcm:
                     return
 
-                # Перед первой отдачей применить fade-in к началу audio.
                 if (
                     config.playback.boundary_smoothing_enabled
                     and not fade_in_applied
@@ -1920,6 +1995,7 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
 
                 pcm_seq += 1
                 first_emit_done = True
+                await asyncio.sleep(0)
 
         yield await emit(
             {
@@ -1944,7 +2020,12 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
         )
 
         async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
-            async with client.stream("POST", UPSTREAM_TTS_URL, json=payload) as upstream:
+            async with client.stream(
+                "POST",
+                UPSTREAM_TTS_URL,
+                json=payload,
+                headers=_auth_headers(),
+            ) as upstream:
                 if upstream.status_code != 200:
                     msg = (await upstream.aread()).decode("utf-8", errors="replace")
                     yield await emit(
@@ -1968,6 +2049,18 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
                             continue
 
                         sample_rate, channels, bits_per_sample, data_offset = parsed
+
+                        if bits_per_sample != 16:
+                            yield await emit(
+                                {
+                                    "type": "error",
+                                    "req_id": req_id,
+                                    "message": (
+                                        f"unsupported bits_per_sample={bits_per_sample}"
+                                    ),
+                                }
+                            )
+                            return
 
                         header_sent = True
                         frame_bytes = channels * (bits_per_sample // 8)
@@ -2004,10 +2097,7 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
                             bits_per_sample,
                             effective_start_buffer_ms,
                         )
-
-                        start_buffer_bytes = _align_down(
-                            start_buffer_bytes, frame_bytes
-                        )
+                        start_buffer_bytes = _align_down(start_buffer_bytes, frame_bytes)
 
                         yield await emit(
                             {
@@ -2033,6 +2123,16 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
 
                         async for event in flush_pending():
                             yield event
+
+        if not header_sent:
+            yield await emit(
+                {
+                    "type": "error",
+                    "req_id": req_id,
+                    "message": "upstream finished before WAV data header was parsed",
+                }
+            )
+            return
 
         boundary_kind, pause_ms = _pause_ms_for_commit(
             text,

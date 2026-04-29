@@ -1,5 +1,4 @@
 from http import HTTPStatus
-
 from typing import Any
 
 import numpy as np
@@ -17,18 +16,38 @@ from fish_speech_server.services.adapter import api_tts_to_driver_request
 from fish_speech_server.services.audio import wav_chunk_header
 from fish_speech_server.schema import ServeTTSRequest
 
-# float аудио в диапазоне [-1.0, 1.0] -> int16 PCM
-AMPLITUDE = 32768
+
+def float_audio_to_pcm16_bytes(audio: np.ndarray | bytes | bytearray) -> bytes:
+    """
+    Convert float audio in [-1.0, 1.0] to little-endian PCM16 safely.
+
+    Important: multiplying by 32768 and casting directly can overflow 1.0 to
+    -32768. We clip and use 32767.0 instead.
+    """
+    if isinstance(audio, (bytes, bytearray)):
+        return bytes(audio)
+
+    arr = np.asarray(audio, dtype=np.float32)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=-1.0)
+    arr = np.clip(arr, -1.0, 1.0)
+    return (arr * 32767.0).astype("<i2").tobytes()
 
 
 def inference_wrapper(
-    req: ServeTTSRequest | DriverSynthesisRequest | Any, driver: FishSpeechDriver
+    req: ServeTTSRequest | DriverSynthesisRequest | Any,
+    driver: FishSpeechDriver,
 ):
     """
-    Wrapper for the inference function.
-    Used in the API server.
+    Wrapper for the inference function used in the API server.
+
+    Streaming mode emits:
+    - one WAV header;
+    - raw PCM16 chunks;
+    - token events internally when stateful mode asks for them.
+
+    Non-streaming mode emits a single PCM16 payload.
     """
-    count = 0
+    audio_chunk_count = 0
 
     if isinstance(req, DriverSynthesisRequest):
         driver_req = req
@@ -49,31 +68,25 @@ def inference_wrapper(
                 )
 
             case DriverAudioChunkEvent():
-                count += 1
-                yield (event.audio * AMPLITUDE).astype(np.int16).tobytes()
+                audio_chunk_count += 1
+                yield float_audio_to_pcm16_bytes(event.audio)
 
             case DriverTokenChunkEvent():
-                # Propagate codes for stateful session tracking
+                # Propagate codes for stateful session tracking.
                 yield event
 
             case DriverFinalAudioEvent():
-                # В streaming-режиме final содержит полную собранную дорожку.
-                # Сегменты уже были отправлены ранее, поэтому финал нельзя
-                # отдавать повторно. Но и завершать генератор здесь тоже нельзя:
-                # иначе driver inference не успевает выставить finished_normally,
-                # и finally-ветка ошибочно запускает cleanup_on_abort.
+                # In streaming mode chunks have already been sent. Do not send
+                # the final full track again, but keep consuming the generator so
+                # the driver can finish normally instead of treating it as abort.
                 if streaming:
                     continue
 
-                count += 1
-                final = event.audio
-                if isinstance(final, np.ndarray):
-                    yield (final * AMPLITUDE).astype(np.int16).tobytes()
-                elif isinstance(final, (bytes, bytearray)):
-                    yield bytes(final)
+                audio_chunk_count += 1
+                yield float_audio_to_pcm16_bytes(event.audio)
                 return None
 
-    if count == 0:
+    if audio_chunk_count == 0:
         raise HTTPException(
             HTTPStatus.INTERNAL_SERVER_ERROR,
             content="No audio generated, please check the input text.",

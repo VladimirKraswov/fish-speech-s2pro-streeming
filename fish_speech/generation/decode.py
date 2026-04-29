@@ -26,6 +26,7 @@ torch._inductor.config.triton.unique_kernel_names = True
 if hasattr(torch._inductor.config, "fx_graph_cache"):
     torch._inductor.config.fx_graph_cache = True
 
+
 def _to_normal_tensor(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     """
     Copy tensor so it is not an inference tensor.
@@ -59,6 +60,33 @@ def _model_im_end_id(model: BaseTransformer) -> int:
     if im_end_id < 0 or im_end_id >= model.config.vocab_size:
         raise RuntimeError("Model sampling buffers are missing a valid IM_END token id")
     return im_end_id
+
+
+def _mask_logits_to_max_exclusive(
+    logits: torch.Tensor,
+    max_exclusive: int | None,
+) -> torch.Tensor:
+    """
+    Restrict logits to ids [0, max_exclusive).
+
+    Used for S2-Pro style DAC where the semantic row may need 4096 ids, while
+    acoustic rows must stay inside 1024 ids. Masking here prevents invalid
+    acoustic codes instead of allowing decoder-side clamp or late validation
+    failures.
+    """
+    if max_exclusive is None:
+        return logits
+
+    max_exclusive = int(max_exclusive)
+    vocab_size = int(logits.shape[-1])
+    if max_exclusive <= 0 or max_exclusive >= vocab_size:
+        return logits
+
+    blocked = torch.arange(vocab_size, device=logits.device) >= max_exclusive
+    while blocked.ndim < logits.ndim:
+        blocked = blocked.unsqueeze(0)
+
+    return logits.masked_fill(blocked, float("-inf"))
 
 
 def decode_one_token_ar(
@@ -131,13 +159,18 @@ def decode_one_token_ar(
     hidden_states = model.fast_embeddings(a)
     codebooks.append(a)
 
+    acoustic_codebook_size = getattr(model, "acoustic_codebook_size_for_sampling", None)
+
     for codebook_idx in range(1, model.config.num_codebooks):
         input_pos = torch.tensor(
             [codebook_idx], device=hidden_states.device, dtype=torch.long
         )
         logits = model.forward_generate_fast(hidden_states, input_pos)
 
-        short_logits = logits
+        short_logits = _mask_logits_to_max_exclusive(
+            logits,
+            acoustic_codebook_size,
+        )
         a = sample(
             short_logits,
             temperature=temperature,

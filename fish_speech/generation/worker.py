@@ -52,9 +52,15 @@ def launch_thread_safe_queue(
     compile: bool = False,
     memory_info: dict | None = None,
     expected_num_codebooks: int | None = None,
+    acoustic_codebook_size: int | None = None,
 ):
     """
-    memory_info: optional shared dict; worker will set llama_param_gb, llama_param_count after load.
+    memory_info: optional shared dict; worker will set llama_param_gb,
+    llama_param_count after load.
+
+    acoustic_codebook_size: optional decoder acoustic codebook size. For S2-Pro
+    style models semantic codes may use a wider vocab than acoustic rows, so
+    acoustic logits must be masked during generation.
     """
     input_queue = queue.Queue()
     init_event = threading.Event()
@@ -98,6 +104,20 @@ def launch_thread_safe_queue(
                     f"Codebook mismatch: LLaMA num_codebooks={model.config.num_codebooks}, "
                     f"decoder expected={expected_num_codebooks}"
                 )
+
+            if acoustic_codebook_size is not None:
+                acoustic_size = int(acoustic_codebook_size)
+                if acoustic_size <= 0:
+                    raise ValueError(
+                        f"acoustic_codebook_size must be positive, got {acoustic_size}"
+                    )
+                model.acoustic_codebook_size_for_sampling = acoustic_size
+                logger.info(
+                    "Acoustic codebook sampling limit: {} / fast_vocab={}",
+                    acoustic_size,
+                    model.config.codebook_size,
+                )
+
             cache_len = _cache_max_seq_len(model)
             logger.info(
                 "KV cache max_seq_len={} (model max={})",

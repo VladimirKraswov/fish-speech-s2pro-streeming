@@ -1,3 +1,4 @@
+import asyncio
 from argparse import ArgumentParser, BooleanOptionalAction
 from http import HTTPStatus
 from typing import Annotated, Any
@@ -71,13 +72,16 @@ class MsgPackRequest(HttpRequest):
         ContentType("application/json"),
         ContentType("multipart/form-data"),
     ]:
-        if self.content_type == "application/msgpack":
+        content_type = str(getattr(self, "content_type", "") or "")
+        content_type = content_type.split(";", 1)[0].strip().lower()
+
+        if content_type == "application/msgpack":
             return ormsgpack.unpackb(await self.body)
 
-        elif self.content_type == "application/json":
+        if content_type == "application/json":
             return await self.json
 
-        elif self.content_type == "multipart/form-data":
+        if content_type == "multipart/form-data":
             return await self.form
 
         raise HTTPException(
@@ -89,18 +93,23 @@ class MsgPackRequest(HttpRequest):
 
 
 async def inference_async(
-    req: ServeTTSRequest | Any, driver: FishSpeechDriver, yield_tokens: bool = False
+    req: ServeTTSRequest | Any,
+    driver: FishSpeechDriver,
+    yield_tokens: bool = False,
 ):
     """
-    Asynchronous generator that wraps the inference function.
-    If yield_tokens is True, it will also yield DriverTokenChunkEvent objects.
-    Otherwise, it only yields bytes (audio chunks) for compatibility with HTTP responses.
+    Async generator wrapper around sync driver inference.
+
+    If yield_tokens=True, DriverTokenChunkEvent objects are propagated for
+    stateful history tracking. Otherwise only audio bytes are yielded.
     """
     for chunk in inference(req, driver):
         if isinstance(chunk, bytes):
             yield chunk
+            await asyncio.sleep(0)
         elif yield_tokens and isinstance(chunk, DriverTokenChunkEvent):
             yield chunk
+            await asyncio.sleep(0)
 
 
 async def buffer_to_async_generator(buffer):
@@ -108,20 +117,25 @@ async def buffer_to_async_generator(buffer):
 
 
 def get_content_type(audio_format):
+    audio_format = str(audio_format).strip().lower()
+
     if audio_format == "wav":
         return "audio/wav"
-    elif audio_format == "flac":
+    if audio_format == "flac":
         return "audio/flac"
-    elif audio_format == "mp3":
+    if audio_format == "mp3":
         return "audio/mpeg"
-    else:
-        return "application/octet-stream"
+    if audio_format == "pcm":
+        return "audio/pcm"
+
+    return "application/octet-stream"
 
 
 def wants_json(req):
     q = req.query_params.get("format", "").strip().lower()
     if q in {"json", "application/json", "msgpack", "application/msgpack"}:
-        return q == "json"
+        return q in {"json", "application/json"}
+
     accept = req.headers.get("Accept", "").strip().lower()
     return "application/json" in accept and "application/msgpack" not in accept
 
@@ -130,7 +144,8 @@ def format_response(response: BaseModel, status_code=200):
     try:
         if wants_json(request):
             return JSONResponse(
-                response.model_dump(mode="json"), status_code=status_code
+                response.model_dump(mode="json"),
+                status_code=int(status_code),
             )
 
         return (
@@ -138,11 +153,12 @@ def format_response(response: BaseModel, status_code=200):
                 response,
                 option=ormsgpack.OPT_SERIALIZE_PYDANTIC,
             ),
-            status_code,
+            int(status_code),
             {"Content-Type": "application/msgpack"},
         )
     except Exception as e:
         logger.error(f"Error formatting response: {e}", exc_info=True)
         return JSONResponse(
-            {"error": "Response formatting failed", "details": str(e)}, status_code=500
+            {"error": "Response formatting failed", "details": str(e)},
+            status_code=500,
         )

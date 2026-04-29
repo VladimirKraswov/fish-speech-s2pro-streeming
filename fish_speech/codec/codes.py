@@ -8,47 +8,70 @@ import torch
 
 try:
     import numpy as np
-except ImportError:
+except ImportError:  # pragma: no cover - numpy is a project dependency
     np = None
+
+
+def _shape(codes: Any) -> tuple[int, ...] | None:
+    shape = getattr(codes, "shape", None)
+    if shape is None:
+        return None
+    return tuple(int(dim) for dim in shape)
+
+
+def _range_text(codes: torch.Tensor) -> str:
+    if codes.numel() == 0:
+        return "empty"
+    return f"min={int(codes.min().item())} max={int(codes.max().item())}"
+
+
+def _positive_int(value: Any, default: int | None = None) -> int | None:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return default
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except (TypeError, ValueError):
+            return default
+    if not isinstance(value, (int, float)):
+        return default
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _is_downsample_rvq(quantizer: Any) -> bool:
+    if quantizer.__class__.__name__ == "DownsampleResidualVectorQuantize":
+        return True
+    explicit_attrs = getattr(quantizer, "__dict__", {})
+    return "semantic_quantizer" in explicit_attrs and "quantizer" in explicit_attrs
 
 
 def estimate_code_frames(codes: Any | None) -> int:
     """
-    Estimate the number of frames in the codes.
-    - None -> 0
-    - torch.Tensor / np.ndarray / object with .shape -> int(shape[-1]), if shape is not empty
-    - list/tuple:
-        - empty -> 0
-        - nested list/tuple [[...], [...]] -> len(first row)
-        - flat list -> len(list)
-    - otherwise -> 0
+    Estimate the number of VQ/DAC frames without fully normalizing the payload.
     """
 
     if codes is None:
         return 0
 
-    if hasattr(codes, "shape"):
-        shape = codes.shape
-        if len(shape) > 0:
-            return int(shape[-1])
-        return 0
+    shape = _shape(codes)
+    if shape is not None:
+        return int(shape[-1]) if shape else 0
 
     if isinstance(codes, (list, tuple)):
         if not codes:
             return 0
-        if isinstance(codes[0], (list, tuple, torch.Tensor)) or (
-            np is not None and isinstance(codes[0], np.ndarray)
-        ):
-            # Nested list/tuple/tensor/ndarray
-            if hasattr(codes[0], "shape"):
-                shape = codes[0].shape
-                if len(shape) > 0:
-                    return int(shape[-1])
-                return 0
-            if isinstance(codes[0], (list, tuple)):
-                return len(codes[0])
-            return 0  # Should not happen based on check
-        # Flat list
+        first = codes[0]
+        first_shape = _shape(first)
+        if first_shape is not None:
+            return int(first_shape[-1]) if first_shape else 0
+        if isinstance(first, (list, tuple)):
+            return len(first)
         return len(codes)
 
     return 0
@@ -61,52 +84,66 @@ def normalize_codes(
     name: str = "codes",
 ) -> torch.Tensor:
     """
-    Standardize codes to a [num_codebooks, T] CPU long tensor.
+    Standardize VQ/DAC codes to a CPU long tensor with shape ``[C, T]``.
+
+    Accepted input shapes are ``[C, T]`` and ``[1, C, T]``. The returned tensor is
+    detached, contiguous, on CPU, and safe to cache or persist.
     """
 
     if codes is None:
         raise ValueError(f"{name} cannot be None")
 
-    if not isinstance(codes, torch.Tensor):
-        if np is not None and isinstance(codes, np.ndarray):
-            codes = torch.from_numpy(codes)
-        else:
-            try:
-                codes = torch.tensor(codes)
-            except Exception as e:
-                raise ValueError(f"Failed to convert {name} to torch.Tensor: {e}")
+    if isinstance(codes, torch.Tensor):
+        tensor = codes.detach()
+    elif np is not None and isinstance(codes, np.ndarray):
+        tensor = torch.from_numpy(codes)
+    elif isinstance(codes, (list, tuple)):
+        if not codes:
+            raise ValueError(f"{name} is empty")
+        try:
+            tensor = torch.tensor(codes)
+        except Exception as exc:
+            raise ValueError(f"Failed to convert {name} to torch.Tensor: {exc}") from exc
+    else:
+        try:
+            tensor = torch.as_tensor(codes)
+        except Exception as exc:
+            raise ValueError(f"Failed to convert {name} to torch.Tensor: {exc}") from exc
 
-    # Standardize shape
-    # We expect [C, T] or [1, C, T]
-    if codes.ndim == 3:
-        if codes.shape[0] == 1:
-            codes = codes[0]
-        else:
+    if tensor.ndim == 3:
+        if tensor.shape[0] != 1:
             raise ValueError(
-                f"Unexpected 3D tensor shape {codes.shape} for {name}, "
-                f"expected [1, C, T] or [C, T]"
+                f"{name} has unexpected 3D shape {tuple(tensor.shape)}; "
+                "expected [1, C, T] or [C, T]"
+            )
+        tensor = tensor[0]
+
+    if tensor.ndim != 2:
+        raise ValueError(
+            f"{name} has unexpected ndim={tensor.ndim}, shape={tuple(tensor.shape)}; "
+            "expected [C, T]"
+        )
+
+    codebooks = int(tensor.shape[0])
+    frames = int(tensor.shape[1])
+    if codebooks <= 0:
+        raise ValueError(f"{name} has zero codebooks, shape={tuple(tensor.shape)}")
+    if frames <= 0:
+        raise ValueError(f"{name} has zero frames, shape={tuple(tensor.shape)}")
+
+    if expected_codebooks is not None:
+        expected_codebooks = int(expected_codebooks)
+        if expected_codebooks <= 0:
+            raise ValueError(
+                f"{name} expected_codebooks must be positive, got {expected_codebooks}"
+            )
+        if codebooks != expected_codebooks:
+            raise ValueError(
+                f"{name} codebook count mismatch: got {codebooks}, "
+                f"expected {expected_codebooks}, shape={tuple(tensor.shape)}"
             )
 
-    if codes.ndim != 2:
-        raise ValueError(
-            f"Unexpected tensor ndim {codes.ndim}, shape {codes.shape} for {name}, "
-            f"expected [num_codebooks, T]"
-        )
-
-    if codes.shape[0] == 0:
-        raise ValueError(f"{name} has zero codebooks (C=0), shape {codes.shape}")
-
-    if codes.shape[1] == 0:
-        raise ValueError(f"{name} is empty (T=0), shape {codes.shape}")
-
-    if expected_codebooks is not None and codes.shape[0] != expected_codebooks:
-        raise ValueError(
-            f"{name} codebook count mismatch: "
-            f"got {codes.shape[0]}, expected {expected_codebooks}. "
-            f"Shape: {codes.shape}"
-        )
-
-    return codes.detach().cpu().long().contiguous()
+    return tensor.to(device="cpu", dtype=torch.long).contiguous()
 
 
 def crop_codes_tail(
@@ -117,18 +154,39 @@ def crop_codes_tail(
     name: str = "codes",
 ) -> torch.Tensor | None:
     """
-    Crop codes from the tail to at most max_frames.
+    Return a normalized copy of the last ``max_frames`` frames.
     """
 
     if codes is None or max_frames <= 0:
         return None
 
-    codes = normalize_codes(codes, expected_codebooks=expected_codebooks, name=name)
+    normalized = normalize_codes(
+        codes,
+        expected_codebooks=expected_codebooks,
+        name=name,
+    )
 
-    if codes.shape[1] <= max_frames:
-        return codes
+    if normalized.shape[1] <= max_frames:
+        return normalized
 
-    return codes[:, -max_frames:].contiguous().clone()
+    return normalized[:, -max_frames:].contiguous().clone()
+
+
+def _extract_codes_payload(loaded: Any, *, name: str) -> Any:
+    if isinstance(loaded, dict):
+        for key in ("codes", "tokens", "indices"):
+            if key in loaded:
+                return loaded[key]
+        raise ValueError(
+            f"{name} payload dict does not contain one of: codes, tokens, indices"
+        )
+
+    if isinstance(loaded, (tuple, list)):
+        if not loaded:
+            raise ValueError(f"{name} payload list/tuple is empty")
+        return loaded[0]
+
+    return loaded
 
 
 def load_codes_pt(
@@ -138,33 +196,32 @@ def load_codes_pt(
     name: str = "codes",
 ) -> torch.Tensor:
     """
-    Load torch tensor from path or bytes and normalize it.
+    Load a ``.pt`` codes payload and normalize it to ``[C, T]`` CPU long.
     """
 
+    source: str | Path | io.BytesIO
     if isinstance(path_or_bytes, (bytes, bytearray)):
-        path_or_bytes = io.BytesIO(path_or_bytes)
+        source = io.BytesIO(path_or_bytes)
+    else:
+        source = path_or_bytes
+
+    if isinstance(source, io.BytesIO):
+        source.seek(0)
 
     try:
-        # torch.load weights_only is available since torch 1.13
-        # Use it if possible for security
-        import inspect
+        try:
+            loaded = torch.load(source, map_location="cpu", weights_only=True)
+        except TypeError:
+            loaded = torch.load(source, map_location="cpu")
 
-        sig = inspect.signature(torch.load)
-        if "weights_only" in sig.parameters:
-            loaded = torch.load(path_or_bytes, map_location="cpu", weights_only=True)
-        else:
-            loaded = torch.load(path_or_bytes, map_location="cpu")
-
-        if isinstance(loaded, (tuple, list)) and len(loaded) > 0:
-            # Often models save (codes, ...) or similar
-            if isinstance(loaded[0], (torch.Tensor, list, tuple)) or (
-                np is not None and isinstance(loaded[0], np.ndarray)
-            ):
-                loaded = loaded[0]
-
-        return normalize_codes(loaded, expected_codebooks=expected_codebooks, name=name)
-    except Exception as e:
-        raise ValueError(f"Failed to load {name} from {path_or_bytes}: {e}") from e
+        payload = _extract_codes_payload(loaded, name=name)
+        return normalize_codes(
+            payload,
+            expected_codebooks=expected_codebooks,
+            name=name,
+        )
+    except Exception as exc:
+        raise ValueError(f"Failed to load {name} from {path_or_bytes}: {exc}") from exc
 
 
 def save_codes_pt(
@@ -175,21 +232,24 @@ def save_codes_pt(
     name: str = "codes",
 ) -> torch.Tensor:
     """
-    Normalize and save codes to a file.
+    Normalize and save codes as a CPU long tensor.
     """
 
-    codes = normalize_codes(codes, expected_codebooks=expected_codebooks, name=name)
+    normalized = normalize_codes(
+        codes,
+        expected_codebooks=expected_codebooks,
+        name=name,
+    )
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-
-    torch.save(codes, path)
-    return codes
+    torch.save(normalized, path)
+    return normalized
 
 
 def expected_codebooks_from_decoder(decoder_model: Any) -> int | None:
     """
-    Try to infer the number of codebooks from the decoder model.
+    Infer decoder codebook count when the decoder exposes quantizer metadata.
     """
 
     if decoder_model is None:
@@ -199,74 +259,115 @@ def expected_codebooks_from_decoder(decoder_model: Any) -> int | None:
     if quantizer is None:
         return None
 
-    # Check for DownsampleResidualVectorQuantize (DAC) structurally
-    if quantizer.__class__.__name__ == "DownsampleResidualVectorQuantize":
-        # semantic (1) + acoustic (n_codebooks)
+    if _is_downsample_rvq(quantizer):
         inner = getattr(quantizer, "quantizer", None)
-        n = getattr(inner, "n_codebooks", None)
-        if n is None:
-            return None
-        return int(n) + 1
+        n_codebooks = _positive_int(getattr(inner, "n_codebooks", None))
+        return n_codebooks + 1 if n_codebooks is not None else None
 
-    # Fallback to n_codebooks attribute
-    n = getattr(quantizer, "n_codebooks", None)
-    if n is None:
-        return None
-    return int(n)
+    return _positive_int(getattr(quantizer, "n_codebooks", None))
+
+
+def _raise_range_error(
+    *,
+    name: str,
+    row_name: str,
+    codes: torch.Tensor,
+    expected_range: str,
+) -> None:
+    row_label = f" {row_name}" if row_name else ""
+    raise ValueError(
+        f"{name}{row_label} codes out of range {expected_range}: "
+        f"shape={tuple(codes.shape)} {_range_text(codes)}"
+    )
+
+
+def _validate_row_range(
+    codes: torch.Tensor,
+    *,
+    name: str,
+    row_name: str,
+    min_value: int,
+    max_exclusive: int,
+) -> None:
+    if codes.numel() == 0:
+        return
+    if torch.any(codes < min_value) or torch.any(codes >= max_exclusive):
+        _raise_range_error(
+            name=name,
+            row_name=row_name,
+            codes=codes,
+            expected_range=f"[{min_value}, {max_exclusive})",
+        )
 
 
 def validate_codes_for_decoder(
-    codes: Any, decoder_model: Any, *, name="codes"
+    codes: Any,
+    decoder_model: Any,
+    *,
+    name: str = "codes",
 ) -> torch.Tensor:
     """
-    Normalize and validate codes for a specific decoder model.
-    Checks shape, codebook count, and value ranges.
+    Normalize and validate codes against decoder expectations.
+
+    For ``DownsampleResidualVectorQuantize``, row 0 is the semantic codebook and
+    rows 1+ are acoustic codebooks.
     """
-    expected = expected_codebooks_from_decoder(decoder_model)
-    codes = normalize_codes(codes, expected_codebooks=expected, name=name)
 
-    # Range validation
-    if decoder_model is not None:
-        quantizer = getattr(decoder_model, "quantizer", None)
-        if quantizer is not None:
-            # Check for DownsampleResidualVectorQuantize
-            if quantizer.__class__.__name__ == "DownsampleResidualVectorQuantize":
-                # semantic codebook size
-                sem_q = getattr(quantizer, "semantic_quantizer", None)
-                sem_size = getattr(sem_q, "codebook_size", 4096)
+    expected_codebooks = expected_codebooks_from_decoder(decoder_model)
+    normalized = normalize_codes(
+        codes,
+        expected_codebooks=expected_codebooks,
+        name=name,
+    )
 
-                # acoustic codebook size
-                ac_q = getattr(quantizer, "quantizer", None)
-                ac_size = getattr(ac_q, "codebook_size", 1024)
+    quantizer = getattr(decoder_model, "quantizer", None) if decoder_model else None
+    if quantizer is None:
+        if torch.any(normalized < 0):
+            raise ValueError(
+                f"{name} contains negative codes: "
+                f"shape={tuple(normalized.shape)} {_range_text(normalized)}"
+            )
+        return normalized
 
-                # Validate semantic codes (row 0)
-                sem_codes = codes[0]
-                if (sem_codes < 0).any() or (sem_codes >= sem_size).any():
-                    raise ValueError(
-                        f"{name} semantic codes out of range [0, {sem_size}): "
-                        f"min={sem_codes.min()}, max={sem_codes.max()}"
-                    )
+    if _is_downsample_rvq(quantizer):
+        sem_q = getattr(quantizer, "semantic_quantizer", None)
+        ac_q = getattr(quantizer, "quantizer", None)
+        semantic_size = _positive_int(getattr(sem_q, "codebook_size", None), 4096)
+        acoustic_size = _positive_int(getattr(ac_q, "codebook_size", None), 1024)
 
-                # Validate acoustic codes (rows 1+)
-                if codes.shape[0] > 1:
-                    ac_codes = codes[1:]
-                    if (ac_codes < 0).any() or (ac_codes >= ac_size).any():
-                        raise ValueError(
-                            f"{name} acoustic codes out of range [0, {ac_size}): "
-                            f"min={ac_codes.min()}, max={ac_codes.max()}"
-                        )
-            else:
-                # Generic fallback for other quantizers
-                size = getattr(quantizer, "codebook_size", None)
-                if size is not None:
-                    if (codes < 0).any() or (codes >= size).any():
-                        raise ValueError(
-                            f"{name} codes out of range [0, {size}): "
-                            f"min={codes.min()}, max={codes.max()}"
-                        )
+        assert semantic_size is not None
+        assert acoustic_size is not None
 
-    # Basic non-negative check if we couldn't determine specific ranges
-    if (codes < 0).any():
-        raise ValueError(f"{name} contains negative codes: min={codes.min()}")
+        _validate_row_range(
+            normalized[0],
+            name=name,
+            row_name="semantic",
+            min_value=0,
+            max_exclusive=semantic_size,
+        )
+        if normalized.shape[0] > 1:
+            _validate_row_range(
+                normalized[1:],
+                name=name,
+                row_name="acoustic",
+                min_value=0,
+                max_exclusive=acoustic_size,
+            )
+        return normalized
 
-    return codes
+    size = _positive_int(getattr(quantizer, "codebook_size", None))
+    if size is not None:
+        _validate_row_range(
+            normalized,
+            name=name,
+            row_name="",
+            min_value=0,
+            max_exclusive=size,
+        )
+    elif torch.any(normalized < 0):
+        raise ValueError(
+            f"{name} contains negative codes: "
+            f"shape={tuple(normalized.shape)} {_range_text(normalized)}"
+        )
+
+    return normalized

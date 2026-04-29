@@ -88,7 +88,9 @@ class ReferenceLoader:
                 if not lab_path.exists():
                     logger.warning("Reference stem {} missing .lab, skipping", stem)
                     continue
+
                 prompt_texts.append(read_ref_text(str(lab_path)))
+
                 if codes_path.exists():
                     # Pre-encoded: load from disk (no encoder run). File must be tensor shape (num_codebooks, T) from DAC encode.
                     # map_location="cpu" = put tensor in RAM (worker will .to(device) later).
@@ -119,18 +121,23 @@ class ReferenceLoader:
                             f"Invalid pre-encoded reference at {codes_path}: {e}"
                         ) from e
                 elif audio_path is not None:
-                    prompt_tokens.append(
-                        self.encode_reference(
-                            reference_audio=audio_to_bytes(str(audio_path)),
-                            enable_reference_audio=True,
-                        )
+                    encoded = self.encode_reference(
+                        reference_audio=audio_to_bytes(str(audio_path)),
+                        enable_reference_audio=True,
                     )
+                    encoded = validate_codes_for_decoder(
+                        encoded,
+                        getattr(self, "decoder_model", None),
+                        name=f"reference {id}/{stem}",
+                    )
+                    prompt_tokens.append(encoded)
                 else:
                     logger.warning(
                         "Reference stem {} has .lab but no .codes.pt or audio, skipping",
                         stem,
                     )
                     prompt_texts.pop()
+
             if not prompt_tokens:
                 raise ValueError(
                     f"Reference ID '{id}' has no valid (audio/.codes.pt + .lab) pairs"
@@ -163,6 +170,11 @@ class ReferenceLoader:
                     reference_audio=ref.audio,
                     enable_reference_audio=True,
                 )
+                prompt_token = validate_codes_for_decoder(
+                    prompt_token,
+                    getattr(self, "decoder_model", None),
+                    name=f"reference hash {audio_hash[:12]}",
+                )
                 prompt_tokens.append(prompt_token)
                 prompt_texts.append(ref.text)
                 self.ref_by_hash[audio_hash] = prompt_token
@@ -179,6 +191,12 @@ class ReferenceLoader:
                     self.ref_by_hash[audio_hash] = cached_token
                 else:
                     cached_token = cached_value
+
+                cached_token = validate_codes_for_decoder(
+                    cached_token,
+                    getattr(self, "decoder_model", None),
+                    name=f"cached reference hash {audio_hash[:12]}",
+                )
                 prompt_tokens.append(cached_token)
                 prompt_texts.append(ref.text)
                 cache_used = True

@@ -53,27 +53,21 @@ from fish_speech_server.services.adapter import (
     stateful_tts_to_driver_request,
 )
 from fish_speech_server.services.continuation import build_continuation_debug_summary
-from fish_speech_server.services.stateful_inference import stateful_inference_async
+from fish_speech_server.services.inference import float_audio_to_pcm16_bytes
 from fish_speech_server.services.model_manager import ModelManager
 from fish_speech_server.services.model_utils import (
     batch_vqgan_decode,
     cached_vqgan_batch_encode,
 )
+from fish_speech_server.services.stateful_inference import stateful_inference_async
 
 MAX_NUM_SAMPLES = int(os.getenv("NUM_SAMPLES", 1))
 
 routes = Routes()
 
 
-# =============================================================================
-# Endpoint: Health check (проверка работоспособности)
-# =============================================================================
 @routes.http("/v1/health")
 class Health(HttpView):
-    """GET/POST /v1/health — проверка, что сервер жив и модель загружена.
-    Используется Docker healthcheck и мониторингом.
-    """
-
     @classmethod
     async def get(cls):
         return JSONResponse({"status": "ok"})
@@ -83,22 +77,16 @@ class Health(HttpView):
         return JSONResponse({"status": "ok"})
 
 
-# =============================================================================
-# Вспомогательные функции для получения информации о памяти GPU
-# =============================================================================
 def _model_param_memory_gb(module: torch.nn.Module) -> tuple[float, int]:
-    """Возвращает память (ГБ), занимаемую только весами модели, и количество параметров."""
     total_bytes = sum(p.numel() * p.element_size() for p in module.parameters())
     count = sum(p.numel() for p in module.parameters())
     return (round(total_bytes / (1024**3), 3), count)
 
 
 def _gpu_memory_info(model_manager: ModelManager | None = None):
-    """Собирает текущую информацию об использовании видеопамяти CUDA.
-    Возвращает словарь с allocated, reserved, max, а также информацию о моделях (DAC, LLaMA).
-    """
     if not torch.cuda.is_available():
         return {"cuda_available": False}
+
     gb = 1024**3
     out = {
         "cuda_available": True,
@@ -107,14 +95,17 @@ def _gpu_memory_info(model_manager: ModelManager | None = None):
         "max_allocated_gb": round(torch.cuda.max_memory_allocated() / gb, 3),
         "device_count": torch.cuda.device_count(),
     }
+
     if model_manager is not None:
         models = {}
+
         if (
             hasattr(model_manager, "decoder_model")
             and model_manager.decoder_model is not None
         ):
             dac_gb, dac_count = _model_param_memory_gb(model_manager.decoder_model)
             models["dac"] = {"param_gb": dac_gb, "param_count": dac_count}
+
         if getattr(model_manager, "_worker_memory_info", None):
             wi = model_manager._worker_memory_info
             if "llama_param_gb" in wi:
@@ -122,8 +113,10 @@ def _gpu_memory_info(model_manager: ModelManager | None = None):
                     "param_gb": wi["llama_param_gb"],
                     "param_count": wi.get("llama_param_count"),
                 }
+
         if models:
             out["models"] = models
+
     if torch.cuda.device_count() > 1:
         out["devices"] = []
         for i in range(torch.cuda.device_count()):
@@ -139,17 +132,19 @@ def _gpu_memory_info(model_manager: ModelManager | None = None):
                         ),
                     }
                 )
+
     try:
         out["memory_summary"] = torch.cuda.memory_summary(abbreviated=True)
     except Exception:
         pass
+
     return out
 
 
 def _gpu_memory_text(info: dict) -> str:
-    """Форматирует информацию о памяти GPU в читаемый текст (таблица)."""
     if not info.get("cuda_available"):
         return "CUDA not available.\n"
+
     lines = [
         "GPU memory (current)",
         f"  allocated_gb:    {info['allocated_gb']}",
@@ -158,32 +153,40 @@ def _gpu_memory_text(info: dict) -> str:
         f"  device_count:    {info['device_count']}",
         "",
     ]
+
     if "models" in info:
         lines.append("Model weights (params only)")
         for name, m in info["models"].items():
             lines.append(
-                f"  {name}: param_gb={m.get('param_gb')} param_count={m.get('param_count', 'N/A')}"
+                f"  {name}: param_gb={m.get('param_gb')} "
+                f"param_count={m.get('param_count', 'N/A')}"
             )
         lines.append("")
+
     if "devices" in info:
         for d in info["devices"]:
             lines.append(f"  device {d['device']} ({d['name']})")
             lines.append(
-                f"    allocated_gb: {d['allocated_gb']}  reserved_gb: {d['reserved_gb']}  max_allocated_gb: {d['max_allocated_gb']}"
+                f"    allocated_gb: {d['allocated_gb']}  "
+                f"reserved_gb: {d['reserved_gb']}  "
+                f"max_allocated_gb: {d['max_allocated_gb']}"
             )
         lines.append("")
+
     if "memory_summary" in info:
         lines.append(info["memory_summary"])
+
     return "\n".join(lines)
 
 
 def _dump_memory_snapshot(out_dir: str = "/workspace") -> tuple[str | None, str | None]:
-    """Сохраняет снапшот памяти CUDA в pickle-файл для последующего анализа (memory viz)."""
     if not torch.cuda.is_available():
         return None, "CUDA not available"
+
     dump_fn = getattr(torch.cuda.memory, "_dump_snapshot", None)
     if dump_fn is None:
         return None, "_dump_snapshot not found (PyTorch too old?)"
+
     try:
         Path(out_dir).mkdir(parents=True, exist_ok=True)
         path = os.path.join(out_dir, f"memory_snapshot_{int(time.time())}.pickle")
@@ -192,50 +195,67 @@ def _dump_memory_snapshot(out_dir: str = "/workspace") -> tuple[str | None, str 
     except Exception as e:
         return (
             None,
-            f"Dump failed: {e!r} (need PyTorch built with CUDA memory snapshot support?)",
+            f"Dump failed: {e!r} "
+            "(need PyTorch built with CUDA memory snapshot support?)",
         )
 
 
-# =============================================================================
-# Endpoint: Отладка памяти GPU
-# =============================================================================
+def _msgpack_response(model) -> Response:
+    return Response(
+        content=ormsgpack.packb(model, option=ormsgpack.OPT_SERIALIZE_PYDANTIC),
+        media_type="application/msgpack",
+    )
+
+
+def _encode_complete_audio_response(
+    audio: np.ndarray,
+    sample_rate: int,
+    audio_format: str,
+) -> bytes:
+    audio_format = audio_format.strip().lower()
+
+    if audio_format == "pcm":
+        return float_audio_to_pcm16_bytes(audio)
+
+    buffer = io.BytesIO()
+    sf.write(
+        buffer,
+        np.asarray(audio, dtype=np.float32),
+        sample_rate,
+        format=audio_format.upper(),
+    )
+    return buffer.getvalue()
+
+
 @routes.http.get("/v1/debug/memory")
 async def debug_memory():
-    """
-    GET /v1/debug/memory — возвращает текущее использование видеопамяти.
-    Параметры:
-        ?format=text  -> текстовый формат (таблица)
-        ?dump=1       -> дополнительно создать .pickle снапшот (требуется FISH_RECORD_MEMORY_HISTORY=1)
-    """
     model_manager = getattr(request.app.state, "model_manager", None)
     info = _gpu_memory_info(model_manager)
+
     if request.query_params.get("dump", "").strip() in ("1", "true", "True"):
         out_dir = request.query_params.get("dump_dir", "").strip() or "/workspace"
         snapshot_path, snapshot_err = _dump_memory_snapshot(out_dir=out_dir)
+
         if snapshot_path:
             info["snapshot_path"] = snapshot_path
             info["snapshot_note"] = (
-                "Open at https://pytorch.org/memory_viz or: python -m torch.cuda._memory_viz trace_plot <path> -o out.html"
+                "Open at https://pytorch.org/memory_viz or: "
+                "python -m torch.cuda._memory_viz trace_plot <path> -o out.html"
             )
         else:
             info["snapshot_error"] = (
                 snapshot_err
-                or "Set FISH_RECORD_MEMORY_HISTORY=1 at startup for alloc history in snapshot."
+                or "Set FISH_RECORD_MEMORY_HISTORY=1 at startup for alloc history."
             )
+
     if request.query_params.get("format", "").strip().lower() == "text":
         return Response(_gpu_memory_text(info), media_type="text/plain; charset=utf-8")
+
     return JSONResponse(info)
 
 
-# =============================================================================
-# Endpoint: VQGAN кодирование аудио в токены
-# =============================================================================
 @routes.http.post("/v1/vqgan/encode")
 async def vqgan_encode(req: Annotated[ServeVQGANEncodeRequest, Body(exclusive=True)]):
-    """
-    POST /v1/vqgan/encode — кодирует аудио в дискретные коды (токены) с помощью VQGAN (DAC).
-    Используется для предвычисления референсов.
-    """
     try:
         model_manager: ModelManager = request.app.state.model_manager
         decoder_model = model_manager.decoder_model
@@ -243,63 +263,51 @@ async def vqgan_encode(req: Annotated[ServeVQGANEncodeRequest, Body(exclusive=Tr
         start_time = time.time()
         tokens = cached_vqgan_batch_encode(decoder_model, req.audios)
         logger.info(
-            f"[EXEC] VQGAN encode time: {(time.time() - start_time) * 1000:.2f}ms"
+            "[EXEC] VQGAN encode time: {:.2f}ms",
+            (time.time() - start_time) * 1000,
         )
 
-        return ormsgpack.packb(
-            ServeVQGANEncodeResponse(tokens=[i.tolist() for i in tokens]),
-            option=ormsgpack.OPT_SERIALIZE_PYDANTIC,
+        return _msgpack_response(
+            ServeVQGANEncodeResponse(tokens=[i.tolist() for i in tokens])
         )
+
     except Exception as e:
         logger.error(f"Error in VQGAN encode: {e}", exc_info=True)
         raise HTTPException(
-            HTTPStatus.INTERNAL_SERVER_ERROR, content="Failed to encode audio"
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            content="Failed to encode audio",
         )
 
 
-# =============================================================================
-# Endpoint: VQGAN декодирование токенов в аудио
-# =============================================================================
 @routes.http.post("/v1/vqgan/decode")
 async def vqgan_decode(req: Annotated[ServeVQGANDecodeRequest, Body(exclusive=True)]):
-    """
-    POST /v1/vqgan/decode — декодирует токены обратно в аудио (PCM).
-    """
     try:
         model_manager: ModelManager = request.app.state.model_manager
         decoder_model = model_manager.decoder_model
 
-        tokens = [torch.tensor(token, dtype=torch.int) for token in req.tokens]
+        tokens = [torch.tensor(token, dtype=torch.long) for token in req.tokens]
+
         start_time = time.time()
         audios = batch_vqgan_decode(decoder_model, tokens)
         logger.info(
-            f"[EXEC] VQGAN decode time: {(time.time() - start_time) * 1000:.2f}ms"
+            "[EXEC] VQGAN decode time: {:.2f}ms",
+            (time.time() - start_time) * 1000,
         )
-        audios = [audio.astype(np.float16).tobytes() for audio in audios]
 
-        return ormsgpack.packb(
-            ServeVQGANDecodeResponse(audios=audios),
-            option=ormsgpack.OPT_SERIALIZE_PYDANTIC,
-        )
+        audios = [np.asarray(audio, dtype=np.float16).tobytes() for audio in audios]
+
+        return _msgpack_response(ServeVQGANDecodeResponse(audios=audios))
+
     except Exception as e:
         logger.error(f"Error in VQGAN decode: {e}", exc_info=True)
         raise HTTPException(
-            HTTPStatus.INTERNAL_SERVER_ERROR, content="Failed to decode tokens to audio"
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            content="Failed to decode tokens to audio",
         )
 
 
-# =============================================================================
-# Основной эндпоинт: синтез речи (Text‑to‑Speech)
-# =============================================================================
 @routes.http.post("/v1/tts")
 async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
-    """
-    POST /v1/tts — синтезирует речь из текста.
-    Поддерживает:
-        - Потоковый режим (streaming=True) -> отдаёт WAV чанками.
-        - Пакетный режим -> возвращает полный аудиофайл.
-    Обязательно указать reference_id или загруженные references.
-    """
     try:
         app_state = request.app.state
         model_manager: ModelManager = app_state.model_manager
@@ -308,7 +316,10 @@ async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
         if not req.reference_id and not req.references:
             raise HTTPException(
                 HTTPStatus.BAD_REQUEST,
-                content="Reference is required for this test mode: provide reference_id or references",
+                content=(
+                    "Reference is required for this test mode: "
+                    "provide reference_id or references"
+                ),
             )
 
         sample_rate = driver.sample_rate
@@ -333,59 +344,50 @@ async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
                 },
                 content_type=get_content_type(req.format),
             )
-        else:
-            chunks = []
-            for event in driver.synthesize(api_tts_to_driver_request(req)):
-                if isinstance(event, DriverErrorEvent) and event.error:
-                    raise RuntimeError(str(event.error))
-                if isinstance(event, DriverFinalAudioEvent):
-                    chunks.append(event.audio)
-            if not chunks:
-                raise HTTPException(
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    content="No audio generated, please check the input text.",
-                )
-            fake_audios = np.concatenate(chunks, axis=0)
-            buffer = io.BytesIO()
-            sf.write(
-                buffer,
-                fake_audios,
-                sample_rate,
-                format=req.format,
+
+        chunks = []
+
+        for event in driver.synthesize(api_tts_to_driver_request(req)):
+            if isinstance(event, DriverErrorEvent) and event.error:
+                raise RuntimeError(str(event.error))
+
+            if isinstance(event, DriverFinalAudioEvent):
+                chunks.append(event.audio)
+
+        if not chunks:
+            raise HTTPException(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                content="No audio generated, please check the input text.",
             )
 
-            return StreamResponse(
-                iterable=buffer_to_async_generator(buffer.getvalue()),
-                headers={
-                    "Content-Disposition": f"attachment; filename=audio.{req.format}",
-                },
-                content_type=get_content_type(req.format),
-            )
+        audio = np.concatenate(chunks, axis=0)
+        payload = _encode_complete_audio_response(audio, sample_rate, req.format)
+
+        return StreamResponse(
+            iterable=buffer_to_async_generator(payload),
+            headers={
+                "Content-Disposition": f"attachment; filename=audio.{req.format}",
+            },
+            content_type=get_content_type(req.format),
+        )
+
     except HTTPException:
         raise
+
     except Exception as e:
         logger.error(f"Error in TTS generation: {e}", exc_info=True)
         raise HTTPException(
-            HTTPStatus.INTERNAL_SERVER_ERROR, content="Failed to generate speech"
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            content="Failed to generate speech",
         )
 
 
-# =============================================================================
-# Управление референсными голосами (Reference Voices)
-# =============================================================================
-
-# 1. Добавление нового референса (загружается аудиофайл и текст)
 @routes.http.post("/v1/references/add")
 async def add_reference(
-    id: str = Body(...), audio: UploadFile = Body(...), text: str = Body(...)
+    id: str = Body(...),
+    audio: UploadFile = Body(...),
+    text: str = Body(...),
 ):
-    """
-    POST /v1/references/add — добавляет новый референсный голос.
-    Параметры:
-        id: уникальное имя референса (латиница, цифры, -, _, пробел)
-        audio: WAV‑файл
-        text: транскрипция (текст, произнесённый в аудио)
-    """
     temp_file_path = None
 
     try:
@@ -398,7 +400,7 @@ async def add_reference(
         model_manager: ModelManager = app_state.model_manager
         driver = model_manager.driver
 
-        audio_content = audio.read()
+        audio_content = await audio.read()
         if not audio_content:
             raise ValueError("Audio file is empty or could not be read")
 
@@ -432,14 +434,18 @@ async def add_reference(
     except (FileNotFoundError, OSError) as e:
         logger.error(f"File system error for reference '{id}': {e}")
         response = AddReferenceResponse(
-            success=False, message="File system error occurred", reference_id=id
+            success=False,
+            message="File system error occurred",
+            reference_id=id,
         )
         return format_response(response, status_code=500)
 
     except Exception as e:
         logger.error(f"Unexpected error adding reference '{id}': {e}", exc_info=True)
         response = AddReferenceResponse(
-            success=False, message="Internal server error occurred", reference_id=id
+            success=False,
+            message="Internal server error occurred",
+            reference_id=id,
         )
         return format_response(response, status_code=500)
 
@@ -449,11 +455,12 @@ async def add_reference(
                 os.unlink(temp_file_path)
             except OSError as e:
                 logger.warning(
-                    "Failed to clean up temporary file %s: %s", temp_file_path, e
+                    "Failed to clean up temporary file {}: {}",
+                    temp_file_path,
+                    e,
                 )
 
 
-# 2. Добавление предварительно закодированного референса (минуя кодирование на сервере)
 @routes.http.post("/v1/references/add_encoded")
 async def add_reference_encoded(
     id: str = Body(...),
@@ -461,20 +468,20 @@ async def add_reference_encoded(
     lab: UploadFile = Body(...),
     stem: str | None = Body(None),
 ):
-    """
-    POST /v1/references/add_encoded — добавляет или обновляет референс, уже закодированный в .codes.pt и .lab.
-    Позволяет избежать повторного кодирования аудио на сервере.
-    """
     try:
         if not id or not id.strip():
             raise ValueError("Reference ID cannot be empty")
+
         codes_bytes = await codes.read()
         lab_bytes = await lab.read()
+
         if not codes_bytes:
             raise ValueError("Codes file is empty")
+
         lab_text = lab_bytes.decode("utf-8", errors="replace").strip()
         if not lab_text:
             raise ValueError("Lab content is empty")
+
         stem_val = stem.strip() if stem and stem.strip() else None
 
         app_state = request.app.state
@@ -495,10 +502,14 @@ async def add_reference_encoded(
         logger.warning("add_encoded invalid input: {}", e)
         return format_response(
             AddEncodedReferenceResponse(
-                success=False, status="error", message=str(e), reference_id=id or ""
+                success=False,
+                status="error",
+                message=str(e),
+                reference_id=id or "",
             ),
             status_code=400,
         )
+
     except Exception as e:
         logger.error("add_encoded error: {}", e, exc_info=True)
         return format_response(
@@ -512,12 +523,8 @@ async def add_reference_encoded(
         )
 
 
-# 3. Получение списка всех доступных референсов
 @routes.http.get("/v1/references/list")
 async def list_references():
-    """
-    GET /v1/references/list — возвращает массив имён (ID) всех загруженных референсных голосов.
-    """
     try:
         app_state = request.app.state
         model_manager: ModelManager = app_state.model_manager
@@ -535,18 +542,15 @@ async def list_references():
     except Exception as e:
         logger.error(f"Unexpected error listing references: {e}", exc_info=True)
         response = ListReferencesResponse(
-            success=False, reference_ids=[], message="Internal server error occurred"
+            success=False,
+            reference_ids=[],
+            message="Internal server error occurred",
         )
         return format_response(response, status_code=500)
 
 
-# 4. Удаление референса по ID
 @routes.http.delete("/v1/references/delete")
 async def delete_reference(reference_id: str = Body(...)):
-    """
-    DELETE /v1/references/delete — удаляет референсный голос и все его файлы.
-    Тело запроса: { "reference_id": "имя" }
-    """
     try:
         if not reference_id or not reference_id.strip():
             raise ValueError("Reference ID cannot be empty")
@@ -576,7 +580,9 @@ async def delete_reference(reference_id: str = Body(...)):
     except ValueError as e:
         logger.warning(f"Invalid input for reference '{reference_id}': {e}")
         response = DeleteReferenceResponse(
-            success=False, message=str(e), reference_id=reference_id
+            success=False,
+            message=str(e),
+            reference_id=reference_id,
         )
         return format_response(response, status_code=400)
 
@@ -591,7 +597,8 @@ async def delete_reference(reference_id: str = Body(...)):
 
     except Exception as e:
         logger.error(
-            f"Unexpected error deleting reference '{reference_id}': {e}", exc_info=True
+            f"Unexpected error deleting reference '{reference_id}': {e}",
+            exc_info=True,
         )
         response = DeleteReferenceResponse(
             success=False,
@@ -601,18 +608,10 @@ async def delete_reference(reference_id: str = Body(...)):
         return format_response(response, status_code=500)
 
 
-# =============================================================================
-# Stateful Synthesis Sessions (Управление сессиями синтеза)
-# =============================================================================
-
 @routes.http.post("/v1/synthesis/sessions/open")
 async def open_synthesis_session(
     req: Annotated[OpenSynthesisSessionRequest, Body(exclusive=True)]
 ):
-    """
-    POST /v1/synthesis/sessions/open — создает новую сессию синтеза.
-    Обеспечивает сохранение контекста (истории) между запросами.
-    """
     try:
         store = request.app.state.synthesis_session_store
         ctx = await store.create(
@@ -644,14 +643,6 @@ async def open_synthesis_session(
 
 @routes.http.get("/v1/synthesis/sessions/{synthesis_session_id}")
 async def get_synthesis_session():
-    """
-    GET /v1/synthesis/sessions/{synthesis_session_id}
-    Возвращает информацию о сессии и её историю.
-
-    Важно:
-    Kui в текущей обвязке вызывает endpoint без positional args,
-    поэтому path-параметр нужно брать через request.path_params.
-    """
     synthesis_session_id = request.path_params.get("synthesis_session_id")
 
     if not synthesis_session_id:
@@ -680,17 +671,6 @@ async def get_synthesis_session():
 
 @routes.http.post("/v1/synthesis/sessions/close")
 async def close_synthesis_session(synthesis_session_id: str = Body(...)):
-    """
-    POST /v1/synthesis/sessions/close — закрывает сессию.
-
-    Тело запроса должно быть JSON-строкой:
-        "session_id_here"
-
-    Пример:
-        curl -X POST http://127.0.0.1:8080/v1/synthesis/sessions/close \
-          -H "Content-Type: application/json" \
-          -d '"0090e12427bc46c0945480d72bf58632"'
-    """
     store = request.app.state.synthesis_session_store
     closed = await store.close(synthesis_session_id)
 
@@ -705,10 +685,6 @@ async def close_synthesis_session(synthesis_session_id: str = Body(...)):
 
 @routes.http.post("/v1/synthesis/synthesize")
 async def stateful_synthesize(req: Annotated[StatefulTTSRequest, Body(exclusive=True)]):
-    """
-    POST /v1/synthesis/synthesize — stateful синтез речи.
-    Автоматически обновляет историю сессии после завершения генерации.
-    """
     try:
         app_state = request.app.state
         model_manager: ModelManager = app_state.model_manager
@@ -802,15 +778,11 @@ async def stateful_synthesize(req: Annotated[StatefulTTSRequest, Body(exclusive=
         )
 
 
-# 5. Переименование референса (старый ID -> новый ID)
 @routes.http.post("/v1/references/update")
 async def update_reference(
-    old_reference_id: str = Body(...), new_reference_id: str = Body(...)
+    old_reference_id: str = Body(...),
+    new_reference_id: str = Body(...),
 ):
-    """
-    POST /v1/references/update — переименовывает референсный голос.
-    Тело: { "old_reference_id": "старое_имя", "new_reference_id": "новое_имя" }
-    """
     try:
         if not old_reference_id or not old_reference_id.strip():
             raise ValueError("Old reference ID cannot be empty")
@@ -849,7 +821,8 @@ async def update_reference(
         response = UpdateReferenceResponse(
             success=True,
             message=(
-                f"Reference voice renamed from '{old_reference_id}' to '{new_reference_id}' successfully"
+                f"Reference voice renamed from '{old_reference_id}' "
+                f"to '{new_reference_id}' successfully"
             ),
             old_reference_id=old_reference_id,
             new_reference_id=new_reference_id,

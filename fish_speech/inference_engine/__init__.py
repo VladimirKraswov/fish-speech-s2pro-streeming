@@ -2,7 +2,7 @@ import gc
 import queue
 import threading
 import time
-from typing import Generator
+from typing import Any, Generator
 
 import numpy as np
 import torch
@@ -20,6 +20,23 @@ from fish_speech.utils import set_seed
 from fish_speech.codec.vq import VQManager
 
 
+def _as_list(value: Any | None) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _validate_text_turns(values: list[Any], *, name: str) -> list[str]:
+    out: list[str] = []
+    for idx, value in enumerate(values):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name}[{idx}] must be a non-empty string")
+        out.append(value)
+    return out
+
+
 class TTSInferenceEngine(ReferenceLoader, VQManager):
     def __init__(
         self,
@@ -27,6 +44,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         decoder_model: DAC,
         precision: torch.dtype,
         compile: bool,
+        llama_device: str | torch.device | None = None,
     ) -> None:
         super().__init__()
 
@@ -35,6 +53,11 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         self.precision = precision
         self.compile = compile
         self.runtime = load_runtime_config()
+        self.llama_device = (
+            torch.device(llama_device)
+            if llama_device is not None
+            else self._get_decoder_device()
+        )
 
         model_cfg = self.runtime.model
         self.cleanup_after_request = model_cfg.cleanup_after_request
@@ -143,6 +166,11 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             ref_tokens, ref_texts = [], []
             history_tokens, history_texts = [], []
 
+            request_prompt_tokens = _as_list(req.prompt_tokens)
+            request_prompt_texts = _as_list(req.prompt_text)
+            request_continuation_tokens = _as_list(req.continuation_tokens)
+            request_continuation_texts = _as_list(req.continuation_text)
+
             # 1. Load main reference
             if ref_id is not None:
                 ref_tokens, ref_texts = self.load_by_id(ref_id, req.use_memory_cache)
@@ -152,14 +180,27 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                     req.references, req.use_memory_cache
                 )
                 _mark("ref_loaded", mode="hash", refs=len(req.references))
-            elif req.prompt_tokens and req.prompt_text:
+            elif request_prompt_tokens or request_prompt_texts:
+                if not (request_prompt_tokens and request_prompt_texts):
+                    raise ValueError(
+                        "Reference prompt is incomplete: prompt_text and prompt_tokens must be provided together"
+                    )
+                if len(request_prompt_tokens) != len(request_prompt_texts):
+                    raise ValueError(
+                        "Prompt text and tokens must have the same length: "
+                        f"texts={len(request_prompt_texts)} tokens={len(request_prompt_tokens)}"
+                    )
+
+                ref_texts = _validate_text_turns(
+                    request_prompt_texts,
+                    name="prompt_text",
+                )
                 ref_tokens = [
                     validate_codes_for_decoder(
                         t, self.decoder_model, name=f"prompt[{i}]"
                     )
-                    for i, t in enumerate(req.prompt_tokens)
+                    for i, t in enumerate(request_prompt_tokens)
                 ]
-                ref_texts = list(req.prompt_text)
                 logger.info(
                     "reference: using request prompt turns={} chars={} frames={}",
                     len(ref_texts),
@@ -169,14 +210,27 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                 _mark("ref_loaded", mode="prompt", refs=len(ref_texts))
 
             # 2. Load continuation history
-            if req.continuation_tokens and req.continuation_text:
+            if request_continuation_tokens or request_continuation_texts:
+                if not (request_continuation_tokens and request_continuation_texts):
+                    raise ValueError(
+                        "Continuation is incomplete: continuation_text and continuation_tokens must be provided together"
+                    )
+                if len(request_continuation_tokens) != len(request_continuation_texts):
+                    raise ValueError(
+                        "Continuation text and tokens must have the same length: "
+                        f"texts={len(request_continuation_texts)} tokens={len(request_continuation_tokens)}"
+                    )
+
+                history_texts = _validate_text_turns(
+                    request_continuation_texts,
+                    name="continuation_text",
+                )
                 history_tokens = [
                     validate_codes_for_decoder(
                         t, self.decoder_model, name=f"continuation[{i}]"
                     )
-                    for i, t in enumerate(req.continuation_tokens)
+                    for i, t in enumerate(request_continuation_tokens)
                 ]
-                history_texts = list(req.continuation_text)
                 logger.info(
                     "continuation: added history after reference turns={} chars={} frames={}",
                     len(history_texts),
@@ -190,6 +244,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
             stream_decode = bool(req.stream_tokens or req.stream_audio)
             emit_token_events = bool(req.stream_tokens)
+            collect_codes = not req.stream_audio
             ack_queue = queue.Queue() if stream_decode else None
             cancel_event = threading.Event() if stream_decode else None
             response_queue = self.send_Llama_request(
@@ -269,7 +324,9 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                     result = wrapped_result.response
                     if result.action != "next":
                         if result.codes is not None:
-                            all_codes.append(result.codes)
+                            if collect_codes:
+                                all_codes.append(result.codes)
+
                             if emit_token_events:
                                 yield InferenceResult(
                                     code="tokens",
@@ -461,7 +518,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
         stream_tokens = bool(req.stream_tokens or req.stream_audio)
         request = dict(
-            device=self._get_decoder_device(),
+            device=self.llama_device,
             req_tag=req_tag,
             max_new_tokens=req.max_new_tokens,
             text=req.text,

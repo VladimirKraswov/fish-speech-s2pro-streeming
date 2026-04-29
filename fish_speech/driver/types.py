@@ -24,6 +24,18 @@ class DriverGenerationOptions:
 
 @dataclass
 class DriverSynthesisRequest:
+    """
+    High-level synthesis request.
+
+    ``prompt_text`` / ``prompt_tokens`` are speaker reference prompts. They
+    condition voice identity and style, and should not be used for cached intros.
+
+    ``continuation_text`` / ``continuation_tokens`` are acoustic continuation
+    history that has already been spoken. Cached intros must be injected through
+    these fields, never through ``prompt_tokens``, so the model continues from
+    the intro while the server sends only the live suffix for synthesis.
+    """
+
     text: str = ""
     segments: list[str] = field(default_factory=list)
     references: list[DriverReference] = field(default_factory=list)
@@ -32,10 +44,16 @@ class DriverSynthesisRequest:
     use_memory_cache: Literal["on", "off"] = "off"
     normalize: bool = True
     stream_audio: bool = False
+
+    # Speaker reference prompt. This conditions voice identity/style.
+    # Do not use this for cached intros.
     prompt_text: list[str] | None = None
     prompt_tokens: list[Any] | None = None
+
+    # Already-spoken acoustic history. Cached intros belong here.
     continuation_text: list[str] | None = None
     continuation_tokens: list[Any] | None = None
+
     generation: DriverGenerationOptions = field(default_factory=DriverGenerationOptions)
 
     def committed_segments(self) -> list[str]:

@@ -1,73 +1,130 @@
-# Cached Intro Mode in Fish Speech
+# Cached Intro Mode in Fish Speech Core
 
-This document describes the utilities and workflow for building and using cached intro artifacts in Fish Speech.
+Cached intro mode lowers perceived TTFA by letting a server/proxy play a
+pre-generated prefix immediately while Fish Speech generates only the live
+suffix.
 
-## Overview
+Fish Speech core does not do prefix matching, browser streaming, PCM queueing,
+or protocol events. Core is responsible for two things:
 
-Cached intros allow for lower Time To First Audio (TTFA) by pre-generating the beginning of common phrases.
-The server/proxy can then immediately serve the cached audio while the model generates the remainder (the suffix) in the background.
+- building cached intro artifacts: WAV/PCM for the client and DAC/VQ codes for
+  the model;
+- accepting already-spoken acoustic history through `continuation_text` and
+  `continuation_tokens`.
 
-## Key Concepts
+## Prompt vs Continuation
 
-1.  **Cached Intro Artifact**: A set of files including pre-generated audio (WAV/PCM), acoustic codes (VQ tokens), and metadata.
-2.  **Continuation History**: Cached codes are injected into the LLaMA model's history as a `continuation_tokens` prompt, ensuring acoustic and linguistic continuity between the cached prefix and the newly generated suffix.
-3.  **Not a Reference**: Cached intros are different from speaker references. They represent specific text being spoken, whereas references represent the voice style.
+`prompt_text` and `prompt_tokens` are speaker reference inputs. They condition
+voice identity and style. Cached intros must not be passed through
+`prompt_tokens`.
 
-## Artifact Structure
+`continuation_text` and `continuation_tokens` are already-spoken acoustic
+history. Cached intros belong here. The prompt builder inserts each continuation
+turn as:
 
-Each cached intro is stored in a directory:
+```python
+Message(role="user", parts=[TextPart(text=old_text)])
+Message(role="assistant", parts=[VQPart(codes=old_codes)], modality="voice")
+```
 
-- `audio.wav`: Reference audio for manual inspection.
-- `audio.pcm`: Raw 16-bit little-endian PCM audio at the model's sample rate (e.g., 44.1kHz). This is served to the client.
-- `codes.pt`: Torch tensor of shape `[num_codebooks, T]` containing the acoustic codes.
-- `meta.json`: Metadata about the intro (text, sample rate, duration, generation parameters, etc.).
+That makes the model continue naturally from the intro while the server sends
+only the suffix text to TTS.
 
-## Building Cached Intros
+## Artifacts
 
-Use the `build_cached_intros.py` tool to generate artifacts from a JSON input.
+Each cached intro directory contains:
 
-### Input JSON Format
+- `audio.wav`: inspectable audio file;
+- `audio.pcm`: raw PCM served immediately to the browser;
+- `codes.pt`: normalized CPU `torch.long` DAC/VQ codes with shape
+  `[num_codebooks, T]`;
+- `meta.json`: text, generation settings, sample rate, duration, and code frame
+  metadata.
+
+The browser needs PCM/WAV. The model needs the DAC/VQ codes.
+
+## Building Artifacts
+
+Input may be either a list:
 
 ```json
 [
-  {
-    "id": "welcome_message",
-    "text": "Welcome to our service!"
-  },
-  {
-    "id": "how_can_i_help",
-    "text": "How can I help you today?"
-  }
+  { "id": "what_is", "text": "Что такое" }
 ]
 ```
 
-### Running the Builder
+or an object with `items`:
+
+```json
+{
+  "items": [
+    { "id": "what_is", "text": "Что такое" }
+  ]
+}
+```
+
+Run:
 
 ```bash
 python -m fish_speech.tools.build_cached_intros \
   --input intros.json \
   --output-dir ./cached_intros \
-  --reference-id my_voice_model \
-  --llama-checkpoint-path checkpoints/s2-pro \
-  --decoder-checkpoint-path checkpoints/s2-pro/codec.pth \
-  --device cuda
+  --reference-id voice \
+  --skip-existing
 ```
 
-## How it works (Server-side)
+Checkpoint paths, device, precision, and compile mode default to
+`config/runtime.json` unless explicitly passed.
 
-When a synthesis request is received:
-1. The server checks if the requested text starts with any cached intro prefix.
-2. If a match is found:
-   - The server immediately sends `audio.pcm` to the client.
-   - The server initiates a stateful synthesis session.
-   - The cached codes from `codes.pt` are passed as `continuation_tokens`.
-   - The intro text is passed as `continuation_text`.
-   - The model generates only the remaining suffix text.
+## Runtime Workflow
+
+Full text:
+
+```text
+Что такое квантизация модели и зачем она нужна?
+```
+
+Cached intro:
+
+```text
+Что такое
+```
+
+The server/proxy:
+
+1. matches the cached prefix;
+2. immediately sends `cached_intros/what_is/audio.pcm` to the client;
+3. loads `cached_intros/what_is/codes.pt`;
+4. sends only the suffix to Fish Speech:
+
+```python
+from fish_speech.codec import load_codes_pt
+from fish_speech.driver import DriverSynthesisRequest
+
+intro_codes = load_codes_pt("cached_intros/what_is/codes.pt")
+
+request = DriverSynthesisRequest(
+    text="квантизация модели и зачем она нужна?",
+    segments=["квантизация модели и зачем она нужна?"],
+    reference_id="voice",
+    continuation_text=["Что такое"],
+    continuation_tokens=[intro_codes],
+)
+```
+
+The cached prefix is not sent as normal TTS text and is not mixed into Fish
+Speech audio generation. Fish Speech sees it only as continuation history.
 
 ## Codec Utilities
 
-New utilities are available in `fish_speech.codec.codes` for managing VQ codes:
-- `normalize_codes`: Standardizes codes to `[num_codebooks, T]` CPU long tensor.
-- `crop_codes_tail`: Safely trims history to fit within model context limits.
-- `load_codes_pt` / `save_codes_pt`: Standardized loading and saving.
-- `validate_codes_for_decoder`: Ensures codes match the decoder's expected codebook count.
+`fish_speech.codec.codes` provides:
+
+- `normalize_codes`: normalize `[C, T]` or `[1, C, T]` payloads to CPU
+  `torch.long`;
+- `load_codes_pt` / `save_codes_pt`: stable `.pt` load/save helpers;
+- `validate_codes_for_decoder`: validate codebook count and code ranges for the
+  active decoder;
+- `crop_codes_tail`: return a compact tail copy for history policies.
+
+External cached intro continuation defaults to the `full` context policy, so the
+intro codes are not silently cropped by long-form generated-history settings.

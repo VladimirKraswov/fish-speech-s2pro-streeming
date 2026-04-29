@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -55,6 +55,15 @@ class ModelConfig(BaseModel):
     long_form_min_new_tokens: int = Field(48, ge=1)
     long_form_max_new_tokens_per_segment: int = Field(256, ge=1)
 
+    external_continuation_context_policy: Literal[
+        "none",
+        "full",
+        "tail_frames",
+        "last_segment",
+    ] = "full"
+    external_continuation_tail_frames: int = Field(0, ge=0)
+    external_continuation_max_segments: int = Field(1, ge=0)
+
     @field_validator("long_form_context_policy")
     @classmethod
     def validate_long_form_context_policy(cls, value: str) -> str:
@@ -62,6 +71,17 @@ class ModelConfig(BaseModel):
         if value not in {"none", "last_segment", "tail_frames"}:
             raise ValueError(
                 "long_form_context_policy must be one of: none, last_segment, tail_frames"
+            )
+        return value
+
+    @field_validator("external_continuation_context_policy")
+    @classmethod
+    def validate_external_continuation_context_policy(cls, value: str) -> str:
+        value = value.strip().lower()
+        if value not in {"none", "full", "last_segment", "tail_frames"}:
+            raise ValueError(
+                "external_continuation_context_policy must be one of: "
+                "none, full, last_segment, tail_frames"
             )
         return value
 

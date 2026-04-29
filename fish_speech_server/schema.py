@@ -1,7 +1,7 @@
 import base64
 from typing import Literal
 
-from pydantic import BaseModel, Field, conint, model_validator
+from pydantic import BaseModel, ConfigDict, Field, conint, model_validator
 from pydantic.functional_validators import SkipValidation
 from typing_extensions import Annotated
 
@@ -53,13 +53,19 @@ class ServeReferenceAudio(BaseModel):
     text: str
 
     @model_validator(mode="before")
+    @classmethod
     def decode_audio(cls, values):
+        if not isinstance(values, dict):
+            return values
+
         audio = values.get("audio")
         if isinstance(audio, str) and len(audio) > 255:
             try:
+                values = dict(values)
                 values["audio"] = base64.b64decode(audio)
             except Exception:
                 pass
+
         return values
 
     def __repr__(self) -> str:
@@ -67,10 +73,12 @@ class ServeReferenceAudio(BaseModel):
 
 
 class ServeTTSRequest(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     text: str
     chunk_length: Annotated[int, conint(ge=100, le=300, strict=True)] = 200
-    format: Literal["wav", "pcm", "mp3"] = "wav"
-    references: list[ServeReferenceAudio] = []
+    format: Literal["wav", "pcm", "mp3", "flac"] = "wav"
+    references: list[ServeReferenceAudio] = Field(default_factory=list)
     reference_id: str | None = None
     seed: int | None = None
     use_memory_cache: Literal["on", "off"] = "off"
@@ -79,13 +87,18 @@ class ServeTTSRequest(BaseModel):
     stream_tokens: bool = False
     stream_chunk_size: Annotated[int, conint(ge=1, le=200, strict=True)] = 8
     initial_stream_chunk_size: Annotated[int, conint(ge=1, le=200, strict=True)] = 10
-    max_new_tokens: int = 512
+    max_new_tokens: Annotated[int, conint(ge=1, le=4096, strict=True)] = 512
     top_p: Annotated[float, Field(ge=0.1, le=1.0, strict=True)] = 0.8
     repetition_penalty: Annotated[float, Field(ge=0.9, le=2.0, strict=True)] = 1.1
     temperature: Annotated[float, Field(ge=0.1, le=1.0, strict=True)] = 0.8
 
-    class Config:
-        arbitrary_types_allowed = True
+    @model_validator(mode="after")
+    def validate_stream_chunk_sizes(self) -> "ServeTTSRequest":
+        if self.initial_stream_chunk_size < self.stream_chunk_size:
+            raise ValueError(
+                "initial_stream_chunk_size must be >= stream_chunk_size"
+            )
+        return self
 
 
 class AddReferenceRequest(BaseModel):
@@ -154,5 +167,5 @@ class SynthesisSessionInfoResponse(BaseModel):
 
 class StatefulTTSRequest(ServeTTSRequest):
     synthesis_session_id: str
-    commit_seq: int
+    commit_seq: Annotated[int, conint(ge=1, strict=True)]
     commit_reason: str = "unknown"

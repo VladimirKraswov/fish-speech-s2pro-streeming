@@ -1911,6 +1911,7 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
                     {
                         "type": "pcm",
                         "req_id": req_id,
+                        "commit_seq": 1,
                         "seq": pcm_seq,
                         "first_pcm_for_commit": is_first_pcm_for_this_commit,
                         "data": base64.b64encode(out).decode("ascii"),
@@ -1933,6 +1934,7 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
                 "req_id": req_id,
                 "mode": "stateless",
                 "commit_seq": 1,
+                "reason": "stateless",
                 "text_preview": text[:180],
                 "text_len": len(text),
                 "effective_target_emit_bytes": effective_target_emit_bytes,

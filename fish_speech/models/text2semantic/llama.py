@@ -297,6 +297,8 @@ class BaseTransformer(nn.Module):
             ),
             persistent=False,
         )
+        self.im_end_token_id = -1
+        self._register_default_sampling_buffers()
 
         # For kv cache
         self.max_batch_size = -1
@@ -304,6 +306,92 @@ class BaseTransformer(nn.Module):
 
         if init_weights:
             self.apply(self._init_weights)
+
+    def _register_default_sampling_buffers(self) -> None:
+        vocab_size = int(self.config.vocab_size)
+        semantic_mask = torch.zeros(vocab_size, dtype=torch.bool)
+        token_to_code = torch.full((vocab_size,), -1, dtype=torch.long)
+
+        begin = int(self.config.semantic_begin_id)
+        end = int(self.config.semantic_end_id)
+        if 0 <= begin <= end < vocab_size:
+            semantic_mask[begin : end + 1] = True
+            token_to_code[begin : end + 1] = torch.arange(
+                end - begin + 1,
+                dtype=torch.long,
+            )
+
+        self.register_buffer(
+            "semantic_token_mask_for_sampling",
+            semantic_mask,
+            persistent=False,
+        )
+        self.register_buffer(
+            "repetition_valid_token_mask",
+            semantic_mask.clone(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "semantic_token_to_code_for_sampling",
+            token_to_code,
+            persistent=False,
+        )
+        self.register_buffer(
+            "im_end_token_id_tensor",
+            torch.tensor(-1, dtype=torch.long),
+            persistent=False,
+        )
+
+    def configure_tokenizer_buffers(self, tokenizer) -> None:
+        from fish_speech.tokenizer import IM_END_TOKEN
+
+        vocab_size = int(self.config.vocab_size)
+        device = self.semantic_token_mask_for_sampling.device
+
+        semantic_ids = tokenizer.semantic_map_tensor.to(dtype=torch.long).cpu()
+        if semantic_ids.numel() == 0:
+            raise ValueError("Tokenizer has no semantic token ids")
+        if semantic_ids.numel() > int(self.config.codebook_size):
+            raise ValueError(
+                "Tokenizer semantic token count exceeds model codebook_size: "
+                f"{semantic_ids.numel()} > {int(self.config.codebook_size)}"
+            )
+
+        min_semantic_id = int(semantic_ids.min().item())
+        max_semantic_id = int(semantic_ids.max().item())
+        if min_semantic_id < 0 or max_semantic_id >= vocab_size:
+            raise ValueError(
+                "Tokenizer semantic token id is outside model vocab_size: "
+                f"min={min_semantic_id} max={max_semantic_id} vocab_size={vocab_size}"
+            )
+
+        im_end_id = int(tokenizer.get_token_id(IM_END_TOKEN))
+        if im_end_id < 0 or im_end_id >= vocab_size:
+            raise ValueError(
+                f"IM_END token id {im_end_id} is outside model vocab_size={vocab_size}"
+            )
+
+        semantic_mask = torch.zeros(vocab_size, dtype=torch.bool)
+        semantic_mask[semantic_ids] = True
+
+        token_to_code = torch.full((vocab_size,), -1, dtype=torch.long)
+        token_to_code[semantic_ids] = torch.arange(
+            semantic_ids.numel(),
+            dtype=torch.long,
+        )
+
+        repetition_mask = semantic_mask.clone()
+        repetition_mask[im_end_id] = True
+
+        self.semantic_token_mask_for_sampling = semantic_mask.to(device=device)
+        self.repetition_valid_token_mask = repetition_mask.to(device=device)
+        self.semantic_token_to_code_for_sampling = token_to_code.to(device=device)
+        self.im_end_token_id_tensor = torch.tensor(
+            im_end_id,
+            dtype=torch.long,
+            device=device,
+        )
+        self.im_end_token_id = im_end_id
 
     def setup_caches(
         self, max_batch_size: int, max_seq_len: int, dtype: torch.dtype = torch.bfloat16
@@ -345,17 +433,13 @@ class BaseTransformer(nn.Module):
 
         vq_embeds_sum = torch.stack(embeds, dim=1).sum(dim=1)
 
-        if hasattr(self, "tokenizer") and hasattr(
-            self.tokenizer, "semantic_token_mask"
-        ):
-            mask = self.tokenizer.semantic_token_mask.to(inp.device)
-            is_semantic = mask[inp[:, 0]]
-        else:
-            is_semantic = (inp[:, 0] >= self.config.semantic_begin_id) & (
-                inp[:, 0] <= self.config.semantic_end_id
-            )
+        is_semantic = self.semantic_token_mask_for_sampling[inp[:, 0]]
 
-        vq_embeds_sum[~is_semantic] = 0
+        vq_embeds_sum = torch.where(
+            is_semantic.unsqueeze(-1),
+            vq_embeds_sum,
+            torch.zeros_like(vq_embeds_sum),
+        )
 
         x = self.embeddings(inp[:, 0]) + vq_embeds_sum
 
@@ -423,17 +507,13 @@ class BaseTransformer(nn.Module):
 
         vq_embeds_sum = torch.stack(embeds, dim=1).sum(dim=1)
 
-        if hasattr(self, "tokenizer") and hasattr(
-            self.tokenizer, "semantic_token_mask"
-        ):
-            mask = self.tokenizer.semantic_token_mask.to(inp.device)
-            vq_masks = mask[inp[:, 0]]
-        else:
-            vq_masks = (inp[:, 0] >= self.config.semantic_begin_id) & (
-                inp[:, 0] <= self.config.semantic_end_id
-            )
+        vq_masks = self.semantic_token_mask_for_sampling[inp[:, 0]]
 
-        vq_embeds_sum[~vq_masks] = 0
+        vq_embeds_sum = torch.where(
+            vq_masks.unsqueeze(-1),
+            vq_embeds_sum,
+            torch.zeros_like(vq_embeds_sum),
+        )
         x = self.embeddings(inp[:, 0]) + vq_embeds_sum
 
         if self.config.scale_codebook_embeddings:
@@ -544,6 +624,7 @@ class BaseTransformer(nn.Module):
         model = model_cls(config)
         # Attach tokenizer to model instance for inference convenience (optional, but good for user scripts)
         model.tokenizer = tokenizer
+        model.configure_tokenizer_buffers(tokenizer)
 
         if load_weights is False:
             logger.info("Randomly initialized model")
@@ -616,6 +697,8 @@ class BaseTransformer(nn.Module):
         if lora_config is not None:
             setup_lora(model, lora_config)
             logger.info(f"LoRA setup: {lora_config}")
+
+        model.configure_tokenizer_buffers(tokenizer)
 
         return model
 
@@ -780,16 +863,17 @@ class DualARTransformer(BaseTransformer):
         # Extract corresponding parts with labels
         token_labels = labels[:, 0]
 
-        # [MODIFIED] Use config instead of tokenizer
-        if hasattr(self, "tokenizer") and hasattr(
-            self.tokenizer, "semantic_token_mask"
-        ):
-            mask = self.tokenizer.semantic_token_mask.to(token_labels.device)
-            codebook_mask = mask[token_labels]
-        else:
-            codebook_mask = (token_labels >= self.config.semantic_begin_id) & (
-                token_labels <= self.config.semantic_end_id
-            )
+        vocab_size = self.semantic_token_mask_for_sampling.shape[0]
+        valid_label_mask = (token_labels >= 0) & (token_labels < vocab_size)
+        safe_token_labels = torch.where(
+            valid_label_mask,
+            token_labels,
+            torch.zeros_like(token_labels),
+        )
+        codebook_mask = (
+            valid_label_mask
+            & self.semantic_token_mask_for_sampling[safe_token_labels]
+        )
 
         # This gives where input token is <|semantic|>
         x = x[codebook_mask]

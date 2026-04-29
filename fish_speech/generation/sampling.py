@@ -52,16 +52,25 @@ def apply_repetition_penalty(
         return logits
 
     vocab_size = logits.shape[-1]
-    ids = previous_tokens.to(torch.long).reshape(-1)
+    ids = previous_tokens.to(device=logits.device, dtype=torch.long).reshape(-1)
 
     # Filter out-of-range tokens in a compile-safe way
     valid_ids_mask = (ids >= 0) & (ids < vocab_size)
-    safe_ids = torch.where(valid_ids_mask, ids, torch.zeros_like(ids))
+    invalid_bucket = torch.full_like(ids, vocab_size)
+    safe_ids = torch.where(valid_ids_mask, ids, invalid_bucket)
 
-    token_mask = torch.zeros((vocab_size,), dtype=torch.bool, device=logits.device)
+    token_mask = torch.zeros((vocab_size + 1,), dtype=torch.bool, device=logits.device)
     token_mask = token_mask.scatter(0, safe_ids, valid_ids_mask)
+    token_mask = token_mask[:vocab_size]
 
     if valid_token_mask is not None:
+        valid_token_mask = valid_token_mask.to(device=logits.device, dtype=torch.bool)
+        valid_token_mask = valid_token_mask.reshape(-1)
+        if valid_token_mask.shape[0] != vocab_size:
+            raise ValueError(
+                "valid_token_mask must have shape [vocab_size], "
+                f"got {tuple(valid_token_mask.shape)} for vocab_size={vocab_size}"
+            )
         token_mask = token_mask & valid_token_mask
 
     penalized_logits = torch.where(logits > 0, logits / penalty, logits * penalty)

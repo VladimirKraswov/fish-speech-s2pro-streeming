@@ -18,7 +18,6 @@ from fish_speech.generation.sampling import (
 )
 from fish_speech.models.text2semantic.llama import BaseTransformer, DualARTransformer
 from fish_speech.driver.config import load_runtime_config
-from fish_speech.tokenizer import IM_END_TOKEN
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 torch._inductor.config.coordinate_descent_tuning = True
@@ -55,6 +54,13 @@ def _cache_max_seq_len(model: BaseTransformer) -> int:
     return min(max(1, configured), model.config.max_seq_len)
 
 
+def _model_im_end_id(model: BaseTransformer) -> int:
+    im_end_id = int(getattr(model, "im_end_token_id", -1))
+    if im_end_id < 0 or im_end_id >= model.config.vocab_size:
+        raise RuntimeError("Model sampling buffers are missing a valid IM_END token id")
+    return im_end_id
+
+
 def decode_one_token_ar(
     model: DualARTransformer,
     x: torch.Tensor,
@@ -84,23 +90,11 @@ def decode_one_token_ar(
         # We assume previous_tokens[0] contains main tokens (semantic + IM_END)
         window = previous_tokens[0]
 
-        # Prepare valid_token_mask: semantic tokens + IM_END
-        tokenizer = getattr(model, "tokenizer", None)
-        valid_token_mask = None
-        if tokenizer is not None:
-            valid_token_mask = getattr(tokenizer, "semantic_token_mask", None)
-            if valid_token_mask is not None:
-                # IM_END id is also valid for repetition penalty
-                im_end_id = tokenizer.get_token_id(IM_END_TOKEN)
-                if 0 <= im_end_id < valid_token_mask.shape[0]:
-                    valid_token_mask = valid_token_mask.clone()
-                    valid_token_mask[im_end_id] = True
-
         biased_logits = apply_repetition_penalty(
             biased_logits,
             window,
             repetition_penalty,
-            valid_token_mask=valid_token_mask,
+            valid_token_mask=model.repetition_valid_token_mask,
         )
 
     main_token_normal = sample(
@@ -117,15 +111,7 @@ def decode_one_token_ar(
 
     if previous_tokens is not None:
         in_window = (previous_tokens[0] == main_token_normal).any()
-        if hasattr(model, "tokenizer") and hasattr(
-            model.tokenizer, "semantic_token_mask"
-        ):
-            mask = model.tokenizer.semantic_token_mask.to(main_token_normal.device)
-            is_semantic = mask[main_token_normal]
-        else:
-            is_semantic = (main_token_normal >= model.config.semantic_begin_id) & (
-                main_token_normal <= model.config.semantic_end_id
-            )
+        is_semantic = model.semantic_token_mask_for_sampling[main_token_normal]
 
         should_use_high = in_window & is_semantic
         main_token_normal = torch.where(
@@ -137,15 +123,10 @@ def decode_one_token_ar(
     input_pos = torch.tensor([0], device=hidden_states.device, dtype=torch.long)
     model.forward_generate_fast(hidden_states, input_pos)
 
-    if hasattr(model, "tokenizer") and hasattr(model.tokenizer, "semantic_token_to_code"):
-        mapping = model.tokenizer.semantic_token_to_code.to(main_token_normal.device)
-        a = mapping[main_token_normal]
-        # For non-semantic tokens (like IM_END), a will be -1.
-        # We use 0 as a dummy code because codebooks after EOS are ignored.
-        a = torch.where(a >= 0, a, torch.zeros_like(a))
-    else:
-        a = codebooks[0] - model.config.semantic_begin_id
-        a = torch.clamp(a, min=0, max=model.config.codebook_size - 1)
+    a = model.semantic_token_to_code_for_sampling[main_token_normal]
+    # For non-semantic tokens (like IM_END), a will be -1.
+    # We use 0 as a dummy code because codebooks after EOS are ignored.
+    a = torch.where(a >= 0, a, torch.zeros_like(a))
 
     hidden_states = model.fast_embeddings(a)
     codebooks.append(a)
@@ -206,9 +187,10 @@ def decode_n_tokens(
     if audio_parts is not None:
         audio_parts = audio_parts.detach().clone()
 
-    previous_tokens = torch.zeros(
+    previous_tokens = torch.full(
         (model.config.num_codebooks + 1, RAS_WIN_SIZE),
-        dtype=torch.int,
+        -1,
+        dtype=torch.long,
         device=cur_token.device,
     )
 
@@ -224,7 +206,7 @@ def decode_n_tokens(
         if initial_token_chunk is not None:
             new_tokens.append(initial_token_chunk.detach().clone())
 
-    im_end_id = model.tokenizer.get_token_id(IM_END_TOKEN)
+    im_end_id = _model_im_end_id(model)
     do_stream_log = stream_chunk_size is not None
 
     for i in tqdm(range(num_new_tokens)):
@@ -390,14 +372,8 @@ def generate(
         (1, 1, vocab_size), float("-inf"), device=device, dtype=dtype
     )
 
-    if hasattr(model, "tokenizer") and hasattr(model.tokenizer, "semantic_map_tensor"):
-        semantic_ids = model.tokenizer.semantic_map_tensor.to(device=device)
-        semantic_logit_bias[0, 0, semantic_ids] = 0.0
-    else:
-        semantic_logit_bias[
-            0, 0, model.config.semantic_begin_id : model.config.semantic_end_id + 1
-        ] = 0.0
-    semantic_logit_bias[0, 0, model.tokenizer.get_token_id(IM_END_TOKEN)] = 0.0
+    semantic_logit_bias[0, 0, model.semantic_token_mask_for_sampling] = 0.0
+    semantic_logit_bias[0, 0, _model_im_end_id(model)] = 0.0
 
     prefill_decode = decode_one_token_ar
 
@@ -425,7 +401,7 @@ def generate(
     initial_stream_chunk_size = sampling_kwargs.pop("initial_stream_chunk_size", None)
     compile = sampling_kwargs.pop("compile", False)
 
-    im_end_id = model.tokenizer.get_token_id(IM_END_TOKEN)
+    im_end_id = _model_im_end_id(model)
     if first_token[0, 0] == im_end_id:
         if stream_chunk_size is not None:
             return _iter_no_grad(iter([]))

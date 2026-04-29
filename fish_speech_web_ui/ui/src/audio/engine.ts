@@ -19,12 +19,8 @@ export class AudioEngine {
 
   private activeSources = new Set<AudioBufferSourceNode>();
 
-  // Было слишком мало для стабильного браузерного playback.
-  // При маленьком буфере появляются underrun/щелчки/электронные артефакты.
-  private readonly initialPlaybackBufferMs = 450;
-
-  // Первый запуск делаем не "прямо сейчас", а с запасом.
-  private readonly initialStartDelaySec = 0.22;
+  private initialPlaybackBufferMs = 180;
+  private initialStartDelaySec = 0.05;
 
   // Если до конца уже запланированного аудио осталось меньше этого,
   // новый source лучше не приклеивать впритык — браузер может не успеть.
@@ -86,7 +82,23 @@ export class AudioEngine {
     this.pendingBuffers = [];
     this.pendingSamplesCount = 0;
 
+    // We keep the configured initialPlaybackBufferMs and initialStartDelaySec
+    // as they were set for the session.
+
     this.setStatus('idle', true);
+  }
+
+  configurePlayback(options: {
+    clientStartBufferMs?: number;
+    clientInitialStartDelayMs?: number;
+  }) {
+    if (typeof options.clientStartBufferMs === 'number') {
+      this.initialPlaybackBufferMs = Math.max(0, options.clientStartBufferMs);
+    }
+
+    if (typeof options.clientInitialStartDelayMs === 'number') {
+      this.initialStartDelaySec = Math.max(0, options.clientInitialStartDelayMs) / 1000;
+    }
   }
 
   async connectStream(url: string, signal: AbortSignal) {
@@ -161,6 +173,11 @@ export class AudioEngine {
 
   private async handleEvent(event: StreamEvent) {
     if (event.type === 'session_start') {
+      this.configurePlayback({
+        clientStartBufferMs: event.client_start_buffer_ms,
+        clientInitialStartDelayMs: event.client_initial_start_delay_ms,
+      });
+
       this.setStatus('stream ready', true);
       return;
     }
@@ -289,7 +306,7 @@ export class AudioEngine {
 
       this.started = true;
       this.scheduledUntil = now + this.initialStartDelaySec;
-      this.setStatus('playing', true);
+      this.setStatus(`playing, buffer=${Math.round(bufferedMs)}ms`, true);
     }
 
     const leadSec = this.scheduledUntil - now;

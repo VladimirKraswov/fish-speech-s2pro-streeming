@@ -16,18 +16,18 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
   const base: ProxyConfig = {
     commit: {
       first: {
-        min_chars: 70,
-        target_chars: 140,
-        max_chars: 210,
-        max_wait_ms: 520,
-        allow_partial_after_ms: 1200,
+        min_chars: 18,
+        target_chars: 42,
+        max_chars: 90,
+        max_wait_ms: 220,
+        allow_partial_after_ms: 520,
       },
       next: {
-        min_chars: 90,
-        target_chars: 180,
-        max_chars: 250,
-        max_wait_ms: 850,
-        allow_partial_after_ms: 1800,
+        min_chars: 70,
+        target_chars: 145,
+        max_chars: 220,
+        max_wait_ms: 650,
+        allow_partial_after_ms: 1350,
       },
       flush_on_sentence_punctuation: true,
       flush_on_clause_punctuation: false,
@@ -48,17 +48,23 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
       stream_tokens: true,
       initial_stream_chunk_size: 28,
       stream_chunk_size: 20,
+      first_initial_stream_chunk_size: 10,
+      first_stream_chunk_size: 8,
       stateful_synthesis: true,
       stateful_fallback_to_stateless: false,
       stateful_history_turns: 1,
-      stateful_history_chars: 180,
+      stateful_history_chars: 160,
       stateful_history_code_frames: 120,
-      stateful_reset_every_commits: 6,
-      stateful_reset_every_chars: 900,
+      stateful_reset_every_commits: 4,
+      stateful_reset_every_chars: 800,
     },
     playback: {
-      target_emit_bytes: 32768,
-      start_buffer_ms: 450,
+      target_emit_bytes: 24576,
+      start_buffer_ms: 300,
+      first_commit_target_emit_bytes: 8192,
+      first_commit_start_buffer_ms: 140,
+      client_start_buffer_ms: 180,
+      client_initial_start_delay_ms: 50,
       stop_grace_ms: 0,
       boundary_smoothing_enabled: true,
       punctuation_pauses_enabled: true,
@@ -78,98 +84,78 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
 
   if (kind === 'lowLatency') {
     base.commit.first = {
-      min_chars: 50,
-      target_chars: 105,
-      max_chars: 170,
-      max_wait_ms: 360,
-      allow_partial_after_ms: 850,
+      min_chars: 12,
+      target_chars: 28,
+      max_chars: 64,
+      max_wait_ms: 140,
+      allow_partial_after_ms: 320,
     };
 
     base.commit.next = {
-      min_chars: 70,
-      target_chars: 145,
-      max_chars: 220,
-      max_wait_ms: 650,
-      allow_partial_after_ms: 1350,
+      min_chars: 55,
+      target_chars: 120,
+      max_chars: 190,
+      max_wait_ms: 480,
+      allow_partial_after_ms: 950,
     };
 
-    base.commit.flush_on_sentence_punctuation = true;
-    base.commit.flush_on_clause_punctuation = false;
-    base.commit.flush_on_newline = true;
-    base.commit.carry_incomplete_tail = true;
-
     base.tts.max_new_tokens = 300;
-    base.tts.chunk_length = 190;
-    base.tts.top_p = 0.82;
-    base.tts.repetition_penalty = 1.02;
-    base.tts.temperature = 0.69;
+    base.tts.chunk_length = 180;
     base.tts.initial_stream_chunk_size = 22;
     base.tts.stream_chunk_size = 16;
+    base.tts.first_initial_stream_chunk_size = 6;
+    base.tts.first_stream_chunk_size = 5;
 
     base.tts.stateful_history_turns = 1;
-    base.tts.stateful_history_chars = 140;
+    base.tts.stateful_history_chars = 120;
     base.tts.stateful_history_code_frames = 96;
-    base.tts.stateful_reset_every_commits = 5;
-    base.tts.stateful_reset_every_chars = 700;
+    base.tts.stateful_reset_every_commits = 3;
+    base.tts.stateful_reset_every_chars = 650;
 
-    base.playback.target_emit_bytes = 24576;
-    base.playback.start_buffer_ms = 300;
-    base.playback.stop_grace_ms = 0;
-    base.playback.fade_in_ms = 6;
-    base.playback.fade_out_ms = 8;
-    base.playback.pause_after_clause_ms = 80;
-    base.playback.pause_after_sentence_ms = 220;
-    base.playback.pause_after_newline_ms = 420;
-    base.playback.pause_after_force_ms = 160;
-    base.playback.pause_after_hard_limit_ms = 20;
+    base.playback.target_emit_bytes = 16384;
+    base.playback.start_buffer_ms = 220;
+    base.playback.first_commit_target_emit_bytes = 6144;
+    base.playback.first_commit_start_buffer_ms = 90;
+    base.playback.client_start_buffer_ms = 120;
+    base.playback.client_initial_start_delay_ms = 25;
   }
 
   if (kind === 'stable') {
     base.commit.first = {
-      min_chars: 85,
-      target_chars: 165,
-      max_chars: 230,
-      max_wait_ms: 800,
-      allow_partial_after_ms: 1700,
+      min_chars: 24,
+      target_chars: 56,
+      max_chars: 110,
+      max_wait_ms: 300,
+      allow_partial_after_ms: 700,
     };
 
     base.commit.next = {
-      min_chars: 105,
-      target_chars: 210,
+      min_chars: 90,
+      target_chars: 180,
       max_chars: 250,
-      max_wait_ms: 1200,
-      allow_partial_after_ms: 2400,
+      max_wait_ms: 900,
+      allow_partial_after_ms: 1800,
     };
-
-    base.commit.flush_on_sentence_punctuation = true;
-    base.commit.flush_on_clause_punctuation = false;
-    base.commit.flush_on_newline = true;
-    base.commit.carry_incomplete_tail = true;
 
     base.tts.max_new_tokens = 300;
     base.tts.chunk_length = 220;
-    base.tts.top_p = 0.83;
-    base.tts.repetition_penalty = 1.04;
-    base.tts.temperature = 0.7;
     base.tts.initial_stream_chunk_size = 36;
     base.tts.stream_chunk_size = 28;
+    base.tts.first_initial_stream_chunk_size = 14;
+    base.tts.first_stream_chunk_size = 10;
 
     base.tts.stateful_history_turns = 1;
     base.tts.stateful_history_chars = 220;
     base.tts.stateful_history_code_frames = 160;
-    base.tts.stateful_reset_every_commits = 8;
-    base.tts.stateful_reset_every_chars = 1200;
+    base.tts.stateful_reset_every_commits = 5;
+    base.tts.stateful_reset_every_chars = 1000;
 
-    base.playback.target_emit_bytes = 32768; // Reduced to 32768 to avoid validation issues if limit was lower, but Step 1 increased it.
+    base.playback.target_emit_bytes = 32768;
     base.playback.start_buffer_ms = 650;
-    base.playback.stop_grace_ms = 0;
-    base.playback.fade_in_ms = 10;
-    base.playback.fade_out_ms = 16;
-    base.playback.pause_after_clause_ms = 140;
-    base.playback.pause_after_sentence_ms = 340;
-    base.playback.pause_after_newline_ms = 650;
-    base.playback.pause_after_force_ms = 260;
-    base.playback.pause_after_hard_limit_ms = 60;
+    base.playback.first_commit_target_emit_bytes = 12288;
+    base.playback.first_commit_start_buffer_ms = 180;
+    base.playback.client_start_buffer_ms = 240;
+    base.playback.client_initial_start_delay_ms = 70;
   }
 
   return base;
@@ -245,7 +231,11 @@ export function App() {
 
   const onStreamEvent = (event: StreamEvent) => {
     if (event.type === 'session_start') {
-      log(`pcm stream opened, target_emit_bytes=${event.target_emit_bytes ?? 'n/a'}`);
+      log(
+        `pcm stream opened, target_emit_bytes=${event.target_emit_bytes ?? 'n/a'}, ` +
+        `first_emit=${event.first_commit_target_emit_bytes ?? 'n/a'}, ` +
+        `client_buffer=${event.client_start_buffer_ms ?? 'n/a'}ms`
+      );
     }
 
     if (event.type === 'upstream_reset') {
@@ -257,8 +247,16 @@ export function App() {
     }
 
     if (event.type === 'commit_start') {
-      setActiveCommit(event.text || '');
-      log(`commit #${event.commit_seq} started, reason=${event.reason}`);
+      setActiveCommit(event.text_preview || event.text || '');
+      log(
+        `commit #${event.commit_seq} started, reason=${event.reason}, ` +
+        `emit=${event.effective_target_emit_bytes ?? 'n/a'}, ` +
+        `start_buffer=${event.effective_start_buffer_ms ?? 'n/a'}ms`
+      );
+    }
+
+    if (event.type === 'pcm' && event.commit_seq === 1 && event.first_pcm_for_commit) {
+      log('first PCM for commit #1 received');
     }
 
     if (event.type === 'pause') {

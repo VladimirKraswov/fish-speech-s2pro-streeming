@@ -29,6 +29,8 @@ export interface ProxyConfig {
     stream_tokens?: boolean;
     initial_stream_chunk_size: number;
     stream_chunk_size: number;
+    first_initial_stream_chunk_size?: number | null;
+    first_stream_chunk_size?: number | null;
     stateful_synthesis?: boolean;
     stateful_fallback_to_stateless?: boolean;
     stateful_history_turns?: number;
@@ -40,6 +42,10 @@ export interface ProxyConfig {
   playback: {
     target_emit_bytes: number;
     start_buffer_ms: number;
+    first_commit_target_emit_bytes?: number;
+    first_commit_start_buffer_ms?: number;
+    client_start_buffer_ms?: number;
+    client_initial_start_delay_ms?: number;
     stop_grace_ms: number;
     boundary_smoothing_enabled?: boolean;
     punctuation_pauses_enabled?: boolean;
@@ -88,6 +94,10 @@ export type StreamEvent =
       session_id: string;
       req_id?: string;
       target_emit_bytes?: number;
+      first_commit_target_emit_bytes?: number;
+      first_commit_start_buffer_ms?: number;
+      client_start_buffer_ms?: number;
+      client_initial_start_delay_ms?: number;
     }
   | {
       type: 'meta';
@@ -102,7 +112,12 @@ export type StreamEvent =
       session_id?: string;
       commit_seq: number;
       reason: string;
-      text: string;
+      text?: string;
+      text_preview?: string;
+      text_len?: number;
+      effective_target_emit_bytes?: number;
+      effective_start_buffer_ms?: number;
+      server_perf_ms?: number;
     }
   | {
       type: 'pcm';
@@ -110,6 +125,7 @@ export type StreamEvent =
       commit_seq?: number;
       seq: number;
       data: string;
+      first_pcm_for_commit?: boolean;
     }
   | {
       type: 'pause';

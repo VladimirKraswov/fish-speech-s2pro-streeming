@@ -567,6 +567,7 @@ def _safe_partial_cut_for_ttfa(
     if limit < min_chars and not allow_inside_word:
         return None
 
+    # punctuation candidates: only end >= min_chars
     punctuation_candidates: list[int] = []
     for match in SENTENCE_BOUNDARY_RE.finditer(prefix):
         punctuation_candidates.append(match.end())
@@ -579,14 +580,14 @@ def _safe_partial_cut_for_ttfa(
     if valid_punctuation:
         return min(valid_punctuation), "ttfa_boundary"
 
+    # whitespace candidates: only end >= min_chars
     for match in re.finditer(r"\s+", prefix):
         end = match.end()
         if min_chars <= end <= limit:
             return end, "ttfa_boundary"
 
     if allow_inside_word:
-        hard_min_keep = min(min_chars, limit)
-        end = _safe_hard_cut(text, limit, min_keep=hard_min_keep)
+        end = _safe_hard_cut(text, limit, min_keep=min_chars)
         if end > 0:
             return end, "ttfa_partial"
 

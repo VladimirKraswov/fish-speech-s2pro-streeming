@@ -11,6 +11,7 @@ from loguru import logger
 from fish_speech.driver import DriverSynthesisRequest
 from fish_speech.inference_engine.utils import InferenceResult
 from fish_speech.models.dac.modded_dac import DAC
+from fish_speech.codec.codes import validate_codes_for_decoder
 from fish_speech.generation.prompt_builder import GenerateResponse
 from fish_speech.generation.worker import GenerateRequest
 from fish_speech.references.loader import ReferenceLoader
@@ -151,7 +152,12 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                 )
                 _mark("ref_loaded", mode="hash", refs=len(req.references))
             elif req.prompt_tokens and req.prompt_text:
-                ref_tokens = list(req.prompt_tokens)
+                ref_tokens = [
+                    validate_codes_for_decoder(
+                        t, self.decoder_model, name=f"prompt[{i}]"
+                    )
+                    for i, t in enumerate(req.prompt_tokens)
+                ]
                 ref_texts = list(req.prompt_text)
                 logger.info(
                     "reference: using request prompt turns={} chars={} frames={}",
@@ -163,7 +169,12 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
             # 2. Load continuation history
             if req.continuation_tokens and req.continuation_text:
-                history_tokens = list(req.continuation_tokens)
+                history_tokens = [
+                    validate_codes_for_decoder(
+                        t, self.decoder_model, name=f"continuation[{i}]"
+                    )
+                    for i, t in enumerate(req.continuation_tokens)
+                ]
                 history_texts = list(req.continuation_text)
                 logger.info(
                     "continuation: added history after reference turns={} chars={} frames={}",

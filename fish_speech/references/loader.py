@@ -8,7 +8,11 @@ import torch
 import torchaudio
 from loguru import logger
 
-from fish_speech.codec.codes import load_codes_pt, validate_codes_for_decoder
+from fish_speech.codec.codes import (
+    load_codes_pt,
+    save_codes_pt,
+    validate_codes_for_decoder,
+)
 from fish_speech.driver.types import DriverReference
 from fish_speech.models.dac.modded_dac import DAC
 from fish_speech.references.cache import ReferenceCache
@@ -289,13 +293,24 @@ class ReferenceLoader:
                 )
                 return "unchanged"
 
+        # Validate incoming codes
+        codes = load_codes_pt(codes_bytes, name=f"reference {id}/{stem}")
+        codes = validate_codes_for_decoder(
+            codes,
+            getattr(self, "decoder_model", None),
+            name=f"reference {id}/{stem}",
+        )
+
         existed_before = ref_dir.exists() and (ref_dir / f"{stem}.codes.pt").exists()
         ref_dir.mkdir(parents=True, exist_ok=True)
-        (ref_dir / f"{stem}.codes.pt").write_bytes(codes_bytes)
+
+        save_codes_pt(codes, ref_dir / f"{stem}.codes.pt", name=f"reference {id}/{stem}")
         (ref_dir / f"{stem}.lab").write_text(lab_text, encoding="utf-8")
         hash_file.write_text(content_hash, encoding="utf-8")
+
         if id in self.ref_by_id:
             del self.ref_by_id[id]
+
         status = "updated" if existed_before else "created"
         logger.info("Reference {}/{} {}", id, stem, status)
         return status

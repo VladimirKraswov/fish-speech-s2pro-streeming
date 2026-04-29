@@ -199,15 +199,20 @@ def expected_codebooks_from_decoder(decoder_model: Any) -> int | None:
     if quantizer is None:
         return None
 
-    # Check for DownsampleResidualVectorQuantize (DAC)
-    from fish_speech.models.dac.rvq import DownsampleResidualVectorQuantize
-
-    if isinstance(quantizer, DownsampleResidualVectorQuantize):
+    # Check for DownsampleResidualVectorQuantize (DAC) structurally
+    if quantizer.__class__.__name__ == "DownsampleResidualVectorQuantize":
         # semantic (1) + acoustic (n_codebooks)
-        return getattr(quantizer.quantizer, "n_codebooks", 0) + 1
+        inner = getattr(quantizer, "quantizer", None)
+        n = getattr(inner, "n_codebooks", None)
+        if n is None:
+            return None
+        return int(n) + 1
 
     # Fallback to n_codebooks attribute
-    return getattr(quantizer, "n_codebooks", None)
+    n = getattr(quantizer, "n_codebooks", None)
+    if n is None:
+        return None
+    return int(n)
 
 
 def validate_codes_for_decoder(

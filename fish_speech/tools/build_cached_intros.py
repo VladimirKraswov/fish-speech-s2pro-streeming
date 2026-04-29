@@ -1,7 +1,7 @@
 import argparse
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -9,7 +9,7 @@ import soundfile as sf
 import torch
 from loguru import logger
 
-from fish_speech.codec.codes import save_codes_pt
+from fish_speech.codec.codes import save_codes_pt, validate_codes_for_decoder
 from fish_speech.driver.api import FishSpeechDriver
 from fish_speech.driver.types import DriverGenerationOptions, DriverSynthesisRequest
 from fish_speech.generation.prompt_builder import GenerateResponse
@@ -112,131 +112,157 @@ def main():
         compile=args.compile,
     )
 
-    # Load input
-    with open(args.input, "r", encoding="utf-8") as f:
-        input_data = json.load(f)
+    try:
+        # Load input
+        with open(args.input, "r", encoding="utf-8") as f:
+            input_data = json.load(f)
 
-    if isinstance(input_data, dict) and "items" in input_data:
-        items = input_data["items"]
-    elif isinstance(input_data, list):
-        items = input_data
-    else:
-        raise ValueError("Invalid input JSON format. Expected list or {'items': [...]}")
+        if isinstance(input_data, dict) and "items" in input_data:
+            items = input_data["items"]
+        elif isinstance(input_data, list):
+            items = input_data
+        else:
+            raise ValueError("Invalid input JSON format. Expected list or {'items': [...]}")
 
-    output_base_dir = Path(args.output_dir)
-    output_base_dir.mkdir(parents=True, exist_ok=True)
+        output_base_dir = Path(args.output_dir)
+        output_base_dir.mkdir(parents=True, exist_ok=True)
 
-    generated_count = 0
-    failed_count = 0
-    skipped_count = 0
+        generated_count = 0
+        failed_count = 0
+        skipped_count = 0
 
-    for item in items:
-        intro_id = item.get("id")
-        text = item.get("text")
+        for item in items:
+            if not isinstance(item, dict):
+                logger.warning("Skipping invalid item (not a dict): {}", item)
+                failed_count += 1
+                continue
 
-        if not intro_id or not text:
-            logger.warning("Skipping item with missing id or text: {}", item)
-            continue
+            intro_id = item.get("id")
+            text = item.get("text")
 
-        # Validate ID
-        if not re.match(r"^[a-zA-Z0-9\-_]+$", intro_id):
-            logger.error("Invalid intro id: {}. Use only alphanumeric, - and _", intro_id)
-            failed_count += 1
-            continue
+            if intro_id is None or text is None:
+                logger.warning("Skipping item with missing id or text: {}", item)
+                failed_count += 1
+                continue
 
-        intro_dir = output_base_dir / intro_id
-        if args.skip_existing and intro_dir.exists():
-            logger.info("Skipping existing intro: {}", intro_id)
-            skipped_count += 1
-            continue
+            intro_id = str(intro_id).strip()
+            text = str(text).strip()
 
-        logger.info("Processing intro: {} ('{}')", intro_id, text)
+            if not intro_id or not text:
+                logger.warning("Skipping item with empty id or text: id='{}', text='{}'", intro_id, text)
+                failed_count += 1
+                continue
 
-        try:
-            request = DriverSynthesisRequest(
-                text=text,
-                segments=[text],
-                reference_id=args.reference_id,
-                seed=args.seed,
-                use_memory_cache="on",
-                normalize=True,
-                stream_audio=False,
-                generation=DriverGenerationOptions(
-                    chunk_length=args.chunk_length,
-                    max_new_tokens=args.max_new_tokens,
-                    top_p=args.top_p,
-                    repetition_penalty=args.repetition_penalty,
-                    temperature=args.temperature,
-                    stream_tokens=True,
-                    initial_stream_chunk_size=args.initial_stream_chunk_size,
-                    stream_chunk_size=args.stream_chunk_size,
-                ),
-            )
+            # Validate ID
+            if not re.match(r"^[a-zA-Z0-9\-_]+$", intro_id):
+                logger.error("Invalid intro id: {}. Use only alphanumeric, - and _", intro_id)
+                failed_count += 1
+                continue
 
-            result = driver.synthesize_collect(request)
-            audio = result["audio"]
-            codes = result["codes"]
-            sample_rate = result["sample_rate"]
+            intro_dir = output_base_dir / intro_id
+            if args.skip_existing and intro_dir.exists():
+                logger.info("Skipping existing intro: {}", intro_id)
+                skipped_count += 1
+                continue
 
-            if codes is None or codes.shape[1] == 0:
-                raise RuntimeError("No codes generated")
+            logger.info("Processing intro: {} ('{}')", intro_id, text)
 
-            # If audio is missing (e.g. stream_audio=False and not auto-decoded), decode it
-            if audio is None:
-                logger.info("Decoding audio from codes...")
-                audio = driver.engine.get_audio_segment(
-                    GenerateResponse(action="sample", codes=codes)
+            try:
+                request = DriverSynthesisRequest(
+                    text=text,
+                    segments=[text],
+                    reference_id=args.reference_id,
+                    seed=args.seed,
+                    use_memory_cache="on",
+                    normalize=True,
+                    stream_audio=False,
+                    generation=DriverGenerationOptions(
+                        chunk_length=args.chunk_length,
+                        max_new_tokens=args.max_new_tokens,
+                        top_p=args.top_p,
+                        repetition_penalty=args.repetition_penalty,
+                        temperature=args.temperature,
+                        stream_tokens=True,
+                        initial_stream_chunk_size=args.initial_stream_chunk_size,
+                        stream_chunk_size=args.stream_chunk_size,
+                    ),
                 )
 
-            # Ensure intro directory exists
-            intro_dir.mkdir(parents=True, exist_ok=True)
+                result = driver.synthesize_collect(request)
+                audio = result["audio"]
+                codes = result["codes"]
+                sample_rate = result["sample_rate"]
 
-            # Save codes
-            save_codes_pt(codes, intro_dir / "codes.pt", name=f"intro {intro_id}")
+                if codes is None or codes.shape[1] == 0:
+                    raise RuntimeError("No codes generated")
 
-            # Save WAV
-            sf.write(intro_dir / "audio.wav", audio, sample_rate)
+                # Validate codes
+                codes = validate_codes_for_decoder(
+                    codes, driver.engine.decoder_model, name=f"intro {intro_id}"
+                )
 
-            # Save PCM16LE
-            pcm16 = (np.clip(audio, -1.0, 1.0) * 32767).astype("<i2")
-            (intro_dir / "audio.pcm").write_bytes(pcm16.tobytes())
+                # If audio is missing (e.g. stream_audio=False and not auto-decoded), decode it
+                if audio is None:
+                    logger.info("Decoding audio from codes...")
+                    audio = driver.engine.get_audio_segment(
+                        GenerateResponse(action="sample", codes=codes)
+                    )
 
-            # Save meta.json
-            meta = {
-                "id": intro_id,
-                "text": text,
-                "reference_id": args.reference_id,
-                "sample_rate": sample_rate,
-                "channels": 1,
-                "sample_width": 2,
-                "format": "pcm16le",
-                "code_frames": codes.shape[1],
-                "num_codebooks": codes.shape[0],
-                "audio_samples": len(audio),
-                "duration_ms": int(len(audio) / sample_rate * 1000),
-                "seed": args.seed,
-                "max_new_tokens": args.max_new_tokens,
-                "chunk_length": args.chunk_length,
-                "top_p": args.top_p,
-                "temperature": args.temperature,
-                "repetition_penalty": args.repetition_penalty,
-                "created_at": datetime.now().isoformat(),
-            }
-            with open(intro_dir / "meta.json", "w", encoding="utf-8") as f:
-                json.dump(meta, f, ensure_ascii=False, indent=2)
+                audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+                if audio.size <= 0:
+                    raise RuntimeError("No audio samples generated")
 
-            logger.info("Successfully generated intro: {}", intro_id)
-            generated_count += 1
+                # Ensure intro directory exists
+                intro_dir.mkdir(parents=True, exist_ok=True)
 
-        except Exception as e:
-            logger.exception("Failed to generate intro {}: {}", intro_id, e)
-            failed_count += 1
+                # Save codes
+                save_codes_pt(codes, intro_dir / "codes.pt", name=f"intro {intro_id}")
 
-    logger.info("Build finished:")
-    logger.info("  Generated: {}", generated_count)
-    logger.info("  Failed:    {}", failed_count)
-    logger.info("  Skipped:   {}", skipped_count)
-    logger.info("  Output:    {}", args.output_dir)
+                # Save WAV
+                sf.write(intro_dir / "audio.wav", audio, sample_rate, subtype="PCM_16")
+
+                # Save PCM16LE
+                pcm16 = (np.clip(audio, -1.0, 1.0) * 32767).astype("<i2")
+                (intro_dir / "audio.pcm").write_bytes(pcm16.tobytes())
+
+                # Save meta.json
+                meta = {
+                    "id": intro_id,
+                    "text": text,
+                    "reference_id": args.reference_id,
+                    "sample_rate": sample_rate,
+                    "channels": 1,
+                    "sample_width": 2,
+                    "format": "pcm16le",
+                    "code_frames": codes.shape[1],
+                    "num_codebooks": codes.shape[0],
+                    "audio_samples": len(audio),
+                    "duration_ms": int(len(audio) / sample_rate * 1000),
+                    "seed": args.seed,
+                    "max_new_tokens": args.max_new_tokens,
+                    "chunk_length": args.chunk_length,
+                    "top_p": args.top_p,
+                    "temperature": args.temperature,
+                    "repetition_penalty": args.repetition_penalty,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+                with open(intro_dir / "meta.json", "w", encoding="utf-8") as f:
+                    json.dump(meta, f, ensure_ascii=False, indent=2)
+
+                logger.info("Successfully generated intro: {}", intro_id)
+                generated_count += 1
+
+            except Exception as e:
+                logger.exception("Failed to generate intro {}: {}", intro_id, e)
+                failed_count += 1
+
+        logger.info("Build finished:")
+        logger.info("  Generated: {}", generated_count)
+        logger.info("  Failed:    {}", failed_count)
+        logger.info("  Skipped:   {}", skipped_count)
+        logger.info("  Output:    {}", args.output_dir)
+    finally:
+        driver.close()
 
 
 if __name__ == "__main__":

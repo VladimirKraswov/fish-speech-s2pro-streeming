@@ -146,10 +146,6 @@ class ProxyTTSConfig(BaseModel):
     stateful_synthesis: bool = True
     stateful_fallback_to_stateless: bool = False
 
-    # Важно для длинного текста:
-    # держим небольшой акустический хвост, а не всю историю.
-    # Если держать много history, prompt раздувается, и модель начинает
-    # пропускать слова/куски или повторять.
     stateful_history_turns: int = Field(1, ge=1, le=4)
     stateful_history_chars: int = Field(160, ge=1, le=1000)
     stateful_history_code_frames: int = Field(260, ge=0, le=2000)
@@ -263,6 +259,8 @@ class IntroCacheConfig(BaseModel):
         if value % 2 != 0:
             raise ValueError("intro_cache.emit_bytes must be even for PCM16")
         return value
+
+
 class ProxyConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

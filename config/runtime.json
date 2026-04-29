@@ -24,18 +24,15 @@
     "cache_max_seq_len": 1280,
     "max_new_tokens_cap": 300,
     "sdpa_math": false,
-
     "cleanup_after_request": false,
     "cleanup_every_n_requests": 12,
     "cleanup_on_error": true,
     "cleanup_on_abort": true,
     "empty_cache_per_stream_chunk": false,
     "empty_cache_per_segment": false,
-
     "profile_inference": false,
     "record_memory_history": false,
     "memory_history_max_entries": 100000,
-
     "long_form_auto_split": true,
     "long_form_target_chars": 170,
     "long_form_max_chars": 250,
@@ -128,6 +125,16 @@
     "session": {
       "max_buffer_chars": 20000,
       "auto_close_on_finish": false
+    },
+    "intro_cache": {
+      "enabled": false,
+      "text": "",
+      "max_entries": 16,
+      "ttl_sec": 3600,
+      "warm_on_session_open": false,
+      "ignore_errors": true,
+      "emit_bytes": 8192,
+      "pause_after_ms": 0
     }
   },
   "frontend_overrides": {
@@ -186,7 +193,15 @@
       "playback.pause_after_force_ms",
       "playback.pause_after_hard_limit_ms",
       "session.max_buffer_chars",
-      "session.auto_close_on_finish"
+      "session.auto_close_on_finish",
+      "intro_cache.enabled",
+      "intro_cache.text",
+      "intro_cache.max_entries",
+      "intro_cache.ttl_sec",
+      "intro_cache.warm_on_session_open",
+      "intro_cache.ignore_errors",
+      "intro_cache.emit_bytes",
+      "intro_cache.pause_after_ms"
     ]
   }
 }

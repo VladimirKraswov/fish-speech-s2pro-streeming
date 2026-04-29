@@ -223,7 +223,7 @@ def decode_n_tokens(
                         semantic_logit_bias=semantic_logit_bias,
                         audio_masks=audio_masks,
                         audio_parts=audio_parts,
-                    ).clone()
+                    )
             else:
                 next_token = decode_one_token(
                     model=model,
@@ -236,7 +236,7 @@ def decode_n_tokens(
                     semantic_logit_bias=semantic_logit_bias,
                     audio_masks=audio_masks,
                     audio_parts=audio_parts,
-                ).clone()
+                )
         except Exception as e:
             logger.exception(
                 "stream: decode_n_tokens FAILED at iter={} (cur_token.shape={}): {}",

@@ -119,18 +119,24 @@ class ReferenceLoader:
                             raise ValueError("Acoustic tensor is empty (T=0)")
 
                         # Final validation of num_codebooks if possible
-                        if (
-                            hasattr(self, "decoder_model")
-                            and hasattr(self.decoder_model, "config")
-                            and hasattr(self.decoder_model.config, "num_codebooks")
+                        if hasattr(self, "decoder_model") and hasattr(
+                            self.decoder_model, "quantizer"
                         ):
-                            expected_cb = self.decoder_model.config.num_codebooks
-                            if loaded.shape[0] != expected_cb:
-                                logger.warning(
-                                    "Reference {} codebook count mismatch: got {}, expected {}",
-                                    stem,
-                                    loaded.shape[0],
-                                    expected_cb,
+                            from fish_speech.models.dac.rvq import (
+                                DownsampleResidualVectorQuantize,
+                            )
+
+                            quantizer = self.decoder_model.quantizer
+                            if isinstance(quantizer, DownsampleResidualVectorQuantize):
+                                # expected = residual_n_codebooks + 1 semantic codebook
+                                expected_cb = quantizer.quantizer.n_codebooks + 1
+                            else:
+                                expected_cb = getattr(quantizer, "n_codebooks", None)
+
+                            if expected_cb is not None and loaded.shape[0] != expected_cb:
+                                raise ValueError(
+                                    f"Reference {stem} codebook count mismatch at {codes_path}: "
+                                    f"got {loaded.shape[0]}, expected {expected_cb}. Shape: {loaded.shape}"
                                 )
 
                         prompt_tokens.append(loaded.long().cpu())

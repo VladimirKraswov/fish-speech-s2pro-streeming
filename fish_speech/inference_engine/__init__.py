@@ -199,6 +199,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                 sample_rate = self.decoder_model.sample_rate
 
             segments = []
+            all_codes = []
             seg_idx = 0
             vq_left_context = None
             pending_pcm_tail = None
@@ -252,19 +253,21 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
                     result = wrapped_result.response
                     if result.action != "next":
-                        if emit_token_events and result.codes is not None:
-                            yield InferenceResult(
-                                code="tokens",
-                                audio=None,
-                                error=None,
-                                tokens=(
-                                    result.codes.cpu()
-                                    if getattr(result.codes, "is_cuda", False)
-                                    else result.codes
-                                ),
-                            )
+                        if result.codes is not None:
+                            all_codes.append(result.codes)
+                            if emit_token_events:
+                                yield InferenceResult(
+                                    code="tokens",
+                                    audio=None,
+                                    error=None,
+                                    tokens=(
+                                        result.codes.cpu()
+                                        if getattr(result.codes, "is_cuda", False)
+                                        else result.codes
+                                    ),
+                                )
 
-                        if stream_decode:
+                        if req.stream_audio:
                             logger.info(
                                 "stream: decoding segment seg_idx={} codes_shape={} req={}",
                                 seg_idx + 1,
@@ -281,7 +284,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                         )
 
                         try:
-                            if stream_decode and result.codes is not None:
+                            if req.stream_audio and result.codes is not None:
                                 new_codes = result.codes
                                 context_frames_before = (
                                     vq_left_context.shape[-1]
@@ -307,7 +310,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                                         len(segment),
                                     )
                                     stream_decode_idx += 1
-                            else:
+                            elif req.stream_audio:
                                 if result.codes is not None and not result.codes.is_cuda:
                                     result = GenerateResponse(
                                         result.action,
@@ -315,6 +318,8 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                                         getattr(result, "text", None),
                                     )
                                 segment = self.get_audio_segment(result)
+                            else:
+                                segment = None
                         except Exception as seg_err:
                             if stream_decode:
                                 logger.exception(
@@ -330,38 +335,41 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                                 )
                             raise
 
-                        seg_idx += 1
-                        _mark(
-                            "segment_decoded", segment_idx=seg_idx, samples=len(segment)
-                        )
-                        if stream_decode:
-                            logger.info(
-                                "stream: segment_decoded seg_idx={} samples={} req={}",
-                                seg_idx,
-                                len(segment),
-                                req_tag,
+                        if segment is not None:
+                            seg_idx += 1
+                            _mark(
+                                "segment_decoded",
+                                segment_idx=seg_idx,
+                                samples=len(segment),
                             )
-
-                        if req.stream_audio:
-                            processed_segment, pending_pcm_tail = (
-                                self._crossfade_stream_segment(
-                                    segment=segment,
-                                    pending_tail=pending_pcm_tail,
-                                    sample_rate=sample_rate,
-                                    fade_ms=8.0,
+                            if req.stream_audio:
+                                logger.info(
+                                    "stream: segment_decoded seg_idx={} samples={} req={}",
+                                    seg_idx,
+                                    len(segment),
+                                    req_tag,
                                 )
-                            )
 
-                            if processed_segment.size > 0:
-                                _mark("yield_segment", segment_idx=seg_idx)
-                                yield InferenceResult(
-                                    code="segment",
-                                    audio=(sample_rate, processed_segment),
-                                    error=None,
+                            if req.stream_audio:
+                                processed_segment, pending_pcm_tail = (
+                                    self._crossfade_stream_segment(
+                                        segment=segment,
+                                        pending_tail=pending_pcm_tail,
+                                        sample_rate=sample_rate,
+                                        fade_ms=8.0,
+                                    )
                                 )
-                                segments.append(processed_segment)
-                        else:
-                            segments.append(segment)
+
+                                if processed_segment.size > 0:
+                                    _mark("yield_segment", segment_idx=seg_idx)
+                                    yield InferenceResult(
+                                        code="segment",
+                                        audio=(sample_rate, processed_segment),
+                                        error=None,
+                                    )
+                                    segments.append(processed_segment)
+                            else:
+                                segments.append(segment)
 
                         if self.empty_cache_per_segment and torch.cuda.is_available():
                             torch.cuda.empty_cache()
@@ -391,7 +399,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                     if needs_ack:
                         ack_queue.put(None)
 
-            if len(segments) == 0:
+            if not segments and not all_codes:
                 _mark("yield_error_empty")
                 yield InferenceResult(
                     code="error",
@@ -403,7 +411,14 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             elif req.stream_audio:
                 _mark("stream_done", total_segments=len(segments))
             elif not req.stream_audio:
-                audio = np.concatenate(segments, axis=0)
+                if all_codes:
+                    full_codes = torch.cat(all_codes, dim=1)
+                    audio = self.get_audio_segment(
+                        GenerateResponse(action="sample", codes=full_codes)
+                    )
+                else:
+                    audio = np.concatenate(segments, axis=0)
+
                 _mark("yield_final", total_samples=len(audio), segments=len(segments))
                 yield InferenceResult(
                     code="final",

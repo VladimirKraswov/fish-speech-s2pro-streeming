@@ -76,6 +76,7 @@ def launch_thread_safe_queue(
                 max_seq_len=cache_len,
                 dtype=next(model.parameters()).dtype,
             )
+        model._cache_setup_done = True
         if memory_info is not None:
             gb, count = _model_param_memory_gb(model)
             memory_info["llama_param_gb"] = gb

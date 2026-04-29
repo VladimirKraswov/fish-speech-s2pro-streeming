@@ -316,7 +316,15 @@ class ContentSequence:
 
             # Values[0] is already the Main Token ID (Semantic Begin + Code)
             # Values[1:] should be the codes themselves
-            # Ensure shape matches: all_vq_codes.shape[-1] == encoded.vq_mask_tokens.sum()
+            if all_vq_codes.ndim != 2:
+                raise ValueError(f"VQ codes must be 2D, got {all_vq_codes.ndim}D")
+
+            if all_vq_codes.shape[0] != num_codebooks:
+                raise ValueError(
+                    f"VQ codes and model codebooks mismatch: "
+                    f"codes.C={all_vq_codes.shape[0]}, model.C={num_codebooks}"
+                )
+
             num_vq_tokens = encoded.vq_mask_tokens.sum().item()
             if all_vq_codes.shape[-1] != num_vq_tokens:
                 raise ValueError(

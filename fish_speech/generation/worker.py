@@ -51,6 +51,7 @@ def launch_thread_safe_queue(
     precision,
     compile: bool = False,
     memory_info: dict | None = None,
+    expected_num_codebooks: int | None = None,
 ):
     """
     memory_info: optional shared dict; worker will set llama_param_gb, llama_param_count after load.
@@ -88,6 +89,15 @@ def launch_thread_safe_queue(
             model, decode_one_token = init_model(
                 checkpoint_path, device, precision, compile=compile
             )
+
+            if (
+                expected_num_codebooks is not None
+                and model.config.num_codebooks != expected_num_codebooks
+            ):
+                raise ValueError(
+                    f"Codebook mismatch: LLaMA num_codebooks={model.config.num_codebooks}, "
+                    f"decoder expected={expected_num_codebooks}"
+                )
             cache_len = _cache_max_seq_len(model)
             logger.info(
                 "KV cache max_seq_len={} (model max={})",

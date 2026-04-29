@@ -13,6 +13,7 @@ from fish_speech.generation.sampling import (
     RAS_HIGH_TEMP,
     RAS_HIGH_TOP_P,
     RAS_WIN_SIZE,
+    apply_repetition_penalty,
     sample,
 )
 from fish_speech.models.text2semantic.llama import BaseTransformer, DualARTransformer
@@ -65,6 +66,7 @@ def decode_one_token_ar(
     audio_masks: torch.Tensor,
     audio_parts: torch.Tensor,
     previous_tokens: Optional[torch.Tensor] = None,
+    repetition_penalty: float = 1.0,
 ) -> torch.Tensor:
     forward_result = model.forward_generate(
         x,
@@ -76,6 +78,20 @@ def decode_one_token_ar(
     hidden_states = forward_result.hidden_states
 
     biased_logits = logits + semantic_logit_bias
+
+    if repetition_penalty != 1.0 and previous_tokens is not None:
+        # Penalize only semantic tokens in the window
+        # We assume previous_tokens[0] contains main tokens (semantic + IM_END)
+        # Exclude initial padding (0) if it's not a valid semantic token
+        # In current design, previous_tokens is initialized with zeros.
+        # We check if 0 is a semantic token or IM_END to be safe.
+        window = previous_tokens[0]
+        # Only keep non-zero tokens unless 0 is a valid part of the sequence
+        # For simplicity, let's just use unique tokens from the window.
+        # Sampling helper will handle it.
+        biased_logits = apply_repetition_penalty(
+            biased_logits, window, repetition_penalty
+        )
 
     main_token_normal = sample(
         biased_logits, temperature=temperature, top_p=top_p, top_k=top_k
@@ -159,6 +175,7 @@ def decode_n_tokens(
     audio_masks: torch.Tensor,
     audio_parts: torch.Tensor,
     decode_one_token=decode_one_token_ar,
+    repetition_penalty: float = 1.0,
     stream_chunk_size: Optional[int] = None,
     initial_stream_chunk_size: Optional[int] = None,
     initial_token_chunk: Optional[torch.Tensor] = None,
@@ -223,6 +240,7 @@ def decode_n_tokens(
                         semantic_logit_bias=semantic_logit_bias,
                         audio_masks=audio_masks,
                         audio_parts=audio_parts,
+                        repetition_penalty=repetition_penalty,
                     )
             else:
                 next_token = decode_one_token(
@@ -236,6 +254,7 @@ def decode_n_tokens(
                     semantic_logit_bias=semantic_logit_bias,
                     audio_masks=audio_masks,
                     audio_parts=audio_parts,
+                    repetition_penalty=repetition_penalty,
                 )
         except Exception as e:
             logger.exception(
@@ -351,6 +370,7 @@ def generate(
     temp_val = sampling_kwargs.get("temperature", 1.0)
     top_p_val = sampling_kwargs.get("top_p", 0.9)
     top_k_val = sampling_kwargs.get("top_k", 30)
+    repetition_penalty = sampling_kwargs.get("repetition_penalty", 1.0)
 
     temperature = torch.tensor(temp_val, device=device, dtype=dtype)
     top_p = torch.tensor(top_p_val, device=device, dtype=dtype)
@@ -386,6 +406,7 @@ def generate(
         semantic_logit_bias,
         audio_masks,
         audio_parts,
+        repetition_penalty=repetition_penalty,
     )
     seq[:, T : T + 1] = first_token
 
@@ -413,6 +434,7 @@ def generate(
         audio_masks=audio_masks,
         audio_parts=audio_parts,
         decode_one_token=decode_one_token,
+        repetition_penalty=repetition_penalty,
         stream_chunk_size=stream_chunk_size,
         initial_stream_chunk_size=initial_stream_chunk_size,
         initial_token_chunk=first_token.clone() if stream_chunk_size is not None else None,

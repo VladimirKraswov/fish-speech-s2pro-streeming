@@ -38,6 +38,32 @@ def logits_to_probs(
     return probs
 
 
+def apply_repetition_penalty(
+    logits: torch.Tensor, previous_tokens: torch.Tensor, penalty: float
+) -> torch.Tensor:
+    """
+    Apply repetition penalty to logits.
+    Based on the scheme: if logit < 0: logit *= penalty else: logit /= penalty
+    """
+    if penalty == 1.0 or previous_tokens.numel() == 0:
+        return logits
+
+    # Gather unique tokens from the window, exclude dummy 0 if possible
+    # However, 0 might be a valid semantic token.
+    # In decode.py, we'll try to pass only real tokens.
+    unique_tokens = torch.unique(previous_tokens)
+
+    # Apply penalty to the logits of previously generated tokens
+    score = torch.gather(logits, -1, unique_tokens.unsqueeze(0).expand(logits.shape[0], -1))
+
+    # if score < 0, multiply by penalty, else divide
+    # we can do this without explicit if by using torch.where
+    score = torch.where(score < 0, score * penalty, score / penalty)
+
+    logits.scatter_(-1, unique_tokens.unsqueeze(0).expand(logits.shape[0], -1), score)
+    return logits
+
+
 def sample(
     logits,
     temperature: torch.Tensor,

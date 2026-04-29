@@ -106,25 +106,51 @@ def generate_committed_segments(
     if not raw_segments and text and text.strip():
         raw_segments = [text]
 
-    if model_cfg.long_form_auto_split:
+    if model_cfg.long_form_auto_split and chunk_length > 0:
+        target_chars = max(40, int(chunk_length))
+        max_chars = max(target_chars, int(target_chars * 1.5))
         committed_segments = []
         for segment in raw_segments:
             committed_segments.extend(
                 split_long_text(
                     segment,
-                    target_chars=model_cfg.long_form_target_chars,
-                    max_chars=model_cfg.long_form_max_chars,
+                    target_chars=target_chars,
+                    max_chars=max_chars,
                 )
             )
+        split_source = "request_chunk_length"
+    elif model_cfg.long_form_auto_split and chunk_length <= 0:
+        # chunk_length <= 0 means disable request-level auto splitting for this request
+        committed_segments = raw_segments
+        target_chars = 0
+        max_chars = 0
+        split_source = "disabled_by_request"
+    elif model_cfg.long_form_auto_split:
+        target_chars = model_cfg.long_form_target_chars
+        max_chars = model_cfg.long_form_max_chars
+        committed_segments = []
+        for segment in raw_segments:
+            committed_segments.extend(
+                split_long_text(
+                    segment,
+                    target_chars=target_chars,
+                    max_chars=max_chars,
+                )
+            )
+        split_source = "runtime_config"
     else:
         committed_segments = raw_segments
+        target_chars = 0
+        max_chars = 0
+        split_source = "disabled_globally"
 
     logger.info(
-        "long_form_split: input_segments={} output_segments={} target_chars={} max_chars={} text_chars={}",
+        "long_form_split: source={} input_segments={} output_segments={} target_chars={} max_chars={} text_chars={}",
+        split_source,
         len(raw_segments),
         len(committed_segments),
-        model_cfg.long_form_target_chars,
-        model_cfg.long_form_max_chars,
+        target_chars,
+        max_chars,
         sum(len(s) for s in raw_segments),
     )
 
@@ -489,6 +515,7 @@ def generate_committed_segments(
                     temperature=temperature,
                     top_p=top_p,
                     top_k=top_k,
+                    repetition_penalty=repetition_penalty,
                     stream_chunk_size=stream_chunk_size,
                     initial_stream_chunk_size=initial_stream_chunk_size,
                     compile=compile,
@@ -590,6 +617,7 @@ def generate_committed_segments(
                     temperature=temperature,
                     top_p=top_p,
                     top_k=top_k,
+                    repetition_penalty=repetition_penalty,
                     compile=compile,
                 )
 

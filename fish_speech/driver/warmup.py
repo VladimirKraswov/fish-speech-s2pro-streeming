@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from fish_speech.driver.types import DriverGenerationOptions, DriverSynthesisRequest
+from fish_speech.driver.types import (
+    DriverErrorEvent,
+    DriverGenerationOptions,
+    DriverSynthesisRequest,
+)
 
 
 def run_driver_warmup(driver) -> None:
@@ -22,5 +26,10 @@ def run_driver_warmup(driver) -> None:
             stream_chunk_size=warmup.stream_chunk_size,
         ),
     )
-    for _ in driver.synthesize(request):
-        pass
+    for event in driver.synthesize(request):
+        if isinstance(event, DriverErrorEvent):
+            if event.error is not None:
+                raise RuntimeError(f"Warmup synthesis failed: {event.error}") from (
+                    event.error if isinstance(event.error, Exception) else None
+                )
+            raise RuntimeError("Warmup synthesis failed with an unknown error")

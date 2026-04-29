@@ -77,9 +77,17 @@ class FishSpeechDriver:
         config: Any | None = None,
         memory_info: dict | None = None,
     ) -> "FishSpeechDriver":
+        from fish_speech.codec.codes import expected_codebooks_from_decoder
         from fish_speech.codec.dac import load_model as load_decoder_model
         from fish_speech.generation.worker import launch_thread_safe_queue
         from fish_speech.inference_engine import TTSInferenceEngine
+
+        decoder_model = load_decoder_model(
+            config_name=decoder_config_name,
+            checkpoint_path=decoder_checkpoint_path,
+            device=device,
+        )
+        expected_codebooks = expected_codebooks_from_decoder(decoder_model)
 
         llama_queue = launch_thread_safe_queue(
             checkpoint_path=llama_checkpoint_path,
@@ -87,12 +95,9 @@ class FishSpeechDriver:
             precision=precision,
             compile=compile,
             memory_info=memory_info,
+            expected_num_codebooks=expected_codebooks,
         )
-        decoder_model = load_decoder_model(
-            config_name=decoder_config_name,
-            checkpoint_path=decoder_checkpoint_path,
-            device=device,
-        )
+
         engine = TTSInferenceEngine(
             llama_queue=llama_queue,
             decoder_model=decoder_model,

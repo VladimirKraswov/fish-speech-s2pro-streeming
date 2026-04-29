@@ -214,7 +214,7 @@ class ContentSequence:
                 tokens = semantic_map[semantic_codes].to(torch.long)
 
                 vq_parts.append(curr_codes)
-                vq_require_losses.append(part.cal_loss)
+                vq_require_losses.append(part.cal_loss is True)
             elif isinstance(part, AudioPart):
                 raise NotImplementedError("AudioPart is not supported by encode() yet")
             else:

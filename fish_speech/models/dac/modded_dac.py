@@ -989,8 +989,10 @@ class DAC(BaseModel, CodecMixin):
             "audio" : Tensor[B x 1 x length]
                 Decoded audio data.
         """
+        if sample_rate is not None:
+            assert sample_rate == self.sample_rate
+
         length = audio_data.shape[-1]
-        audio_data = self.preprocess(audio_data, sample_rate)
         indices, indices_lens = self.encode(
             audio_data, n_quantizers=n_quantizers, **kwargs
         )

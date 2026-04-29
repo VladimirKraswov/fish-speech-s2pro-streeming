@@ -14,6 +14,12 @@ class VQManager:
         self.decoder_model: DAC
         self.load_audio: Callable
 
+    def _get_decoder_device(self) -> torch.device:
+        device = getattr(self.decoder_model, "device", None)
+        if device is not None:
+            return torch.device(device)
+        return next(self.decoder_model.parameters()).device
+
     def decode_vq_tokens(self, codes):
         chunk_len = codes.shape[1] if codes.dim() >= 2 else 0
         logger.info("VQ features: {} (stream chunk={})", codes.shape, chunk_len)
@@ -41,13 +47,14 @@ class VQManager:
             )
 
             if isinstance(self.decoder_model, DAC):
-                decoder_lock = getattr(self, "_decoder_lock", None)
-                if decoder_lock:
-                    decoder_lock.acquire()
+                from contextlib import nullcontext
 
-                try:
-                    device = getattr(self.decoder_model, "device", None)
-                    on_cuda = device is not None and str(device).startswith("cuda")
+                lock = getattr(self, "_decoder_lock", None)
+                lock_ctx = lock if lock is not None else nullcontext()
+
+                with lock_ctx:
+                    device = self._get_decoder_device()
+                    on_cuda = str(device).startswith("cuda")
                     if on_cuda:
                         torch.cuda.empty_cache()
                         self.decoder_model.to("cpu")
@@ -61,9 +68,6 @@ class VQManager:
                         prompt_tokens = self.decoder_model.encode(audios, audio_lengths)[
                             0
                         ][0]
-                finally:
-                    if decoder_lock:
-                        decoder_lock.release()
 
                 logger.info("Encoded prompt: {}", prompt_tokens.shape)
             else:

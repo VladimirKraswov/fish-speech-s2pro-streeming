@@ -461,7 +461,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
         stream_tokens = bool(req.stream_tokens or req.stream_audio)
         request = dict(
-            device=self.decoder_model.device,
+            device=self._get_decoder_device(),
             req_tag=req_tag,
             max_new_tokens=req.max_new_tokens,
             text=req.text,
@@ -600,8 +600,9 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         """
         Decode the VQ tokens to audio.
         """
+        from fish_speech.codec.codes import estimate_code_frames
 
-        if result.codes is None:
+        if result.codes is None or estimate_code_frames(result.codes) == 0:
             return np.zeros(0, dtype=np.float32)
 
         with self._decoder_lock:
@@ -610,13 +611,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                 result.codes, self.decoder_model, name="generated codes"
             )
 
-            decoder_device = getattr(self.decoder_model, "device", None)
-            if decoder_device is None:
-                try:
-                    decoder_device = next(self.decoder_model.parameters()).device
-                except (AttributeError, StopIteration):
-                    decoder_device = codes.device
-
+            decoder_device = self._get_decoder_device()
             if codes.device != decoder_device:
                 codes = codes.to(decoder_device)
 

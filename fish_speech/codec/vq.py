@@ -41,21 +41,30 @@ class VQManager:
             )
 
             if isinstance(self.decoder_model, DAC):
-                device = getattr(self.decoder_model, "device", None)
-                on_cuda = device is not None and str(device).startswith("cuda")
-                if on_cuda:
-                    torch.cuda.empty_cache()
-                    self.decoder_model.to("cpu")
-                    try:
-                        prompt_tokens = self.decoder_model.encode(
-                            audios, audio_lengths
-                        )[0][0]
-                    finally:
-                        self.decoder_model.to(device)
-                else:
-                    prompt_tokens = self.decoder_model.encode(audios, audio_lengths)[0][
-                        0
-                    ]
+                decoder_lock = getattr(self, "_decoder_lock", None)
+                if decoder_lock:
+                    decoder_lock.acquire()
+
+                try:
+                    device = getattr(self.decoder_model, "device", None)
+                    on_cuda = device is not None and str(device).startswith("cuda")
+                    if on_cuda:
+                        torch.cuda.empty_cache()
+                        self.decoder_model.to("cpu")
+                        try:
+                            prompt_tokens = self.decoder_model.encode(
+                                audios, audio_lengths
+                            )[0][0]
+                        finally:
+                            self.decoder_model.to(device)
+                    else:
+                        prompt_tokens = self.decoder_model.encode(audios, audio_lengths)[
+                            0
+                        ][0]
+                finally:
+                    if decoder_lock:
+                        decoder_lock.release()
+
                 logger.info("Encoded prompt: {}", prompt_tokens.shape)
             else:
                 raise ValueError(f"Unknown model type: {type(self.decoder_model)}")

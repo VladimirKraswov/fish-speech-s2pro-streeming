@@ -61,8 +61,8 @@ class Conversation:
 
             # Add message parts
             for part in message.parts:
-                # Inherit cal_loss from message if not set at part level
-                if not hasattr(part, "cal_loss") or part.cal_loss is False:
+                # Inherit cal_loss from message if not set at part level.
+                if part.cal_loss is None:
                     new_part = deepcopy(part)
                     new_part.cal_loss = message.cal_loss
                     all_parts.append(new_part)
@@ -83,7 +83,7 @@ class Conversation:
         add_shift: bool = True,
         ignore_loss_tokens: list[str] = [],
         metadata: dict | None = None,
-        max_length: int | None = None,
+        max_length: int | None = None,  # TODO: Implement max_length truncation
     ) -> EncodedMessage:
         # Build ContentSequence from messages
         content_seq = self._build_content_sequence(metadata=metadata)

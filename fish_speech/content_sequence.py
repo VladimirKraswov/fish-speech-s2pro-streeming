@@ -25,7 +25,7 @@ def restore_ndarray(obj, to_tensor: bool = False):
 @dataclass
 class BasePart:
     type: Literal["text", "vq", "audio"] | None = None
-    cal_loss: bool = False
+    cal_loss: bool | None = None
 
 
 @dataclass(kw_only=True)
@@ -231,7 +231,7 @@ class ContentSequence:
                 audio_masks.append(torch.zeros_like(tokens, dtype=torch.bool))
 
             # Set labels based on whether we want to calculate loss for this part
-            if part.cal_loss:
+            if getattr(part, "cal_loss", None) is True:
                 all_labels.append(tokens.clone())
             else:
                 all_labels.append(torch.full_like(tokens, -100))

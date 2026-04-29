@@ -106,38 +106,34 @@ def generate_committed_segments(
     if not raw_segments and text and text.strip():
         raw_segments = [text]
 
-    if model_cfg.long_form_auto_split and chunk_length > 0:
-        target_chars = max(40, int(chunk_length))
-        max_chars = max(target_chars, int(target_chars * 1.5))
-        committed_segments = []
-        for segment in raw_segments:
-            committed_segments.extend(
-                split_long_text(
-                    segment,
-                    target_chars=target_chars,
-                    max_chars=max_chars,
+    if model_cfg.long_form_auto_split:
+        if chunk_length > 0:
+            target_chars = max(40, int(chunk_length))
+            max_chars = max(target_chars, int(target_chars * 1.5))
+            split_source = "request_chunk_length"
+        elif chunk_length == 0:
+            # chunk_length == 0 means disable request-level auto splitting
+            target_chars = 0
+            max_chars = 0
+            split_source = "disabled_by_request"
+        else:
+            # Use runtime config defaults if chunk_length is not explicitly set to 0 or positive
+            target_chars = model_cfg.long_form_target_chars
+            max_chars = model_cfg.long_form_max_chars
+            split_source = "runtime_config"
+
+        if target_chars > 0:
+            committed_segments = []
+            for segment in raw_segments:
+                committed_segments.extend(
+                    split_long_text(
+                        segment,
+                        target_chars=target_chars,
+                        max_chars=max_chars,
+                    )
                 )
-            )
-        split_source = "request_chunk_length"
-    elif model_cfg.long_form_auto_split and chunk_length <= 0:
-        # chunk_length <= 0 means disable request-level auto splitting for this request
-        committed_segments = raw_segments
-        target_chars = 0
-        max_chars = 0
-        split_source = "disabled_by_request"
-    elif model_cfg.long_form_auto_split:
-        target_chars = model_cfg.long_form_target_chars
-        max_chars = model_cfg.long_form_max_chars
-        committed_segments = []
-        for segment in raw_segments:
-            committed_segments.extend(
-                split_long_text(
-                    segment,
-                    target_chars=target_chars,
-                    max_chars=max_chars,
-                )
-            )
-        split_source = "runtime_config"
+        else:
+            committed_segments = raw_segments
     else:
         committed_segments = raw_segments
         target_chars = 0

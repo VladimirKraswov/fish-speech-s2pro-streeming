@@ -991,10 +991,11 @@ class DAC(BaseModel, CodecMixin):
         """
         length = audio_data.shape[-1]
         audio_data = self.preprocess(audio_data, sample_rate)
-        vq_results = self.encode(audio_data, n_quantizers, **kwargs)
-        z = vq_results[0] if isinstance(vq_results, tuple) else vq_results.z
-        x = self.decode(z)
-        return x[..., :length], vq_results
+        indices, indices_lens = self.encode(
+            audio_data, n_quantizers=n_quantizers, **kwargs
+        )
+        x = self.from_indices(indices)
+        return x[..., :length], (indices, indices_lens)
 
 
 if __name__ == "__main__":

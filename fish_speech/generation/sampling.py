@@ -44,23 +44,24 @@ def apply_repetition_penalty(
     """
     Apply repetition penalty to logits.
     Based on the scheme: if logit < 0: logit *= penalty else: logit /= penalty
+    Works for logits of shape [vocab], [B, vocab], [B, T, vocab].
     """
     if penalty == 1.0 or previous_tokens.numel() == 0:
         return logits
 
-    # Gather unique tokens from the window, exclude dummy 0 if possible
-    # However, 0 might be a valid semantic token.
-    # In decode.py, we'll try to pass only real tokens.
-    unique_tokens = torch.unique(previous_tokens)
+    vocab_size = logits.shape[-1]
+    unique_tokens = torch.unique(previous_tokens.to(torch.long))
+    unique_tokens = unique_tokens[(unique_tokens >= 0) & (unique_tokens < vocab_size)]
 
-    # Apply penalty to the logits of previously generated tokens
-    score = torch.gather(logits, -1, unique_tokens.unsqueeze(0).expand(logits.shape[0], -1))
+    if unique_tokens.numel() == 0:
+        return logits
 
-    # if score < 0, multiply by penalty, else divide
-    # we can do this without explicit if by using torch.where
-    score = torch.where(score < 0, score * penalty, score / penalty)
-
-    logits.scatter_(-1, unique_tokens.unsqueeze(0).expand(logits.shape[0], -1), score)
+    logits = logits.clone()
+    scores = logits[..., unique_tokens]
+    # Apply penalty: if score > 0, divide by penalty. If score <= 0, multiply by penalty.
+    # Note: Using torch.where to avoid in-place issues and maintain vectorization.
+    new_scores = torch.where(scores > 0, scores / penalty, scores * penalty)
+    logits[..., unique_tokens] = new_scores
     return logits
 
 

@@ -43,6 +43,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         self.cleanup_every_n_requests = model_cfg.cleanup_every_n_requests
         self._success_since_cleanup = 0
         self._cleanup_lock = threading.Lock()
+        self._decoder_lock = threading.Lock()
 
     def _cuda_cleanup(self, *, reason: str) -> None:
         if not torch.cuda.is_available():
@@ -603,18 +604,23 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         if result.codes is None:
             return np.zeros(0, dtype=np.float32)
 
-        codes = result.codes
-        decoder_device = getattr(self.decoder_model, "device", None)
-        if decoder_device is None:
-            try:
-                decoder_device = next(self.decoder_model.parameters()).device
-            except (AttributeError, StopIteration):
-                decoder_device = codes.device
+        with self._decoder_lock:
+            # Standardize and validate codes
+            codes = validate_codes_for_decoder(
+                result.codes, self.decoder_model, name="generated codes"
+            )
 
-        if codes.device != decoder_device:
-            codes = codes.to(decoder_device)
+            decoder_device = getattr(self.decoder_model, "device", None)
+            if decoder_device is None:
+                try:
+                    decoder_device = next(self.decoder_model.parameters()).device
+                except (AttributeError, StopIteration):
+                    decoder_device = codes.device
 
-        with torch.inference_mode():
-            segment = self.decode_vq_tokens(codes=codes)
+            if codes.device != decoder_device:
+                codes = codes.to(decoder_device)
+
+            with torch.inference_mode():
+                segment = self.decode_vq_tokens(codes=codes)
 
         return segment.float().detach().cpu().numpy().astype(np.float32, copy=False)

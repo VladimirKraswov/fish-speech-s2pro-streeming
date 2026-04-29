@@ -127,12 +127,12 @@
       "auto_close_on_finish": false
     },
     "intro_cache": {
-      "enabled": false,
-      "text": "",
+      "enabled": true,
+      "text": "Привет. Сейчас начну отвечать.",
       "max_entries": 16,
       "ttl_sec": 3600,
-      "warm_on_session_open": false,
-      "ignore_errors": true,
+      "warm_on_session_open": true,
+      "ignore_errors": false,
       "emit_bytes": 8192,
       "pause_after_ms": 0
     }

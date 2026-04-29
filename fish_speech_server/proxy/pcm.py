@@ -109,6 +109,8 @@ class IntroCacheEntry:
     audio_meta: dict[str, Any]
     pcm: bytes
     text: str
+    codes: list[list[int]] | None = None
+    code_frames: int = 0
 
 
 class IntroCache:
@@ -200,6 +202,7 @@ class SessionRecord:
     buffer_text: str = ""
     input_closed: bool = False
     synthesis_session_id: str | None = None
+    intro_preloaded_cache_key: str | None = None
     audio_meta: dict[str, Any] | None = None
     stream_started: bool = False
     stream_finished: bool = False
@@ -683,6 +686,7 @@ def _intro_cache_key(config: ProxyConfig) -> str:
     payload = {
         "text": config.intro_cache.text,
         "reference_id": tts.reference_id or config.default_reference_id,
+        "format": tts.format,
         "seed": tts.seed,
         "normalize": tts.normalize,
         "use_memory_cache": tts.use_memory_cache,
@@ -691,9 +695,11 @@ def _intro_cache_key(config: ProxyConfig) -> str:
         "top_p": tts.top_p,
         "repetition_penalty": tts.repetition_penalty,
         "temperature": tts.temperature,
-        "stream_tokens": tts.stream_tokens,
+        "stream_tokens": True,
         "initial_stream_chunk_size": tts.initial_stream_chunk_size,
         "stream_chunk_size": tts.stream_chunk_size,
+        "first_initial_stream_chunk_size": tts.first_initial_stream_chunk_size,
+        "first_stream_chunk_size": tts.first_stream_chunk_size,
         "upstream_url": UPSTREAM_TTS_URL,
     }
     dump = json.dumps(payload, sort_keys=True)
@@ -708,68 +714,123 @@ async def _generate_intro_cache_entry(
     client: httpx.AsyncClient,
 ) -> IntroCacheEntry:
     payload = build_upstream_payload(text=text, config=config, commit_seq=1)
+    payload["streaming"] = True
+    payload["stream_tokens"] = True
+    payload["format"] = "wav"
+
+    url = UPSTREAM_TTS_URL.replace(
+        "/v1/tts",
+        "/v1/synthesis/intro-cache/generate",
+    )
 
     logger.info(
-        "generating intro cache key=%s text=%r ref=%s",
+        "generating intro cache key=%s text=%r ref=%s url=%s",
         key[:8],
         text[:100],
         payload["reference_id"],
+        url,
     )
 
-    # force stateless /v1/tts
-    url = UPSTREAM_TTS_URL
-
-    async with client.stream(
-        "POST",
+    resp = await client.post(
         url,
         json=payload,
-        headers=_auth_headers(),
-    ) as upstream:
-        if upstream.status_code != 200:
-            text_body = await upstream.aread()
-            msg = text_body.decode("utf-8", errors="replace")
-            raise RuntimeError(f"intro generation failed status={upstream.status_code}: {msg}")
+        headers=_auth_headers({"Accept": "application/json"}),
+    )
 
-        header_buffer = bytearray()
-        pcm_buffer = bytearray()
-        header_sent = False
-        parsed_meta = None
-        data_offset = 0
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"intro generation failed status={resp.status_code}: {resp.text}"
+        )
 
-        async for chunk in upstream.aiter_raw(1024):
-            if not header_sent:
-                header_buffer.extend(chunk)
-                parsed = _parse_wav_header(header_buffer)
-                if parsed:
-                    sample_rate, channels, bits_per_sample, data_offset = parsed
-                    if bits_per_sample != 16:
-                        raise RuntimeError(f"unsupported bits_per_sample={bits_per_sample}")
-                    parsed_meta = {
-                        "sample_rate": sample_rate,
-                        "channels": channels,
-                        "sample_width": bits_per_sample // 8,
-                    }
-                    pcm_buffer.extend(header_buffer[data_offset:])
-                    header_sent = True
-            else:
-                pcm_buffer.extend(chunk)
+    data = resp.json()
+    pcm_b64 = data.get("pcm_b64") or ""
+    audio_meta = data.get("audio_meta") or {}
+    codes = data.get("codes")
+    code_frames = int(data.get("code_frames") or 0)
 
-    if not header_sent or parsed_meta is None:
-        raise RuntimeError("upstream finished before WAV data header was parsed")
+    if not pcm_b64:
+        raise RuntimeError("intro generation returned empty pcm_b64")
 
-    pcm = bytes(pcm_buffer)
+    pcm = base64.b64decode(pcm_b64)
+
     if not pcm:
-        raise RuntimeError("upstream returned empty PCM for intro")
+        raise RuntimeError("intro generation returned empty PCM")
+
+    if config.tts.stateful_synthesis and (not codes or code_frames <= 0):
+        raise RuntimeError(
+            "intro generation returned PCM but no continuation codes; "
+            "seamless cached intro requires codes"
+        )
 
     now = time.time()
     return IntroCacheEntry(
         key=key,
         created_at=now,
         expires_at=now + config.intro_cache.ttl_sec,
-        audio_meta=parsed_meta,
+        audio_meta=audio_meta,
         pcm=pcm,
         text=text,
+        codes=codes,
+        code_frames=code_frames,
     )
+
+
+async def _preload_intro_cache_context(
+    *,
+    rec: SessionRecord,
+    config: ProxyConfig,
+    entry: IntroCacheEntry,
+    client: httpx.AsyncClient,
+) -> bool:
+    if not config.tts.stateful_synthesis:
+        return False
+
+    if not rec.synthesis_session_id:
+        raise RuntimeError(
+            "cannot emit seamless intro cache: upstream synthesis session is missing"
+        )
+
+    if rec.intro_preloaded_cache_key == entry.key:
+        return True
+
+    if not entry.codes or entry.code_frames <= 0:
+        raise RuntimeError("cannot preload intro cache context: cached entry has no codes")
+
+    url = UPSTREAM_TTS_URL.replace(
+        "/v1/tts",
+        "/v1/synthesis/sessions/preload",
+    )
+
+    payload = {
+        "synthesis_session_id": rec.synthesis_session_id,
+        "text": entry.text,
+        "codes": entry.codes,
+        "commit_seq": 0,
+        "commit_reason": "intro_cache",
+    }
+
+    resp = await client.post(
+        url,
+        json=payload,
+        headers=_auth_headers({"Accept": "application/json"}),
+    )
+
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"intro context preload failed status={resp.status_code}: {resp.text}"
+        )
+
+    rec.intro_preloaded_cache_key = entry.key
+
+    logger.info(
+        "intro context preloaded session=%s synthesis=%s key=%s code_frames=%s",
+        rec.session_id[:8],
+        rec.synthesis_session_id[:8],
+        entry.key[:8],
+        entry.code_frames,
+    )
+
+    return True
 
 
 async def emit_intro_cache(
@@ -792,6 +853,25 @@ async def emit_intro_cache(
 
     if entry is None:
         return
+
+    preloaded = await _preload_intro_cache_context(
+        rec=rec,
+        config=config,
+        entry=entry,
+        client=client,
+    )
+
+    if preloaded:
+        yield await emit(
+            {
+                "type": "intro_context_preloaded",
+                "req_id": req_id,
+                "session_id": rec.session_id,
+                "synthesis_session_id": rec.synthesis_session_id,
+                "cache_key": entry.key,
+                "code_frames": entry.code_frames,
+            }
+        )
 
     # Check if meta matches if already set
     if rec.audio_meta is not None:
@@ -1502,12 +1582,20 @@ async def session_open(req: SessionOpenRequest) -> JSONResponse:
     ):
         try:
             async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
-                await intro_cache.get_or_create(
+                entry = await intro_cache.get_or_create(
                     key=_intro_cache_key(config),
                     text=config.intro_cache.text,
                     config=config,
                     client=client,
                 )
+
+                if entry is not None:
+                    await _preload_intro_cache_context(
+                        rec=rec,
+                        config=config,
+                        entry=entry,
+                        client=client,
+                    )
         except Exception as exc:
             if not config.intro_cache.ignore_errors:
                 await session_store.close(rec.session_id)

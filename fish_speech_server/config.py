@@ -233,27 +233,28 @@ class IntroCacheConfig(BaseModel):
 
     enabled: bool = False
 
-    # Текст intro, который можно заранее прогреть/закешировать.
-    # Например: короткая приветственная фраза или первый стабильный кусок ответа.
+    # Текст, который будет синтезироваться и кэшироваться.
+    # Например: короткое приветствие или стабильный intro-фрагмент.
     text: str = ""
 
-    # Максимум cache entries на proxy-сессию/процесс.
+    # Максимум записей в памяти proxy.
     max_entries: int = Field(16, ge=1, le=256)
 
-    # TTL intro cache entry.
+    # TTL записи в секундах.
     ttl_sec: int = Field(3600, ge=1, le=86400)
 
-    # Если true — proxy попробует подготовить intro при /session/open.
-    # Ошибки можно игнорировать через ignore_errors.
+    # Если true — при /session/open сразу прогревать intro cache.
+    # Если false — lazy generate при первом /pcm-stream.
     warm_on_session_open: bool = False
 
-    # Если true — ошибки intro cache не ломают основную сессию.
+    # Если true — при ошибке генерации intro не валить session,
+    # а просто пропустить intro и продолжить обычный stream.
     ignore_errors: bool = True
 
-    # Размер отдаваемого PCM чанка для intro cache.
+    # Размер PCM чанка для отдачи intro.
     emit_bytes: int = Field(8192, ge=512, le=65536)
 
-    # Опциональная пауза после intro.
+    # Пауза после intro перед первым реальным commit.
     pause_after_ms: int = Field(0, ge=0, le=3000)
 
     @field_validator("emit_bytes")
@@ -262,8 +263,6 @@ class IntroCacheConfig(BaseModel):
         if value % 2 != 0:
             raise ValueError("intro_cache.emit_bytes must be even for PCM16")
         return value
-
-
 class ProxyConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

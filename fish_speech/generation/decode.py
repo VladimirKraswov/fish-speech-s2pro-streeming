@@ -82,15 +82,25 @@ def decode_one_token_ar(
     if repetition_penalty != 1.0 and previous_tokens is not None:
         # Penalize only semantic tokens in the window
         # We assume previous_tokens[0] contains main tokens (semantic + IM_END)
-        # Exclude initial padding (0) if it's not a valid semantic token
-        # In current design, previous_tokens is initialized with zeros.
-        # We check if 0 is a semantic token or IM_END to be safe.
         window = previous_tokens[0]
-        # Only keep non-zero tokens unless 0 is a valid part of the sequence
-        # For simplicity, let's just use unique tokens from the window.
-        # Sampling helper will handle it.
+
+        # Prepare valid_token_mask: semantic tokens + IM_END
+        tokenizer = getattr(model, "tokenizer", None)
+        valid_token_mask = None
+        if tokenizer is not None:
+            valid_token_mask = getattr(tokenizer, "semantic_token_mask", None)
+            if valid_token_mask is not None:
+                # IM_END id is also valid for repetition penalty
+                im_end_id = tokenizer.get_token_id(IM_END_TOKEN)
+                if 0 <= im_end_id < valid_token_mask.shape[0]:
+                    valid_token_mask = valid_token_mask.clone()
+                    valid_token_mask[im_end_id] = True
+
         biased_logits = apply_repetition_penalty(
-            biased_logits, window, repetition_penalty
+            biased_logits,
+            window,
+            repetition_penalty,
+            valid_token_mask=valid_token_mask,
         )
 
     main_token_normal = sample(

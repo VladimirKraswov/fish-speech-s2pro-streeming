@@ -220,6 +220,53 @@ def validate_codes_for_decoder(
 ) -> torch.Tensor:
     """
     Normalize and validate codes for a specific decoder model.
+    Checks shape, codebook count, and value ranges.
     """
     expected = expected_codebooks_from_decoder(decoder_model)
-    return normalize_codes(codes, expected_codebooks=expected, name=name)
+    codes = normalize_codes(codes, expected_codebooks=expected, name=name)
+
+    # Range validation
+    if decoder_model is not None:
+        quantizer = getattr(decoder_model, "quantizer", None)
+        if quantizer is not None:
+            # Check for DownsampleResidualVectorQuantize
+            if quantizer.__class__.__name__ == "DownsampleResidualVectorQuantize":
+                # semantic codebook size
+                sem_q = getattr(quantizer, "semantic_quantizer", None)
+                sem_size = getattr(sem_q, "codebook_size", 4096)
+
+                # acoustic codebook size
+                ac_q = getattr(quantizer, "quantizer", None)
+                ac_size = getattr(ac_q, "codebook_size", 1024)
+
+                # Validate semantic codes (row 0)
+                sem_codes = codes[0]
+                if (sem_codes < 0).any() or (sem_codes >= sem_size).any():
+                    raise ValueError(
+                        f"{name} semantic codes out of range [0, {sem_size}): "
+                        f"min={sem_codes.min()}, max={sem_codes.max()}"
+                    )
+
+                # Validate acoustic codes (rows 1+)
+                if codes.shape[0] > 1:
+                    ac_codes = codes[1:]
+                    if (ac_codes < 0).any() or (ac_codes >= ac_size).any():
+                        raise ValueError(
+                            f"{name} acoustic codes out of range [0, {ac_size}): "
+                            f"min={ac_codes.min()}, max={ac_codes.max()}"
+                        )
+            else:
+                # Generic fallback for other quantizers
+                size = getattr(quantizer, "codebook_size", None)
+                if size is not None:
+                    if (codes < 0).any() or (codes >= size).any():
+                        raise ValueError(
+                            f"{name} codes out of range [0, {size}): "
+                            f"min={codes.min()}, max={codes.max()}"
+                        )
+
+    # Basic non-negative check if we couldn't determine specific ranges
+    if (codes < 0).any():
+        raise ValueError(f"{name} contains negative codes: min={codes.min()}")
+
+    return codes

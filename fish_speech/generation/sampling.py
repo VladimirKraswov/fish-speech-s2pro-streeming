@@ -39,30 +39,33 @@ def logits_to_probs(
 
 
 def apply_repetition_penalty(
-    logits: torch.Tensor, previous_tokens: torch.Tensor, penalty: float
+    logits: torch.Tensor,
+    previous_tokens: torch.Tensor,
+    penalty: float,
+    valid_token_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
-    Apply repetition penalty to logits.
-    Based on the scheme: if logit < 0: logit *= penalty else: logit /= penalty
-    Works for logits of shape [vocab], [B, vocab], [B, T, vocab].
+    Apply repetition penalty to logits in a compile-safe way.
+    Works for logits of shape [..., vocab].
     """
-    if penalty == 1.0 or previous_tokens.numel() == 0:
+    if penalty == 1.0:
         return logits
 
     vocab_size = logits.shape[-1]
-    unique_tokens = torch.unique(previous_tokens.to(torch.long))
-    unique_tokens = unique_tokens[(unique_tokens >= 0) & (unique_tokens < vocab_size)]
+    ids = previous_tokens.to(torch.long).reshape(-1)
 
-    if unique_tokens.numel() == 0:
-        return logits
+    # Filter out-of-range tokens in a compile-safe way
+    valid_ids_mask = (ids >= 0) & (ids < vocab_size)
+    safe_ids = torch.where(valid_ids_mask, ids, torch.zeros_like(ids))
 
-    logits = logits.clone()
-    scores = logits[..., unique_tokens]
-    # Apply penalty: if score > 0, divide by penalty. If score <= 0, multiply by penalty.
-    # Note: Using torch.where to avoid in-place issues and maintain vectorization.
-    new_scores = torch.where(scores > 0, scores / penalty, scores * penalty)
-    logits[..., unique_tokens] = new_scores
-    return logits
+    token_mask = torch.zeros((vocab_size,), dtype=torch.bool, device=logits.device)
+    token_mask = token_mask.scatter(0, safe_ids, valid_ids_mask)
+
+    if valid_token_mask is not None:
+        token_mask = token_mask & valid_token_mask
+
+    penalized_logits = torch.where(logits > 0, logits / penalty, logits * penalty)
+    return torch.where(token_mask, penalized_logits, logits)
 
 
 def sample(

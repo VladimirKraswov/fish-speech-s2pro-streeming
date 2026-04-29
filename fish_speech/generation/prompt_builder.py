@@ -9,6 +9,7 @@ from typing import Any, Callable, Literal, Optional, Union
 import torch
 from loguru import logger
 
+from fish_speech.codec.codes import crop_codes_tail
 from fish_speech.content_sequence import TextPart, VQPart
 from fish_speech.conversation import Conversation, Message
 from fish_speech.driver.config import load_runtime_config
@@ -46,6 +47,39 @@ def _count_code_frames(values: list[Any]) -> int:
     return total
 
 
+def _select_continuation_history(
+    history: list[tuple[str, torch.Tensor]],
+    *,
+    policy: str,
+    tail_frames: int,
+    max_history_segments: int,
+) -> list[tuple[str, torch.Tensor]]:
+    """
+    Select history segments based on policy and limits.
+    Works for both generated and external continuation history.
+    """
+    if not history or policy == "none":
+        return []
+
+    if policy == "last_segment":
+        if max_history_segments <= 0:
+            return []
+        return history[-max_history_segments:]
+
+    if policy == "tail_frames":
+        if tail_frames <= 0:
+            return []
+
+        # Take only the last segment and crop it
+        last_text, last_codes = history[-1]
+        if last_codes.shape[-1] <= tail_frames:
+            return [(last_text, last_codes)]
+
+        return [(last_text, crop_codes_tail(last_codes, max_frames=tail_frames))]
+
+    return []
+
+
 def _select_generated_history(
     generated_history: list[tuple[str, torch.Tensor]],
     *,
@@ -53,25 +87,12 @@ def _select_generated_history(
     tail_frames: int,
     max_history_segments: int,
 ) -> list[tuple[str, torch.Tensor]]:
-    if not generated_history or policy == "none":
-        return []
-
-    if policy == "last_segment":
-        if max_history_segments <= 0:
-            return []
-        return generated_history[-max_history_segments:]
-
-    if policy == "tail_frames":
-        if tail_frames <= 0:
-            return []
-
-        last_text, last_codes = generated_history[-1]
-        if last_codes.shape[-1] <= tail_frames:
-            return [(last_text, last_codes)]
-
-        return [(last_text, last_codes[:, -tail_frames:])]
-
-    return []
+    return _select_continuation_history(
+        generated_history,
+        policy=policy,
+        tail_frames=tail_frames,
+        max_history_segments=max_history_segments,
+    )
 
 
 def generate_committed_segments(
@@ -168,32 +189,52 @@ def generate_committed_segments(
         reference_tokens = _to_cpu_list(reference_tokens)
 
     # Continuation prompt: rolling acoustic history from previous commits.
-    continuation_texts = _as_list(continuation_text)
-    continuation_token_list = _as_list(continuation_tokens)
-    use_continuation = bool(continuation_texts) and bool(continuation_token_list)
+    # For external continuation (e.g. cached intro), we also apply context policy to avoid
+    # overfilling the prompt budget.
+    external_continuation_texts = _as_list(continuation_text)
+    external_continuation_tokens = _as_list(continuation_tokens)
+    use_continuation = bool(external_continuation_texts) and bool(
+        external_continuation_tokens
+    )
 
-    if continuation_texts or continuation_token_list:
+    if external_continuation_texts or external_continuation_tokens:
         if not use_continuation:
             raise ValueError(
                 "Continuation is incomplete: continuation_text and continuation_tokens must be provided together"
             )
-        if len(continuation_texts) != len(continuation_token_list):
+        if len(external_continuation_texts) != len(external_continuation_tokens):
             raise ValueError(
                 "Continuation text and tokens must have the same length: "
-                f"texts={len(continuation_texts)} tokens={len(continuation_token_list)}"
+                f"texts={len(external_continuation_texts)} tokens={len(external_continuation_tokens)}"
             )
-        continuation_token_list = _to_cpu_list(continuation_token_list)
+
+    full_continuation_history = list(
+        zip(external_continuation_texts, _to_cpu_list(external_continuation_tokens))
+    )
+    selected_external_continuation = _select_continuation_history(
+        full_continuation_history,
+        policy=model_cfg.long_form_context_policy,
+        tail_frames=model_cfg.long_form_tail_frames,
+        max_history_segments=model_cfg.long_form_max_history_segments,
+    )
+
+    continuation_texts = [text for text, _ in selected_external_continuation]
+    continuation_token_list = [tokens for _, tokens in selected_external_continuation]
+    use_continuation = bool(continuation_texts)
 
     logger.info(
         "generation_prompt_inputs: "
         "reference_text_count={} reference_token_count={} reference_token_frames={} "
-        "continuation_text_count={} continuation_token_count={} continuation_token_frames={}",
+        "continuation_source={} continuation_text_count={} continuation_token_count={} continuation_token_frames={} "
+        "original_continuation_frames={}",
         len(reference_texts),
         len(reference_tokens),
         _count_code_frames(reference_tokens),
+        model_cfg.long_form_context_policy,
         len(continuation_texts),
         len(continuation_token_list),
         _count_code_frames(continuation_token_list),
+        _count_code_frames([tokens for _, tokens in full_continuation_history]),
     )
 
     model_size = sum(p.numel() for p in model.parameters() if p.requires_grad)

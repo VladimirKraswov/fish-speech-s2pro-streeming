@@ -8,6 +8,7 @@ import torch
 import torchaudio
 from loguru import logger
 
+from fish_speech.codec.codes import load_codes_pt, validate_codes_for_decoder
 from fish_speech.driver.types import DriverReference
 from fish_speech.models.dac.modded_dac import DAC
 from fish_speech.references.cache import ReferenceCache
@@ -86,60 +87,18 @@ class ReferenceLoader:
                 prompt_texts.append(read_ref_text(str(lab_path)))
                 if codes_path.exists():
                     # Pre-encoded: load from disk (no encoder run). File must be tensor shape (num_codebooks, T) from DAC encode.
-                    # map_location="cpu" = put tensor in RAM (worker will .to(device) later). Loading to GPU here would save one tiny copy but is negligible for KB-sized tensors.
+                    # map_location="cpu" = put tensor in RAM (worker will .to(device) later).
                     try:
-                        loaded = torch.load(
-                            codes_path, map_location="cpu", weights_only=True
+                        loaded = load_codes_pt(
+                            codes_path, name=f"reference {id}/{stem}"
                         )
-                        if isinstance(loaded, (tuple, list)):
-                            loaded = loaded[0]
+                        loaded = validate_codes_for_decoder(
+                            loaded,
+                            getattr(self, "decoder_model", None),
+                            name=f"reference {id}/{stem}",
+                        )
 
-                        if not isinstance(loaded, torch.Tensor):
-                            raise TypeError(
-                                f"Expected torch.Tensor, got {type(loaded).__name__}"
-                            )
-
-                        # Standardize to [num_codebooks, T]
-                        if loaded.ndim == 3:
-                            if loaded.shape[0] == 1:
-                                loaded = loaded[0]
-                            else:
-                                raise ValueError(
-                                    f"Unexpected 3D tensor shape {loaded.shape}, "
-                                    f"expected [1, num_codebooks, T] or [num_codebooks, T]"
-                                )
-
-                        if loaded.ndim != 2:
-                            raise ValueError(
-                                f"Unexpected tensor ndim {loaded.ndim}, shape {loaded.shape}, "
-                                f"expected [num_codebooks, T]"
-                            )
-
-                        if loaded.size(-1) == 0:
-                            raise ValueError("Acoustic tensor is empty (T=0)")
-
-                        # Final validation of num_codebooks if possible
-                        if hasattr(self, "decoder_model") and hasattr(
-                            self.decoder_model, "quantizer"
-                        ):
-                            from fish_speech.models.dac.rvq import (
-                                DownsampleResidualVectorQuantize,
-                            )
-
-                            quantizer = self.decoder_model.quantizer
-                            if isinstance(quantizer, DownsampleResidualVectorQuantize):
-                                # expected = residual_n_codebooks + 1 semantic codebook
-                                expected_cb = quantizer.quantizer.n_codebooks + 1
-                            else:
-                                expected_cb = getattr(quantizer, "n_codebooks", None)
-
-                            if expected_cb is not None and loaded.shape[0] != expected_cb:
-                                raise ValueError(
-                                    f"Reference {stem} codebook count mismatch at {codes_path}: "
-                                    f"got {loaded.shape[0]}, expected {expected_cb}. Shape: {loaded.shape}"
-                                )
-
-                        prompt_tokens.append(loaded.long().cpu())
+                        prompt_tokens.append(loaded)
                         logger.info(
                             "Loaded pre-encoded reference {} from {} (shape={})",
                             stem,

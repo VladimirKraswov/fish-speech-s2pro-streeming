@@ -41,6 +41,8 @@ class ModelConfig(BaseModel):
     record_memory_history: bool = False
     memory_history_max_entries: int = Field(100000, ge=1)
 
+    debug_prompt_visualize: bool = False
+
     # Long-form settings
     long_form_auto_split: bool = True
     long_form_target_chars: int = Field(160, ge=40)

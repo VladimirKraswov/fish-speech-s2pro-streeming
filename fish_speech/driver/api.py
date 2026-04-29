@@ -2,6 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Iterator
 
+import torch
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+from fish_speech.codec.codes import normalize_codes
 from fish_speech.driver.session import DriverSession, DriverSessionConfig
 from fish_speech.driver.types import (
     DriverAudioChunkEvent,
@@ -116,6 +124,58 @@ class FishSpeechDriver:
             )
         self._sessions_opened += 1
         return DriverSession(driver=self, config=config)
+
+    def synthesize_collect(
+        self,
+        request: DriverSynthesisRequest,
+    ) -> dict[str, Any]:
+        """
+        Synthesize speech and collect all chunks into a single dictionary.
+        """
+
+        audio_chunks = []
+        code_chunks = []
+        sample_rate = self.sample_rate
+        final_audio = None
+
+        for event in self.synthesize(request):
+            if isinstance(event, DriverAudioChunkEvent):
+                audio_chunks.append(event.audio)
+                sample_rate = event.sample_rate
+            elif isinstance(event, DriverTokenChunkEvent):
+                if event.codes is not None:
+                    # Normalize to CPU long tensor
+                    codes = normalize_codes(event.codes, name="token chunk codes")
+                    code_chunks.append(codes)
+            elif isinstance(event, DriverFinalAudioEvent):
+                final_audio = event.audio
+                sample_rate = event.sample_rate
+            elif isinstance(event, DriverErrorEvent):
+                raise RuntimeError(f"Synthesis error: {event.error}")
+
+        # Consolidate audio
+        audio = None
+        if audio_chunks:
+            if np is not None:
+                audio = np.concatenate(audio_chunks, axis=0)
+            else:
+                audio = audio_chunks  # Fallback to list
+        elif final_audio is not None:
+            audio = final_audio
+
+        # Consolidate codes
+        codes = None
+        if code_chunks:
+            codes = torch.cat(code_chunks, dim=1)
+
+        return {
+            "text": request.text,
+            "sample_rate": sample_rate,
+            "audio": audio,
+            "codes": codes,
+            "audio_chunks": audio_chunks,
+            "code_chunks": code_chunks,
+        }
 
     def synthesize(
         self,

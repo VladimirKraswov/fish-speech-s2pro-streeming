@@ -329,12 +329,13 @@ def generate_committed_segments(
                 )
             )
 
-            logger.info("Visualizing prompt structure:")
-            conversation_gen.visualize(
-                tokenizer,
-                merge_audio_tokens=True,
-                merge_semantic_tokens=True,
-            )
+            if getattr(model_cfg, "debug_prompt_visualize", False):
+                logger.info("Visualizing prompt structure:")
+                conversation_gen.visualize(
+                    tokenizer,
+                    merge_audio_tokens=True,
+                    merge_semantic_tokens=True,
+                )
 
             encoded, audio_masks, audio_parts = conversation_gen.encode_for_inference(
                 tokenizer, num_codebooks=model.config.num_codebooks

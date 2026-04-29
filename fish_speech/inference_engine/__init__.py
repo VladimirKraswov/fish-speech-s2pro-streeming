@@ -400,6 +400,11 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                         "No audio generated, please check the input text."
                     ),
                 )
+            elif req.stream_audio:
+                _mark("stream_done", total_segments=len(segments))
+                finished_normally = True
+                self._maybe_cleanup_after_success()
+                return None
             else:
                 audio = np.concatenate(segments, axis=0)
                 _mark("yield_final", total_samples=len(audio), segments=len(segments))

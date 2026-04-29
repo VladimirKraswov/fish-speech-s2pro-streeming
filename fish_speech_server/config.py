@@ -1,18 +1,78 @@
 from __future__ import annotations
 
 import json
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from fish_speech.driver.config import (
-    DEFAULT_RUNTIME_CONFIG_PATH,
-    ModelConfig,
-    PathsConfig,
-    WarmupConfig,
-)
+
+def _default_runtime_config_path() -> Path:
+    env_path = (
+        os.getenv("FISH_RUNTIME_CONFIG")
+        or os.getenv("FISH_RUNTIME_CONFIG_PATH")
+        or os.getenv("FISH_SERVER_CONFIG")
+        or os.getenv("FISH_CONFIG")
+    )
+    if env_path:
+        return Path(env_path)
+
+    candidates = (
+        Path("/app/config/runtime.json"),
+        Path("config/runtime.json"),
+        Path("runtime.json"),
+    )
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    return Path("config/runtime.json")
+
+
+DEFAULT_RUNTIME_CONFIG_PATH = _default_runtime_config_path()
+
+
+# =============================================================================
+# Proxy-safe copies of driver runtime config models.
+#
+# ВАЖНО:
+# Не импортируем fish_speech.driver.config здесь.
+# Proxy-контейнер импортирует fish_speech_server.config, а fish_speech.* тянет torch.
+# В proxy torch не установлен и не должен быть установлен.
+# =============================================================================
+class PathsConfig(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    llama_checkpoint_path: str
+    decoder_checkpoint_path: str
+    decoder_config_name: str
+
+
+class ModelConfig(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    device: str = "cuda"
+    precision: str = "bfloat16"
+    compile: bool = False
+    record_memory_history: bool = False
+    memory_history_max_entries: int = Field(100_000, ge=1)
+
+
+class WarmupConfig(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    enabled: bool = False
+    reference_id: str | None = None
+    text: str = "Hello."
+    max_new_tokens: int = Field(125, ge=1, le=1024)
+    chunk_length: int = Field(160, ge=100, le=300)
+    streaming: bool = True
+    stream_tokens: bool = True
+    initial_stream_chunk_size: int = Field(24, ge=1, le=200)
+    stream_chunk_size: int = Field(18, ge=1, le=200)
 
 
 class NetworkEndpointConfig(BaseModel):
@@ -116,14 +176,17 @@ class ProxyTTSConfig(BaseModel):
     def validate_chunk_sizes(self) -> "ProxyTTSConfig":
         if self.initial_stream_chunk_size < self.stream_chunk_size:
             raise ValueError("initial_stream_chunk_size must be >= stream_chunk_size")
+
         first_initial = (
             self.first_initial_stream_chunk_size or self.initial_stream_chunk_size
         )
         first_stream = self.first_stream_chunk_size or self.stream_chunk_size
+
         if first_initial < first_stream:
             raise ValueError(
                 "first initial_stream_chunk_size must be >= first stream_chunk_size"
             )
+
         return self
 
 
@@ -165,6 +228,42 @@ class SessionRuntimeConfig(BaseModel):
     auto_close_on_finish: bool = False
 
 
+class IntroCacheConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+
+    # Текст intro, который можно заранее прогреть/закешировать.
+    # Например: короткая приветственная фраза или первый стабильный кусок ответа.
+    text: str = ""
+
+    # Максимум cache entries на proxy-сессию/процесс.
+    max_entries: int = Field(16, ge=1, le=256)
+
+    # TTL intro cache entry.
+    ttl_sec: int = Field(3600, ge=1, le=86400)
+
+    # Если true — proxy попробует подготовить intro при /session/open.
+    # Ошибки можно игнорировать через ignore_errors.
+    warm_on_session_open: bool = False
+
+    # Если true — ошибки intro cache не ломают основную сессию.
+    ignore_errors: bool = True
+
+    # Размер отдаваемого PCM чанка для intro cache.
+    emit_bytes: int = Field(8192, ge=512, le=65536)
+
+    # Опциональная пауза после intro.
+    pause_after_ms: int = Field(0, ge=0, le=3000)
+
+    @field_validator("emit_bytes")
+    @classmethod
+    def validate_even_emit_bytes(cls, value: int) -> int:
+        if value % 2 != 0:
+            raise ValueError("intro_cache.emit_bytes must be even for PCM16")
+        return value
+
+
 class ProxyConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -177,6 +276,7 @@ class ProxyConfig(BaseModel):
     tts: ProxyTTSConfig
     playback: PlaybackConfig
     session: SessionRuntimeConfig
+    intro_cache: IntroCacheConfig = Field(default_factory=IntroCacheConfig)
 
     @model_validator(mode="after")
     def normalize_reference_id(self) -> "ProxyConfig":
@@ -209,30 +309,38 @@ AppConfig = ServerRuntimeConfig
 
 def deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     out = json.loads(json.dumps(base))
+
     for key, value in patch.items():
         if key in out and isinstance(out[key], dict) and isinstance(value, dict):
             out[key] = deep_merge(out[key], value)
         else:
             out[key] = value
+
     return out
 
 
 def _iter_leaf_paths(value: Any, prefix: str = "") -> list[str]:
     if isinstance(value, dict):
         paths: list[str] = []
+
         for key, child in value.items():
             child_prefix = f"{prefix}.{key}" if prefix else str(key)
             paths.extend(_iter_leaf_paths(child, child_prefix))
+
         return paths
+
     return [prefix] if prefix else []
 
 
 def _normalize_allowed_path(path: str) -> str:
     path = path.strip().strip(".")
+
     if path.startswith("proxy."):
         path = path[len("proxy.") :]
+
     if path.startswith("session."):
         path = path[len("session.") :]
+
     return path
 
 
@@ -251,12 +359,15 @@ def merge_frontend_proxy_override(
             for path in _iter_leaf_paths(override_patch)
             if path.strip()
         }
+
         allowed = {
             _normalize_allowed_path(path)
             for path in runtime.frontend_overrides.allowed_paths
             if path.strip()
         }
+
         disallowed = sorted(path for path in requested if path not in allowed)
+
         if disallowed:
             raise ValueError(
                 "frontend override contains disallowed paths: " + ", ".join(disallowed)
@@ -269,8 +380,10 @@ def merge_frontend_proxy_override(
 @lru_cache(maxsize=4)
 def load_runtime_config(path: str | Path | None = None) -> ServerRuntimeConfig:
     config_path = Path(path) if path is not None else DEFAULT_RUNTIME_CONFIG_PATH
+
     with config_path.open("r", encoding="utf-8") as f:
         payload = json.load(f)
+
     return ServerRuntimeConfig.model_validate(payload)
 
 

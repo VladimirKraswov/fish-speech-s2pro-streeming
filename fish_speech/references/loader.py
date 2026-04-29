@@ -193,22 +193,31 @@ class ReferenceLoader:
         cache_used = False
         prompt_tokens, prompt_texts = [], []
         for i, ref in enumerate(references):
-            if use_cache == "off" or audio_hashes[i] not in self.ref_by_hash:
+            audio_hash = audio_hashes[i]
+            if use_cache == "off" or audio_hash not in self.ref_by_hash:
                 # If the references are not already loaded, encode them
-                prompt_tokens.append(
-                    self.encode_reference(
-                        reference_audio=ref.audio,
-                        enable_reference_audio=True,
-                    )
+                prompt_token = self.encode_reference(
+                    reference_audio=ref.audio,
+                    enable_reference_audio=True,
                 )
+                prompt_tokens.append(prompt_token)
                 prompt_texts.append(ref.text)
-                self.ref_by_hash[audio_hashes[i]] = (prompt_tokens[-1], ref.text)
+                self.ref_by_hash[audio_hash] = prompt_token
 
             else:
                 # Reuse already encoded references
-                cached_token, cached_text = self.ref_by_hash[audio_hashes[i]]
+                cached_value = self.ref_by_hash[audio_hash]
+                if isinstance(cached_value, (tuple, list)):
+                    if not cached_value:
+                        raise ValueError(
+                            f"Cached reference for hash {audio_hash} is empty"
+                        )
+                    cached_token = cached_value[0]
+                    self.ref_by_hash[audio_hash] = cached_token
+                else:
+                    cached_token = cached_value
                 prompt_tokens.append(cached_token)
-                prompt_texts.append(cached_text)
+                prompt_texts.append(ref.text)
                 cache_used = True
 
         if cache_used:

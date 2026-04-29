@@ -104,6 +104,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         t_start = time.perf_counter()
         t_prev = t_start
         finished_normally = False
+        cancel_event: threading.Event | None = None
 
         def _vram_gb() -> dict:
             if not torch.cuda.is_available():
@@ -178,12 +179,14 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             stream_decode = bool(req.stream_tokens or req.stream_audio)
             emit_token_events = bool(req.stream_tokens)
             ack_queue = queue.Queue() if stream_decode else None
+            cancel_event = threading.Event() if stream_decode else None
             response_queue = self.send_Llama_request(
                 req,
                 prompt_tokens=ref_tokens,
                 prompt_texts=ref_texts,
                 req_tag=req_tag,
                 ack_queue=ack_queue,
+                cancel_event=cancel_event,
                 continuation_tokens=history_tokens,
                 continuation_text=history_texts,
             )
@@ -311,12 +314,6 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                                     )
                                     stream_decode_idx += 1
                             elif req.stream_audio:
-                                if result.codes is not None and not result.codes.is_cuda:
-                                    result = GenerateResponse(
-                                        result.action,
-                                        result.codes.to(self.decoder_model.device),
-                                        getattr(result, "text", None),
-                                    )
                                 segment = self.get_audio_segment(result)
                             else:
                                 segment = None
@@ -430,6 +427,8 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             self._maybe_cleanup_after_success()
             return None
         finally:
+            if cancel_event is not None:
+                cancel_event.set()
             if not finished_normally and self.cleanup_on_abort:
                 self._cuda_cleanup(reason="abort")
 
@@ -440,6 +439,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         prompt_texts: list,
         req_tag: str,
         ack_queue: queue.Queue | None = None,
+        cancel_event: threading.Event | None = None,
         continuation_tokens: list | None = None,
         continuation_text: list | None = None,
     ) -> queue.Queue:
@@ -468,6 +468,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             stream_chunk_size=req.stream_chunk_size,
             initial_stream_chunk_size=req.initial_stream_chunk_size,
             ack_queue=ack_queue,
+            cancel_event=cancel_event,
         )
 
         response_queue = queue.Queue()
@@ -500,9 +501,8 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             decode_codes_cpu = new_codes_cpu
             context_frames = 0
 
-        decode_codes = decode_codes_cpu.to(self.decoder_model.device)
         decoded = self.get_audio_segment(
-            GenerateResponse(action="sample", codes=decode_codes)
+            GenerateResponse(action="sample", codes=decode_codes_cpu)
         )
 
         # DAC uses a specific hop length / frame length for its VQ codebooks.
@@ -592,7 +592,18 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         if result.codes is None:
             return np.zeros(0, dtype=np.float32)
 
+        codes = result.codes
+        decoder_device = getattr(self.decoder_model, "device", None)
+        if decoder_device is None:
+            try:
+                decoder_device = next(self.decoder_model.parameters()).device
+            except (AttributeError, StopIteration):
+                decoder_device = codes.device
+
+        if codes.device != decoder_device:
+            codes = codes.to(decoder_device)
+
         with torch.inference_mode():
-            segment = self.decode_vq_tokens(codes=result.codes)
+            segment = self.decode_vq_tokens(codes=codes)
 
         return segment.float().detach().cpu().numpy().astype(np.float32, copy=False)

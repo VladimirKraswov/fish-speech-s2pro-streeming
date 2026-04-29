@@ -65,18 +65,18 @@
     "version": 1,
     "commit": {
       "first": {
-        "min_chars": 70,
-        "target_chars": 140,
-        "max_chars": 210,
-        "max_wait_ms": 520,
-        "allow_partial_after_ms": 1200
+        "min_chars": 14,
+        "target_chars": 32,
+        "max_chars": 72,
+        "max_wait_ms": 180,
+        "allow_partial_after_ms": 420
       },
       "next": {
-        "min_chars": 90,
-        "target_chars": 180,
-        "max_chars": 250,
-        "max_wait_ms": 850,
-        "allow_partial_after_ms": 1800
+        "min_chars": 70,
+        "target_chars": 145,
+        "max_chars": 220,
+        "max_wait_ms": 650,
+        "allow_partial_after_ms": 1350
       },
       "flush_on_sentence_punctuation": true,
       "flush_on_clause_punctuation": false,
@@ -97,6 +97,8 @@
       "stream_tokens": true,
       "initial_stream_chunk_size": 28,
       "stream_chunk_size": 20,
+      "first_initial_stream_chunk_size": 10,
+      "first_stream_chunk_size": 8,
       "stateful_synthesis": true,
       "stateful_fallback_to_stateless": false,
       "stateful_history_turns": 1,
@@ -106,8 +108,12 @@
       "stateful_reset_every_chars": 800
     },
     "playback": {
-      "target_emit_bytes": 32768,
-      "start_buffer_ms": 450,
+      "target_emit_bytes": 24576,
+      "start_buffer_ms": 300,
+      "first_commit_target_emit_bytes": 8192,
+      "first_commit_start_buffer_ms": 120,
+      "client_start_buffer_ms": 160,
+      "client_initial_start_delay_ms": 40,
       "stop_grace_ms": 0,
       "boundary_smoothing_enabled": true,
       "punctuation_pauses_enabled": true,
@@ -154,6 +160,8 @@
       "tts.stream_tokens",
       "tts.initial_stream_chunk_size",
       "tts.stream_chunk_size",
+      "tts.first_initial_stream_chunk_size",
+      "tts.first_stream_chunk_size",
       "tts.stateful_synthesis",
       "tts.stateful_fallback_to_stateless",
       "tts.stateful_history_turns",
@@ -163,6 +171,10 @@
       "tts.stateful_reset_every_chars",
       "playback.target_emit_bytes",
       "playback.start_buffer_ms",
+      "playback.first_commit_target_emit_bytes",
+      "playback.first_commit_start_buffer_ms",
+      "playback.client_start_buffer_ms",
+      "playback.client_initial_start_delay_ms",
       "playback.stop_grace_ms",
       "playback.boundary_smoothing_enabled",
       "playback.punctuation_pauses_enabled",

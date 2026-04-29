@@ -56,6 +56,7 @@ SENTENCE_BOUNDARY_RE = re.compile(r'.+?[.!?…](?:["»”)\]]+)?(?:\s+|$)', re.S
 CLAUSE_BOUNDARY_RE = re.compile(r'.+?[,:;—\-](?:\s+|$)', re.S)
 
 SHORT_COMPLETE_SENTENCE_MIN_CHARS = 24
+FIRST_COMMIT_TTFA_MIN_CHARS = 6
 
 DEFAULT_SESSION_CONFIG = _RUNTIME.proxy.model_dump(mode="python")
 
@@ -253,36 +254,80 @@ def _extract_timed_commit(
 
     stage = cfg.first if next_commit_seq == 1 else cfg.next
     text_len = len(buffer_text)
+    is_first_commit = next_commit_seq == 1
+    ttfa_min_chars = _first_commit_min_chars(stage)
 
     # First threshold:
     # After max_wait_ms, commit only if we have at least min_chars.
-    if elapsed_ms >= stage.max_wait_ms and text_len >= stage.min_chars:
-        boundary = _last_boundary_before(
-            buffer_text,
-            text_len,
-            include_clause=cfg.flush_on_clause_punctuation,
-            include_newline=cfg.flush_on_newline,
-        )
+    wait_min_chars = ttfa_min_chars if is_first_commit else stage.min_chars
+    if elapsed_ms >= stage.max_wait_ms and text_len >= wait_min_chars:
+        if is_first_commit:
+            cut = _safe_partial_cut_for_ttfa(
+                buffer_text,
+                min_chars=ttfa_min_chars,
+                max_chars=stage.max_chars,
+                allow_inside_word=False,
+            )
+            if cut is None:
+                if elapsed_ms < stage.allow_partial_after_ms:
+                    return [], buffer_text
+            else:
+                end, reason = cut
+                piece = _right_trim_committed(buffer_text[:end])
+                remainder = _normalize_tail_after_commit(buffer_text[end:])
 
-        if boundary is not None:
-            end, reason = boundary
+                if piece:
+                    return [(piece, reason)], remainder
+
+                if elapsed_ms < stage.allow_partial_after_ms:
+                    return [], buffer_text
+
         else:
-            end = _safe_hard_cut(
+            boundary = _last_boundary_before(
                 buffer_text,
                 text_len,
-                min_keep=max(1, min(stage.min_chars, text_len)),
+                include_clause=cfg.flush_on_clause_punctuation,
+                include_newline=cfg.flush_on_newline,
             )
-            reason = "max_wait_timeout"
 
-        piece = _right_trim_committed(buffer_text[:end])
-        remainder = _normalize_tail_after_commit(buffer_text[end:])
+            if boundary is not None:
+                end, reason = boundary
+            else:
+                end = _safe_hard_cut(
+                    buffer_text,
+                    text_len,
+                    min_keep=max(1, min(stage.min_chars, text_len)),
+                )
+                reason = "max_wait_timeout"
 
-        if piece:
-            return [(piece, reason)], remainder
+            piece = _right_trim_committed(buffer_text[:end])
+            remainder = _normalize_tail_after_commit(buffer_text[end:])
+
+            if piece:
+                return [(piece, reason)], remainder
 
     # Second threshold:
     # After allow_partial_after_ms, commit even if min_chars was not reached.
     if elapsed_ms >= stage.allow_partial_after_ms:
+        if is_first_commit:
+            cut = _safe_partial_cut_for_ttfa(
+                buffer_text,
+                min_chars=ttfa_min_chars,
+                max_chars=stage.max_chars,
+                allow_inside_word=True,
+            )
+            if cut is None:
+                return [], buffer_text
+
+            end, reason = cut
+            piece = _right_trim_committed(buffer_text[:end])
+            remainder = _normalize_tail_after_commit(buffer_text[end:])
+
+            if piece:
+                return [(piece, reason)], remainder
+
+            return [], buffer_text
+
         piece = _right_trim_committed(buffer_text)
         if piece:
             return [(piece, "allow_partial_timeout")], ""
@@ -372,7 +417,12 @@ def normalize_config(config_text: str) -> ProxyConfig:
         raise HTTPException(400, detail=str(exc)) from exc
 
 
-def build_upstream_payload(text: str, config: ProxyConfig) -> dict[str, Any]:
+def build_upstream_payload(
+    text: str,
+    config: ProxyConfig,
+    *,
+    commit_seq: int | None = None,
+) -> dict[str, Any]:
     tts = config.tts
     reference_id = tts.reference_id.strip() or config.default_reference_id
 
@@ -395,6 +445,13 @@ def build_upstream_payload(text: str, config: ProxyConfig) -> dict[str, Any]:
 
     if tts.seed is not None:
         payload["seed"] = tts.seed
+
+    if commit_seq == 1:
+        if tts.first_initial_stream_chunk_size is not None:
+            payload["initial_stream_chunk_size"] = tts.first_initial_stream_chunk_size
+
+        if tts.first_stream_chunk_size is not None:
+            payload["stream_chunk_size"] = tts.first_stream_chunk_size
 
     return payload
 
@@ -487,6 +544,53 @@ def _safe_hard_cut(text: str, limit: int, min_keep: int) -> int:
         return cut + 1
 
     return limit
+
+
+def _first_commit_min_chars(stage) -> int:
+    return max(1, min(stage.min_chars, FIRST_COMMIT_TTFA_MIN_CHARS))
+
+
+def _safe_partial_cut_for_ttfa(
+    text: str,
+    *,
+    min_chars: int,
+    max_chars: int,
+    allow_inside_word: bool = False,
+) -> tuple[int, str] | None:
+    if not text:
+        return None
+
+    min_chars = max(1, int(min_chars))
+    limit = max(1, min(len(text), int(max_chars)))
+    prefix = text[:limit]
+
+    if limit < min_chars and not allow_inside_word:
+        return None
+
+    punctuation_candidates: list[int] = []
+    for match in SENTENCE_BOUNDARY_RE.finditer(prefix):
+        punctuation_candidates.append(match.end())
+    for match in CLAUSE_BOUNDARY_RE.finditer(prefix):
+        punctuation_candidates.append(match.end())
+
+    valid_punctuation = [
+        end for end in punctuation_candidates if min_chars <= end <= limit
+    ]
+    if valid_punctuation:
+        return min(valid_punctuation), "ttfa_boundary"
+
+    for match in re.finditer(r"\s+", prefix):
+        end = match.end()
+        if min_chars <= end <= limit:
+            return end, "ttfa_boundary"
+
+    if allow_inside_word:
+        hard_min_keep = min(min_chars, limit)
+        end = _safe_hard_cut(text, limit, min_keep=hard_min_keep)
+        if end > 0:
+            return end, "ttfa_partial"
+
+    return None
 
 
 def _pcm_bytes_for_duration_ms(
@@ -695,13 +799,34 @@ def _extract_commits(
         if text_len == 0:
             break
 
-        stage = cfg.first if (next_commit_seq + len(commits)) == 1 else cfg.next
+        is_first_commit = (next_commit_seq + len(commits)) == 1
+        stage = cfg.first if is_first_commit else cfg.next
 
         if force:
             piece = _right_trim_committed(text)
             if piece:
                 commits.append((piece, "force"))
             text = ""
+            break
+
+        if is_first_commit:
+            cut = _safe_partial_cut_for_ttfa(
+                text,
+                min_chars=_first_commit_min_chars(stage),
+                max_chars=stage.max_chars,
+                allow_inside_word=False,
+            )
+            if cut is None:
+                break
+
+            end, reason = cut
+            piece = _right_trim_committed(text[:end])
+            text = _normalize_tail_after_commit(text[end:])
+
+            if piece:
+                commits.append((piece, reason))
+                continue
+
             break
 
         if (
@@ -1199,379 +1324,402 @@ async def session_pcm_stream(session_id: str):
         return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
 
     async def stream_one_commit(
+        client: httpx.AsyncClient,
         req_id: str,
         commit_item: dict[str, Any],
     ) -> AsyncGenerator[bytes, None]:
-        async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
-            should_reset, reset_reason = _should_reset_upstream_session(
-                rec, config, commit_item
-            )
+        commit_seq = int(commit_item["seq"])
+        is_first_commit = commit_seq == 1
+        effective_target_emit_bytes = (
+            config.playback.first_commit_target_emit_bytes
+            if is_first_commit
+            else config.playback.target_emit_bytes
+        )
+        effective_start_buffer_ms = (
+            config.playback.first_commit_start_buffer_ms
+            if is_first_commit
+            else config.playback.start_buffer_ms
+        )
 
-            if should_reset:
-                old_id = rec.synthesis_session_id
-                try:
-                    new_id = await _open_upstream_synthesis_session(
-                        client, rec, config
-                    )
-                    rec.synthesis_session_id = new_id
-                    rec.chars_since_upstream_reset = 0
-                    rec.last_upstream_reset_commit_seq = commit_item["seq"]
+        should_reset, reset_reason = _should_reset_upstream_session(
+            rec, config, commit_item
+        )
 
-                    logger.info(
-                        "upstream synthesis reset session=%s commit_seq=%s reason=%s old=%s new=%s",
-                        rec.session_id[:8],
-                        commit_item["seq"],
-                        reset_reason,
-                        old_id[:8] if old_id else None,
-                        rec.synthesis_session_id[:8],
-                    )
-
-                    yield await emit(
-                        {
-                            "type": "upstream_reset",
-                            "session_id": rec.session_id,
-                            "commit_seq": commit_item["seq"],
-                            "reason": reset_reason,
-                            "old_synthesis_session_id": old_id,
-                            "new_synthesis_session_id": rec.synthesis_session_id,
-                        }
-                    )
-
-                    # Best-effort close old session
-                    await _close_upstream_synthesis_session(client, old_id)
-
-                except Exception as exc:
-                    logger.warning(
-                        "upstream synthesis reset FAILED session=%s reason=%s: %s",
-                        rec.session_id[:8],
-                        reset_reason,
-                        exc,
-                    )
-                    yield await emit(
-                        {
-                            "type": "upstream_reset_failed",
-                            "session_id": rec.session_id,
-                            "commit_seq": commit_item["seq"],
-                            "reason": reset_reason,
-                            "message": str(exc),
-                        }
-                    )
-
-                await asyncio.sleep(0)
-
-            payload = build_upstream_payload(text=commit_item["text"], config=config)
-
-            url = UPSTREAM_TTS_URL
-            if rec.synthesis_session_id and config.tts.stateful_synthesis:
-                url = url.replace("/v1/tts", "/v1/synthesis/synthesize")
-                payload.update(
-                    {
-                        "synthesis_session_id": rec.synthesis_session_id,
-                        "commit_seq": commit_item["seq"],
-                        "commit_reason": commit_item["reason"],
-                    }
+        if should_reset:
+            old_id = rec.synthesis_session_id
+            try:
+                new_id = await _open_upstream_synthesis_session(
+                    client, rec, config
                 )
+                rec.synthesis_session_id = new_id
+                rec.chars_since_upstream_reset = 0
+                rec.last_upstream_reset_commit_seq = commit_item["seq"]
 
-            header_buffer = bytearray()
-            pending_pcm = bytearray()
-            header_sent = False
-
-            upstream_bytes = 0
-            first_emit_done = False
-            start_buffer_bytes = 0
-
-            fade_in_applied = False
-            sample_rate = None
-            channels = None
-            bits_per_sample = None
-            frame_bytes = 2
-            tail_hold_bytes = 0
-            fade_in_bytes = 0
-            fade_out_bytes = 0
-
-            async def flush_pending(force: bool = False) -> AsyncGenerator[bytes, None]:
-                nonlocal first_emit_done, fade_in_applied
-
-                while True:
-                    if not pending_pcm:
-                        return
-
-                    # Перед первой отдачей применить fade-in к началу commit audio.
-                    if (
-                        config.playback.boundary_smoothing_enabled
-                        and not fade_in_applied
-                        and fade_in_bytes > 0
-                        and len(pending_pcm) >= fade_in_bytes
-                    ):
-                        faded = _apply_pcm16_fade(
-                            bytes(pending_pcm[:fade_in_bytes]),
-                            channels=channels,
-                            fade_in_frames=int(
-                                sample_rate * config.playback.fade_in_ms / 1000.0
-                            ),
-                            fade_out_frames=0,
-                        )
-                        pending_pcm[:fade_in_bytes] = faded
-                        fade_in_applied = True
-
-                    threshold = target_emit_bytes
-
-                    if not first_emit_done:
-                        threshold = max(target_emit_bytes, start_buffer_bytes)
-
-                    threshold = _align_down(threshold, frame_bytes)
-                    if threshold <= 0:
-                        threshold = frame_bytes
-
-                    protected_tail = 0 if force else tail_hold_bytes
-                    available = len(pending_pcm) - protected_tail
-
-                    if available <= 0:
-                        return
-
-                    if not force and available < threshold:
-                        return
-
-                    if force:
-                        out_len = len(pending_pcm)
-                    else:
-                        out_len = min(threshold, available)
-
-                    out_len = _align_down(out_len, frame_bytes)
-
-                    if out_len <= 0:
-                        return
-
-                    out = bytes(pending_pcm[:out_len])
-                    del pending_pcm[:out_len]
-
-                    pcm_seq = rec.next_pcm_seq
-                    rec.next_pcm_seq += 1
-                    first_emit_done = True
-
-                    yield await emit(
-                        {
-                            "type": "pcm",
-                            "req_id": req_id,
-                            "session_id": rec.session_id,
-                            "commit_seq": commit_item["seq"],
-                            "seq": pcm_seq,
-                            "data": base64.b64encode(out).decode("ascii"),
-                        }
-                    )
-
-                    await asyncio.sleep(0)
-
-            yield await emit(
-                {
-                    "type": "commit_start",
-                    "session_id": rec.session_id,
-                    "commit_seq": commit_item["seq"],
-                    "reason": commit_item["reason"],
-                    "text": commit_item["text"],
-                    "text_len": len(commit_item["text"]),
-                }
-            )
-            await asyncio.sleep(0)
-
-            logger.info(
-                "REQ %s commit_seq=%s upstream start text_len=%s ref=%s url=%s text=%r",
-                req_id,
-                commit_item["seq"],
-                len(commit_item["text"]),
-                payload["reference_id"],
-                url,
-                commit_item["text"][:180],
-            )
-
-            async with client.stream("POST", url, json=payload) as upstream:
-                if upstream.status_code != 200:
-                    text_body = await upstream.aread()
-                    msg = text_body.decode("utf-8", errors="replace")
-                    raise RuntimeError(f"upstream status={upstream.status_code}: {msg}")
-
-                async for chunk in upstream.aiter_raw(1024):
-                    if not chunk:
-                        continue
-
-                    upstream_bytes += len(chunk)
-
-                    if not header_sent:
-                        header_buffer.extend(chunk)
-                        parsed = _parse_wav_header(header_buffer)
-
-                        if parsed is None:
-                            continue
-
-                        sample_rate, channels, bits_per_sample, data_offset = parsed
-
-                        if bits_per_sample != 16:
-                            raise RuntimeError(
-                                f"unsupported bits_per_sample={bits_per_sample}"
-                            )
-
-                        frame_bytes = channels * (bits_per_sample // 8)
-
-                        fade_in_bytes = _align_down(
-                            _pcm_bytes_for_duration_ms(
-                                sample_rate,
-                                channels,
-                                bits_per_sample,
-                                config.playback.fade_in_ms,
-                            ),
-                            frame_bytes,
-                        )
-
-                        fade_out_bytes = _align_down(
-                            _pcm_bytes_for_duration_ms(
-                                sample_rate,
-                                channels,
-                                bits_per_sample,
-                                config.playback.fade_out_ms,
-                            ),
-                            frame_bytes,
-                        )
-
-                        tail_hold_bytes = (
-                            fade_out_bytes
-                            if config.playback.boundary_smoothing_enabled
-                            else 0
-                        )
-
-                        current_audio_meta = {
-                            "sample_rate": sample_rate,
-                            "channels": channels,
-                            "sample_width": bits_per_sample // 8,
-                        }
-
-                        start_buffer_bytes = _pcm_bytes_for_duration_ms(
-                            sample_rate,
-                            channels,
-                            bits_per_sample,
-                            config.playback.start_buffer_ms,
-                        )
-
-                        start_buffer_bytes = _align_down(
-                            start_buffer_bytes, frame_bytes
-                        )
-
-                        header_sent = True
-
-                        if rec.audio_meta is None:
-                            rec.audio_meta = current_audio_meta
-
-                            yield await emit(
-                                {
-                                    "type": "meta",
-                                    "session_id": rec.session_id,
-                                    "commit_seq": commit_item["seq"],
-                                    **rec.audio_meta,
-                                }
-                            )
-                            await asyncio.sleep(0)
-
-                        elif rec.audio_meta != current_audio_meta:
-                            raise RuntimeError(
-                                "upstream WAV format changed between commits: "
-                                f"was={rec.audio_meta}, now={current_audio_meta}"
-                            )
-
-                        pcm = bytes(header_buffer[data_offset:])
-                        header_buffer.clear()
-
-                        if pcm:
-                            pending_pcm.extend(pcm)
-
-                            async for event in flush_pending(force=False):
-                                yield event
-
-                    else:
-                        pending_pcm.extend(chunk)
-
-                        async for event in flush_pending(force=False):
-                            yield event
-
-            if not header_sent:
-                raise RuntimeError("upstream finished before WAV data header was parsed")
-
-            boundary_kind, pause_ms = _pause_ms_for_commit(
-                commit_item["text"],
-                commit_item["reason"],
-                config.playback,
-            )
-
-            if (
-                config.playback.boundary_smoothing_enabled
-                and pending_pcm
-                and fade_out_bytes > 0
-            ):
-                # fade-out только на реальном аудио, ДО добавления тишины
-                tail_len = min(len(pending_pcm), fade_out_bytes)
-                tail_len = _align_down(tail_len, frame_bytes)
-
-                if tail_len > 0:
-                    start = len(pending_pcm) - tail_len
-                    faded_tail = _apply_pcm16_fade(
-                        bytes(pending_pcm[start:]),
-                        channels=channels,
-                        fade_in_frames=0,
-                        fade_out_frames=int(
-                            sample_rate * config.playback.fade_out_ms / 1000.0
-                        ),
-                    )
-                    pending_pcm[start:] = faded_tail
-
-            if pause_ms > 0:
-                pending_pcm.extend(
-                    _pcm_silence_bytes(
-                        sample_rate,
-                        channels,
-                        bits_per_sample,
-                        pause_ms,
-                    )
+                logger.info(
+                    "upstream synthesis reset session=%s commit_seq=%s reason=%s old=%s new=%s",
+                    rec.session_id[:8],
+                    commit_item["seq"],
+                    reset_reason,
+                    old_id[:8] if old_id else None,
+                    rec.synthesis_session_id[:8],
                 )
 
                 yield await emit(
                     {
-                        "type": "pause",
+                        "type": "upstream_reset",
+                        "session_id": rec.session_id,
+                        "commit_seq": commit_item["seq"],
+                        "reason": reset_reason,
+                        "old_synthesis_session_id": old_id,
+                        "new_synthesis_session_id": rec.synthesis_session_id,
+                    }
+                )
+
+                # Best-effort close old session
+                await _close_upstream_synthesis_session(client, old_id)
+
+            except Exception as exc:
+                logger.warning(
+                    "upstream synthesis reset FAILED session=%s reason=%s: %s",
+                    rec.session_id[:8],
+                    reset_reason,
+                    exc,
+                )
+                yield await emit(
+                    {
+                        "type": "upstream_reset_failed",
+                        "session_id": rec.session_id,
+                        "commit_seq": commit_item["seq"],
+                        "reason": reset_reason,
+                        "message": str(exc),
+                    }
+                )
+
+            await asyncio.sleep(0)
+
+        payload = build_upstream_payload(
+            text=commit_item["text"],
+            config=config,
+            commit_seq=commit_seq,
+        )
+
+        url = UPSTREAM_TTS_URL
+        if rec.synthesis_session_id and config.tts.stateful_synthesis:
+            url = url.replace("/v1/tts", "/v1/synthesis/synthesize")
+            payload.update(
+                {
+                    "synthesis_session_id": rec.synthesis_session_id,
+                    "commit_seq": commit_item["seq"],
+                    "commit_reason": commit_item["reason"],
+                }
+            )
+
+        header_buffer = bytearray()
+        pending_pcm = bytearray()
+        header_sent = False
+
+        upstream_bytes = 0
+        first_emit_done = False
+        start_buffer_bytes = 0
+
+        fade_in_applied = False
+        sample_rate = None
+        channels = None
+        bits_per_sample = None
+        frame_bytes = 2
+        tail_hold_bytes = 0
+        fade_in_bytes = 0
+        fade_out_bytes = 0
+
+        async def flush_pending(force: bool = False) -> AsyncGenerator[bytes, None]:
+            nonlocal first_emit_done, fade_in_applied
+
+            while True:
+                if not pending_pcm:
+                    return
+
+                # Перед первой отдачей применить fade-in к началу commit audio.
+                if (
+                    config.playback.boundary_smoothing_enabled
+                    and not fade_in_applied
+                    and fade_in_bytes > 0
+                    and len(pending_pcm) >= fade_in_bytes
+                ):
+                    faded = _apply_pcm16_fade(
+                        bytes(pending_pcm[:fade_in_bytes]),
+                        channels=channels,
+                        fade_in_frames=int(
+                            sample_rate * config.playback.fade_in_ms / 1000.0
+                        ),
+                        fade_out_frames=0,
+                    )
+                    pending_pcm[:fade_in_bytes] = faded
+                    fade_in_applied = True
+
+                threshold = effective_target_emit_bytes
+
+                if not first_emit_done:
+                    threshold = max(effective_target_emit_bytes, start_buffer_bytes)
+
+                threshold = _align_down(threshold, frame_bytes)
+                if threshold <= 0:
+                    threshold = frame_bytes
+
+                protected_tail = 0 if force else tail_hold_bytes
+                available = len(pending_pcm) - protected_tail
+
+                if available <= 0:
+                    return
+
+                if not force and available < threshold:
+                    return
+
+                if force:
+                    out_len = len(pending_pcm)
+                else:
+                    out_len = min(threshold, available)
+
+                out_len = _align_down(out_len, frame_bytes)
+
+                if out_len <= 0:
+                    return
+
+                out = bytes(pending_pcm[:out_len])
+                del pending_pcm[:out_len]
+
+                pcm_seq = rec.next_pcm_seq
+                rec.next_pcm_seq += 1
+                is_first_pcm_for_this_commit = not first_emit_done
+
+                yield await emit(
+                    {
+                        "type": "pcm",
                         "req_id": req_id,
                         "session_id": rec.session_id,
                         "commit_seq": commit_item["seq"],
-                        "boundary": boundary_kind,
-                        "pause_ms": pause_ms,
+                        "seq": pcm_seq,
+                        "first_pcm_for_commit": is_first_pcm_for_this_commit,
+                        "data": base64.b64encode(out).decode("ascii"),
                     }
                 )
+
+                first_emit_done = True
                 await asyncio.sleep(0)
 
-            if config.playback.stop_grace_ms > 0:
-                await asyncio.sleep(config.playback.stop_grace_ms / 1000.0)
+        yield await emit(
+            {
+                "type": "commit_start",
+                "session_id": rec.session_id,
+                "commit_seq": commit_item["seq"],
+                "reason": commit_item["reason"],
+                "text_preview": commit_item["text"][:180],
+                "text_len": len(commit_item["text"]),
+                "effective_target_emit_bytes": effective_target_emit_bytes,
+                "effective_start_buffer_ms": effective_start_buffer_ms,
+                "server_perf_ms": int(time.perf_counter() * 1000),
+            }
+        )
+        await asyncio.sleep(0)
 
-            async for event in flush_pending(force=True):
-                yield event
+        logger.info(
+            "REQ %s commit_seq=%s upstream start text_len=%s ref=%s url=%s text=%r",
+            req_id,
+            commit_item["seq"],
+            len(commit_item["text"]),
+            payload["reference_id"],
+            url,
+            commit_item["text"][:180],
+        )
 
-            logger.info(
-                "REQ %s commit_seq=%s upstream done upstream_bytes=%s",
-                req_id,
-                commit_item["seq"],
-                upstream_bytes,
-            )
+        async with client.stream("POST", url, json=payload) as upstream:
+            if upstream.status_code != 200:
+                text_body = await upstream.aread()
+                msg = text_body.decode("utf-8", errors="replace")
+                raise RuntimeError(f"upstream status={upstream.status_code}: {msg}")
 
-            rec.chars_since_upstream_reset += int(
-                commit_item.get("text_len") or len(commit_item.get("text") or "")
+            async for chunk in upstream.aiter_raw(1024):
+                if not chunk:
+                    continue
+
+                upstream_bytes += len(chunk)
+
+                if not header_sent:
+                    header_buffer.extend(chunk)
+                    parsed = _parse_wav_header(header_buffer)
+
+                    if parsed is None:
+                        continue
+
+                    sample_rate, channels, bits_per_sample, data_offset = parsed
+
+                    if bits_per_sample != 16:
+                        raise RuntimeError(
+                            f"unsupported bits_per_sample={bits_per_sample}"
+                        )
+
+                    frame_bytes = channels * (bits_per_sample // 8)
+
+                    fade_in_bytes = _align_down(
+                        _pcm_bytes_for_duration_ms(
+                            sample_rate,
+                            channels,
+                            bits_per_sample,
+                            config.playback.fade_in_ms,
+                        ),
+                        frame_bytes,
+                    )
+
+                    fade_out_bytes = _align_down(
+                        _pcm_bytes_for_duration_ms(
+                            sample_rate,
+                            channels,
+                            bits_per_sample,
+                            config.playback.fade_out_ms,
+                        ),
+                        frame_bytes,
+                    )
+
+                    tail_hold_bytes = (
+                        fade_out_bytes
+                        if config.playback.boundary_smoothing_enabled
+                        else 0
+                    )
+
+                    current_audio_meta = {
+                        "sample_rate": sample_rate,
+                        "channels": channels,
+                        "sample_width": bits_per_sample // 8,
+                    }
+
+                    start_buffer_bytes = _pcm_bytes_for_duration_ms(
+                        sample_rate,
+                        channels,
+                        bits_per_sample,
+                        effective_start_buffer_ms,
+                    )
+
+                    start_buffer_bytes = _align_down(
+                        start_buffer_bytes, frame_bytes
+                    )
+
+                    header_sent = True
+
+                    if rec.audio_meta is None:
+                        rec.audio_meta = current_audio_meta
+
+                        yield await emit(
+                            {
+                                "type": "meta",
+                                "session_id": rec.session_id,
+                                "commit_seq": commit_item["seq"],
+                                **rec.audio_meta,
+                            }
+                        )
+                        await asyncio.sleep(0)
+
+                    elif rec.audio_meta != current_audio_meta:
+                        raise RuntimeError(
+                            "upstream WAV format changed between commits: "
+                            f"was={rec.audio_meta}, now={current_audio_meta}"
+                        )
+
+                    pcm = bytes(header_buffer[data_offset:])
+                    header_buffer.clear()
+
+                    if pcm:
+                        pending_pcm.extend(pcm)
+
+                        async for event in flush_pending(force=False):
+                            yield event
+
+                else:
+                    pending_pcm.extend(chunk)
+
+                    async for event in flush_pending(force=False):
+                        yield event
+
+        if not header_sent:
+            raise RuntimeError("upstream finished before WAV data header was parsed")
+
+        boundary_kind, pause_ms = _pause_ms_for_commit(
+            commit_item["text"],
+            commit_item["reason"],
+            config.playback,
+        )
+
+        if (
+            config.playback.boundary_smoothing_enabled
+            and pending_pcm
+            and fade_out_bytes > 0
+        ):
+            # fade-out только на реальном аудио, ДО добавления тишины
+            tail_len = min(len(pending_pcm), fade_out_bytes)
+            tail_len = _align_down(tail_len, frame_bytes)
+
+            if tail_len > 0:
+                start = len(pending_pcm) - tail_len
+                faded_tail = _apply_pcm16_fade(
+                    bytes(pending_pcm[start:]),
+                    channels=channels,
+                    fade_in_frames=0,
+                    fade_out_frames=int(
+                        sample_rate * config.playback.fade_out_ms / 1000.0
+                    ),
+                )
+                pending_pcm[start:] = faded_tail
+
+        if pause_ms > 0:
+            pending_pcm.extend(
+                _pcm_silence_bytes(
+                    sample_rate,
+                    channels,
+                    bits_per_sample,
+                    pause_ms,
+                )
             )
 
             yield await emit(
                 {
-                    "type": "commit_done",
+                    "type": "pause",
+                    "req_id": req_id,
                     "session_id": rec.session_id,
                     "commit_seq": commit_item["seq"],
-                    "upstream_bytes": upstream_bytes,
                     "boundary": boundary_kind,
                     "pause_ms": pause_ms,
-                    "fade_in_ms": config.playback.fade_in_ms,
-                    "fade_out_ms": config.playback.fade_out_ms,
                 }
             )
+            await asyncio.sleep(0)
+
+        if config.playback.stop_grace_ms > 0:
+            await asyncio.sleep(config.playback.stop_grace_ms / 1000.0)
+
+        async for event in flush_pending(force=True):
+            yield event
+
+        logger.info(
+            "REQ %s commit_seq=%s upstream done upstream_bytes=%s",
+            req_id,
+            commit_item["seq"],
+            upstream_bytes,
+        )
+
+        rec.chars_since_upstream_reset += int(
+            commit_item.get("text_len") or len(commit_item.get("text") or "")
+        )
+
+        yield await emit(
+            {
+                "type": "commit_done",
+                "session_id": rec.session_id,
+                "commit_seq": commit_item["seq"],
+                "upstream_bytes": upstream_bytes,
+                "boundary": boundary_kind,
+                "pause_ms": pause_ms,
+                "fade_in_ms": config.playback.fade_in_ms,
+                "fade_out_ms": config.playback.fade_out_ms,
+            }
+        )
+
     async def body_iter() -> AsyncGenerator[bytes, None]:
         req_id = uuid.uuid4().hex[:8]
 
@@ -1585,34 +1733,45 @@ async def session_pcm_stream(session_id: str):
                     "req_id": req_id,
                     "session_id": rec.session_id,
                     "target_emit_bytes": target_emit_bytes,
+                    "first_commit_target_emit_bytes": (
+                        config.playback.first_commit_target_emit_bytes
+                    ),
+                    "first_commit_start_buffer_ms": (
+                        config.playback.first_commit_start_buffer_ms
+                    ),
+                    "client_start_buffer_ms": config.playback.client_start_buffer_ms,
+                    "client_initial_start_delay_ms": (
+                        config.playback.client_initial_start_delay_ms
+                    ),
                     "synthesis_session_id": rec.synthesis_session_id,
                 }
             )
             await asyncio.sleep(0)
 
             try:
-                while True:
-                    item = await rec.commit_queue.get()
+                async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
+                    while True:
+                        item = await rec.commit_queue.get()
 
-                    if item["type"] == "commit":
-                        async for event in stream_one_commit(req_id, item):
-                            yield event
+                        if item["type"] == "commit":
+                            async for event in stream_one_commit(client, req_id, item):
+                                yield event
 
-                        await _touch_session(rec)
-                        continue
+                            await _touch_session(rec)
+                            continue
 
-                    if item["type"] == "eof":
-                        break
+                        if item["type"] == "eof":
+                            break
 
-                    if item["type"] == "abort":
-                        yield await emit(
-                            {
-                                "type": "session_aborted",
-                                "req_id": req_id,
-                                "session_id": rec.session_id,
-                            }
-                        )
-                        return
+                        if item["type"] == "abort":
+                            yield await emit(
+                                {
+                                    "type": "session_aborted",
+                                    "req_id": req_id,
+                                    "session_id": rec.session_id,
+                                }
+                            )
+                            return
 
             except asyncio.CancelledError:
                 logger.warning("session stream cancelled id=%s", rec.session_id[:8])
@@ -1665,8 +1824,9 @@ async def session_pcm_stream(session_id: str):
 async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
     config = load_runtime_config().proxy
     req_id = uuid.uuid4().hex[:8]
-    payload = build_upstream_payload(text=text, config=config)
-    target_emit_bytes = config.playback.target_emit_bytes
+    payload = build_upstream_payload(text=text, config=config, commit_seq=1)
+    effective_target_emit_bytes = config.playback.first_commit_target_emit_bytes
+    effective_start_buffer_ms = config.playback.first_commit_start_buffer_ms
 
     async def emit(obj: dict[str, Any]) -> bytes:
         return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
@@ -1713,10 +1873,10 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
                     pending_pcm[:fade_in_bytes] = faded
                     fade_in_applied = True
 
-                threshold = target_emit_bytes
+                threshold = effective_target_emit_bytes
 
                 if not first_emit_done:
-                    threshold = max(target_emit_bytes, start_buffer_bytes)
+                    threshold = max(effective_target_emit_bytes, start_buffer_bytes)
 
                 threshold = _align_down(threshold, frame_bytes)
                 if threshold <= 0:
@@ -1744,11 +1904,14 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
                 out = bytes(pending_pcm[:out_len])
                 del pending_pcm[:out_len]
 
+                is_first_pcm_for_this_commit = not first_emit_done
+
                 yield await emit(
                     {
                         "type": "pcm",
                         "req_id": req_id,
                         "seq": pcm_seq,
+                        "first_pcm_for_commit": is_first_pcm_for_this_commit,
                         "data": base64.b64encode(out).decode("ascii"),
                     }
                 )
@@ -1761,6 +1924,19 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
                 "type": "proxy_start",
                 "req_id": req_id,
                 "mode": "stateless",
+            }
+        )
+        yield await emit(
+            {
+                "type": "commit_start",
+                "req_id": req_id,
+                "mode": "stateless",
+                "commit_seq": 1,
+                "text_preview": text[:180],
+                "text_len": len(text),
+                "effective_target_emit_bytes": effective_target_emit_bytes,
+                "effective_start_buffer_ms": effective_start_buffer_ms,
+                "server_perf_ms": int(time.perf_counter() * 1000),
             }
         )
 
@@ -1823,7 +1999,7 @@ async def pcm_stream(text: str = Query(..., min_length=1, max_length=2000)):
                             sample_rate,
                             channels,
                             bits_per_sample,
-                            config.playback.start_buffer_ms,
+                            effective_start_buffer_ms,
                         )
 
                         start_buffer_bytes = _align_down(

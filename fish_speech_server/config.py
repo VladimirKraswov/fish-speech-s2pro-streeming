@@ -80,6 +80,8 @@ class ProxyTTSConfig(BaseModel):
     stream_tokens: bool = True
     initial_stream_chunk_size: int = Field(10, ge=1, le=200)
     stream_chunk_size: int = Field(8, ge=1, le=200)
+    first_initial_stream_chunk_size: int | None = Field(None, ge=1, le=200)
+    first_stream_chunk_size: int | None = Field(None, ge=1, le=200)
 
     stateful_synthesis: bool = True
     stateful_fallback_to_stateless: bool = False
@@ -114,6 +116,14 @@ class ProxyTTSConfig(BaseModel):
     def validate_chunk_sizes(self) -> "ProxyTTSConfig":
         if self.initial_stream_chunk_size < self.stream_chunk_size:
             raise ValueError("initial_stream_chunk_size must be >= stream_chunk_size")
+        first_initial = (
+            self.first_initial_stream_chunk_size or self.initial_stream_chunk_size
+        )
+        first_stream = self.first_stream_chunk_size or self.stream_chunk_size
+        if first_initial < first_stream:
+            raise ValueError(
+                "first initial_stream_chunk_size must be >= first stream_chunk_size"
+            )
         return self
 
 
@@ -121,7 +131,11 @@ class PlaybackConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     target_emit_bytes: int = Field(8192, ge=512, le=65536)
+    first_commit_target_emit_bytes: int = Field(8192, ge=512, le=65536)
     start_buffer_ms: int = Field(180, ge=0, le=5000)
+    first_commit_start_buffer_ms: int = Field(120, ge=0, le=5000)
+    client_start_buffer_ms: int = Field(160, ge=0, le=5000)
+    client_initial_start_delay_ms: int = Field(40, ge=0, le=1000)
     stop_grace_ms: int = Field(100, ge=0, le=5000)
 
     boundary_smoothing_enabled: bool = True
@@ -136,11 +150,11 @@ class PlaybackConfig(BaseModel):
     pause_after_force_ms: int = Field(220, ge=0, le=3000)
     pause_after_hard_limit_ms: int = Field(40, ge=0, le=1000)
 
-    @field_validator("target_emit_bytes")
+    @field_validator("target_emit_bytes", "first_commit_target_emit_bytes")
     @classmethod
     def validate_even_bytes(cls, value: int) -> int:
         if value % 2 != 0:
-            raise ValueError("target_emit_bytes must be even for PCM16")
+            raise ValueError("PCM emit byte sizes must be even for PCM16")
         return value
 
 

@@ -97,6 +97,7 @@ def generate_committed_segments(
     stream_tokens: bool = False,
     stream_chunk_size: int = 8,
     initial_stream_chunk_size: int = 10,
+    cancel_event: Any | None = None,
 ):
     runtime = load_runtime_config()
     model_cfg = runtime.model
@@ -257,6 +258,9 @@ def generate_committed_segments(
         generated_history: list[tuple[str, torch.Tensor]] = []
 
         for batch_idx, batch_text in enumerate(committed_segments):
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("Streaming request cancelled")
+
             logger.info(
                 "--- Sample {}, Segment {} ({} bytes) ---",
                 sample_idx,
@@ -461,6 +465,9 @@ def generate_committed_segments(
             prompt_length = encoded.size(1)
 
             if stream_tokens:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError("Streaming request cancelled")
+
                 logger.info(
                     "stream: generate_committed_segments starting token stream "
                     "segment_idx={} initial_stream_chunk_size={} stream_chunk_size={} "
@@ -569,6 +576,9 @@ def generate_committed_segments(
                 del encoded
 
             else:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError("Streaming request cancelled")
+
                 y = generate(
                     model=model,
                     prompt=encoded,

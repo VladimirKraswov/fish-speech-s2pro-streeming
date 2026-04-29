@@ -11,10 +11,14 @@ from typing import Literal, Optional, Union
 import torch
 from loguru import logger
 
+from fish_speech.driver.config import load_runtime_config
 from fish_speech.generation.decode import _cache_max_seq_len
 from fish_speech.generation.models import init_model
-from fish_speech.generation.prompt_builder import GenerateResponse, generate_committed_segments
-from fish_speech.driver.config import load_runtime_config
+from fish_speech.generation.prompt_builder import (
+    GenerateResponse,
+    generate_committed_segments,
+)
+
 
 @dataclass
 class WrappedGenerateResponse:
@@ -26,6 +30,10 @@ class WrappedGenerateResponse:
 class GenerateRequest:
     request: dict
     response_queue: queue.Queue
+
+
+class _StreamingRequestCancelled(RuntimeError):
+    pass
 
 
 def _model_param_memory_gb(module: torch.nn.Module) -> tuple[float, int]:
@@ -49,39 +57,60 @@ def launch_thread_safe_queue(
     """
     input_queue = queue.Queue()
     init_event = threading.Event()
+    init_error: list[BaseException] = []
+
+    def wait_for_stream_ack(
+        ack_queue: queue.Queue,
+        cancel_event: threading.Event | None,
+    ) -> None:
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise _StreamingRequestCancelled("Streaming request cancelled")
+            try:
+                ack_queue.get(timeout=1.0)
+                return
+            except queue.Empty:
+                continue
 
     def worker():
-        runtime = load_runtime_config()
-        model_cfg = runtime.model
+        try:
+            runtime = load_runtime_config()
+            model_cfg = runtime.model
 
-        profile_cadence = model_cfg.profile_inference
-        cleanup_after_request = model_cfg.cleanup_after_request
-        cleanup_every_n_requests = model_cfg.cleanup_every_n_requests
-        cleanup_on_error = model_cfg.cleanup_on_error
-        empty_cache_per_stream_chunk = model_cfg.empty_cache_per_stream_chunk
-        requests_since_cleanup = 0
+            profile_cadence = model_cfg.profile_inference
+            cleanup_after_request = model_cfg.cleanup_after_request
+            cleanup_every_n_requests = model_cfg.cleanup_every_n_requests
+            cleanup_on_error = model_cfg.cleanup_on_error
+            cleanup_on_abort = model_cfg.cleanup_on_abort
+            empty_cache_per_stream_chunk = model_cfg.empty_cache_per_stream_chunk
+            requests_since_cleanup = 0
 
-        model, decode_one_token = init_model(
-            checkpoint_path, device, precision, compile=compile
-        )
-        cache_len = _cache_max_seq_len(model)
-        logger.info(
-            "KV cache max_seq_len={} (model max={})",
-            cache_len,
-            model.config.max_seq_len,
-        )
-        with torch.device(device):
-            model.setup_caches(
-                max_batch_size=1,
-                max_seq_len=cache_len,
-                dtype=next(model.parameters()).dtype,
+            model, decode_one_token = init_model(
+                checkpoint_path, device, precision, compile=compile
             )
-        model._cache_setup_done = True
-        if memory_info is not None:
-            gb, count = _model_param_memory_gb(model)
-            memory_info["llama_param_gb"] = gb
-            memory_info["llama_param_count"] = count
-        init_event.set()
+            cache_len = _cache_max_seq_len(model)
+            logger.info(
+                "KV cache max_seq_len={} (model max={})",
+                cache_len,
+                model.config.max_seq_len,
+            )
+            with torch.device(device):
+                model.setup_caches(
+                    max_batch_size=1,
+                    max_seq_len=cache_len,
+                    dtype=next(model.parameters()).dtype,
+                )
+            model._cache_setup_done = True
+            if memory_info is not None:
+                gb, count = _model_param_memory_gb(model)
+                memory_info["llama_param_gb"] = gb
+                memory_info["llama_param_count"] = count
+            init_event.set()
+        except BaseException as e:
+            logger.exception("Failed to initialize LLaMA worker")
+            init_error.append(e)
+            init_event.set()
+            return
 
         def maybe_cleanup(*, reason: str, force: bool = False) -> None:
             nonlocal requests_since_cleanup
@@ -140,6 +169,7 @@ def launch_thread_safe_queue(
             kwargs = item.request
             req_tag = str(kwargs.pop("req_tag", "na"))
             ack_queue = kwargs.pop("ack_queue", None)
+            cancel_event = kwargs.pop("cancel_event", None)
             response_queue = item.response_queue
             t_req_start = time.perf_counter()
             t_last_put = t_req_start
@@ -154,9 +184,26 @@ def launch_thread_safe_queue(
                 )
 
             try:
-                for chunk in generate_committed_segments(
-                    model=model, decode_one_token=decode_one_token, **kwargs
+                if (
+                    stream_tokens
+                    and cancel_event is not None
+                    and cancel_event.is_set()
                 ):
+                    raise _StreamingRequestCancelled("Streaming request cancelled")
+                for chunk in generate_committed_segments(
+                    model=model,
+                    decode_one_token=decode_one_token,
+                    cancel_event=cancel_event,
+                    **kwargs,
+                ):
+                    if (
+                        stream_tokens
+                        and cancel_event is not None
+                        and cancel_event.is_set()
+                    ):
+                        raise _StreamingRequestCancelled(
+                            "Streaming request cancelled"
+                        )
                     if stream_tokens and put_count < 5:
                         logger.info(
                             "stream: worker putting chunk put_count={} action={} req={}",
@@ -197,14 +244,43 @@ def launch_thread_safe_queue(
                         WrappedGenerateResponse(status="success", response=out)
                     )
                     if stream_tokens and ack_queue is not None:
-                        ack_queue.get()
-                    if stream_tokens and empty_cache_per_stream_chunk and torch.cuda.is_available():
+                        wait_for_stream_ack(ack_queue, cancel_event)
+                    if (
+                        stream_tokens
+                        and empty_cache_per_stream_chunk
+                        and torch.cuda.is_available()
+                    ):
                         torch.cuda.empty_cache()
 
                 requests_since_cleanup += 1
                 maybe_cleanup(reason="success", force=False)
 
+            except _StreamingRequestCancelled:
+                logger.info(
+                    "stream: worker request cancelled req={} put_count={}",
+                    req_tag,
+                    put_count,
+                )
+                if cleanup_on_abort:
+                    maybe_cleanup(reason="abort", force=True)
+
             except Exception as e:
+                if (
+                    stream_tokens
+                    and cancel_event is not None
+                    and cancel_event.is_set()
+                    and isinstance(e, RuntimeError)
+                    and str(e) == "Streaming request cancelled"
+                ):
+                    logger.info(
+                        "stream: worker request cancelled req={} put_count={}",
+                        req_tag,
+                        put_count,
+                    )
+                    if cleanup_on_abort:
+                        maybe_cleanup(reason="abort", force=True)
+                    continue
+
                 logger.error(
                     "stream: worker EXCEPTION req={} put_count={}: {}",
                     req_tag,
@@ -218,6 +294,9 @@ def launch_thread_safe_queue(
                     maybe_cleanup(reason="error", force=True)
 
     threading.Thread(target=worker, daemon=True).start()
-    init_event.wait()
+    if not init_event.wait(timeout=300):
+        raise TimeoutError("Timed out initializing LLaMA worker")
+    if init_error:
+        raise RuntimeError("Failed to initialize LLaMA worker") from init_error[0]
 
     return input_queue

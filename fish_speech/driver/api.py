@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Iterator
 
 import torch
+from loguru import logger
 
 try:
     import numpy as np
@@ -61,12 +63,23 @@ def _acoustic_codebook_size_from_decoder(decoder_model: Any) -> int | None:
     return _positive_int(getattr(quantizer, "codebook_size", None))
 
 
+def _validate_reference_id(reference_id: str) -> None:
+    if not re.match(r"^[a-zA-Z0-9\-_ ]+$", reference_id):
+        raise ValueError(
+            "Reference ID contains invalid characters. Only alphanumeric, hyphens, underscores, and spaces are allowed."
+        )
+    if len(reference_id) > 255:
+        raise ValueError("Reference ID is too long. Maximum length is 255 characters.")
+
+
 class FishSpeechDriver:
     def __init__(self, engine: Any, config: Any | None = None) -> None:
         self.engine = engine
         self.config = config
         self._closed = False
         self._sessions_opened = 0
+        self._generated_segments = 0
+        self._audio_events = 0
 
     @classmethod
     def from_engine(cls, engine: Any, config: Any | None = None) -> "FishSpeechDriver":
@@ -91,6 +104,12 @@ class FishSpeechDriver:
             device = "mps"
         elif not torch.cuda.is_available():
             device = "cpu"
+        if device != model_cfg.device:
+            logger.warning(
+                "Configured device {} overridden to available device {}",
+                model_cfg.device,
+                device,
+            )
 
         return cls.from_model_paths(
             llama_checkpoint_path=paths.llama_checkpoint_path,
@@ -273,7 +292,11 @@ class FishSpeechDriver:
         return DriverHealth(ok=not self._closed)
 
     def stats(self) -> DriverStats:
-        return DriverStats(sessions_opened=self._sessions_opened)
+        return DriverStats(
+            sessions_opened=self._sessions_opened,
+            generated_segments=self._generated_segments,
+            audio_events=self._audio_events,
+        )
 
     def close(self) -> None:
         self._closed = True
@@ -309,10 +332,21 @@ class FishSpeechDriver:
         self.engine.delete_reference(reference_id)
 
     def rename_reference(self, old_reference_id: str, new_reference_id: str) -> None:
+        _validate_reference_id(old_reference_id)
+        _validate_reference_id(new_reference_id)
+
         old_dir = self.references_dir / old_reference_id
         new_dir = self.references_dir / new_reference_id
-        old_dir.rename(new_dir)
-        if old_reference_id in self.engine.ref_by_id:
-            self.engine.ref_by_id[new_reference_id] = self.engine.ref_by_id.pop(
-                old_reference_id
+
+        if not old_dir.is_dir():
+            raise FileNotFoundError(
+                f"Reference ID {old_reference_id!r} does not exist"
             )
+        if new_dir.exists():
+            raise FileExistsError(
+                f"Reference ID {new_reference_id!r} already exists"
+            )
+
+        old_dir.rename(new_dir)
+        self.engine.ref_by_id.pop(old_reference_id, None)
+        self.engine.ref_by_id.pop(new_reference_id, None)

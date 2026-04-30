@@ -157,7 +157,8 @@ class ReferenceLoader:
         references: list[DriverReference],
         use_cache: Literal["on", "off"],
     ) -> Tuple:
-        # Load the references audio and text by hash
+        # Cache is keyed only by audio hash. Text stays request-local so callers
+        # can reuse the same audio reference with different prompt transcripts.
         audio_hashes = [sha256(ref.audio).hexdigest() for ref in references]
 
         cache_used = False

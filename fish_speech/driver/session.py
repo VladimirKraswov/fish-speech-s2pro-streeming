@@ -72,12 +72,16 @@ class DriverSession:
         if self.closed:
             raise RuntimeError("driver synthesis session is closed")
 
-        self.segments_submitted += len(request.committed_segments())
+        submitted_segments = len(request.committed_segments())
+        self.segments_submitted += submitted_segments
+        self.driver._generated_segments += submitted_segments
+
         for result in self.driver.engine.inference(request):
             if result.code == "tokens":
                 yield DriverTokenChunkEvent(codes=result.tokens)
             elif result.code == "segment" and isinstance(result.audio, tuple):
                 self.audio_events_emitted += 1
+                self.driver._audio_events += 1
                 sample_rate, audio = result.audio
                 yield DriverAudioChunkEvent(
                     sample_rate=sample_rate,
@@ -85,6 +89,7 @@ class DriverSession:
                     segment_index=self.audio_events_emitted,
                 )
             elif result.code == "final" and isinstance(result.audio, tuple):
+                self.driver._audio_events += 1
                 sample_rate, audio = result.audio
                 yield DriverFinalAudioEvent(sample_rate=sample_rate, audio=audio)
             elif result.code == "error":

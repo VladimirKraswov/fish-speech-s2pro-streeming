@@ -371,3 +371,108 @@ def validate_codes_for_decoder(
         )
 
     return normalized
+
+
+def validate_codes_for_decoder_device(
+    codes: torch.Tensor,
+    decoder_model: Any,
+    *,
+    name: str = "codes",
+) -> torch.Tensor:
+    """
+    Validate already-generated decoder codes without forcing a CPU roundtrip.
+
+    This is intended for hot streaming paths where codes are already tensors on
+    the LLaMA/DAC device. It keeps the tensor on-device and only synchronizes if
+    validation is explicitly requested by the caller.
+    """
+
+    if not isinstance(codes, torch.Tensor):
+        raise ValueError(f"{name} must be a torch.Tensor, got {type(codes).__name__}")
+
+    if codes.ndim == 3:
+        if codes.shape[0] != 1:
+            raise ValueError(
+                f"{name} has unexpected 3D shape {tuple(codes.shape)}; "
+                "expected [1, C, T] or [C, T]"
+            )
+        codes = codes[0]
+
+    if codes.ndim != 2:
+        raise ValueError(
+            f"{name} has unexpected ndim={codes.ndim}, shape={tuple(codes.shape)}; "
+            "expected [C, T]"
+        )
+
+    codebooks = int(codes.shape[0])
+    frames = int(codes.shape[1])
+    if codebooks <= 0:
+        raise ValueError(f"{name} has zero codebooks, shape={tuple(codes.shape)}")
+    if frames <= 0:
+        raise ValueError(f"{name} has zero frames, shape={tuple(codes.shape)}")
+
+    expected_codebooks = expected_codebooks_from_decoder(decoder_model)
+    if expected_codebooks is not None and codebooks != int(expected_codebooks):
+        raise ValueError(
+            f"{name} codebook count mismatch: got {codebooks}, "
+            f"expected {expected_codebooks}, shape={tuple(codes.shape)}"
+        )
+
+    if codes.dtype != torch.long:
+        codes = codes.to(dtype=torch.long)
+
+    quantizer = getattr(decoder_model, "quantizer", None) if decoder_model else None
+    if quantizer is None:
+        if torch.any(codes < 0).item():
+            raise ValueError(
+                f"{name} contains negative codes: "
+                f"shape={tuple(codes.shape)} {_range_text(codes)}"
+            )
+        return codes.contiguous()
+
+    if _is_downsample_rvq(quantizer):
+        sem_q = getattr(quantizer, "semantic_quantizer", None)
+        ac_q = getattr(quantizer, "quantizer", None)
+        semantic_size = _positive_int(getattr(sem_q, "codebook_size", None), 4096)
+        acoustic_size = _positive_int(getattr(ac_q, "codebook_size", None), 1024)
+
+        assert semantic_size is not None
+        assert acoustic_size is not None
+
+        if torch.any(codes[0] < 0).item() or torch.any(
+            codes[0] >= semantic_size
+        ).item():
+            _raise_range_error(
+                name=name,
+                row_name="semantic",
+                codes=codes[0],
+                expected_range=f"[0, {semantic_size})",
+            )
+        if codes.shape[0] > 1 and (
+            torch.any(codes[1:] < 0).item()
+            or torch.any(codes[1:] >= acoustic_size).item()
+        ):
+            _raise_range_error(
+                name=name,
+                row_name="acoustic",
+                codes=codes[1:],
+                expected_range=f"[0, {acoustic_size})",
+            )
+        return codes.contiguous()
+
+    size = _positive_int(getattr(quantizer, "codebook_size", None))
+    if size is not None:
+        if torch.any(codes < 0).item() or torch.any(codes >= size).item():
+            _raise_range_error(
+                name=name,
+                row_name="",
+                codes=codes,
+                expected_range=f"[0, {size})",
+            )
+    elif torch.any(codes < 0).item():
+        raise ValueError(
+            f"{name} contains negative codes: "
+            f"shape={tuple(codes.shape)} {_range_text(codes)}"
+        )
+
+    return codes.contiguous()

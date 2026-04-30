@@ -6,6 +6,7 @@ from fish_speech.codec.codes import (
     normalize_codes,
     save_codes_pt,
     validate_codes_for_decoder,
+    validate_codes_for_decoder_device,
 )
 from fish_speech.codec.vq import VQManager
 
@@ -18,4 +19,5 @@ __all__ = [
     "normalize_codes",
     "save_codes_pt",
     "validate_codes_for_decoder",
+    "validate_codes_for_decoder_device",
 ]

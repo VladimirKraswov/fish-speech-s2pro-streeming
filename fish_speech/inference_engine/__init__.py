@@ -11,7 +11,11 @@ from loguru import logger
 from fish_speech.driver import DriverSynthesisRequest
 from fish_speech.inference_engine.utils import InferenceResult
 from fish_speech.models.dac.modded_dac import DAC
-from fish_speech.codec.codes import validate_codes_for_decoder
+from fish_speech.codec.codes import (
+    estimate_code_frames,
+    validate_codes_for_decoder,
+    validate_codes_for_decoder_device,
+)
 from fish_speech.generation.prompt_builder import GenerateResponse
 from fish_speech.generation.worker import GenerateRequest
 from fish_speech.references.loader import ReferenceLoader
@@ -128,6 +132,9 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         req_tag = hex(id(req))[-6:]
         t_start = time.perf_counter()
         t_prev = t_start
+        first_codes_at: float | None = None
+        first_decode_start_at: float | None = None
+        first_decode_end_at: float | None = None
         finished_normally = False
         cancel_event: threading.Event | None = None
 
@@ -258,7 +265,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                 continuation_text=history_texts,
             )
             _mark("llama_queued")
-            if stream_decode:
+            if stream_decode and profile:
                 logger.info(
                     "stream: inference started (token streaming), req={}", req_tag
                 )
@@ -271,19 +278,33 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             segments = []
             all_codes = []
             seg_idx = 0
-            vq_left_context = None
-            pending_pcm_tail = None
             stream_decode_idx = 0
-            max_vq_context_frames = 32
+            max_vq_context_frames = 8 if req.low_latency_first_audio else 32
+
+            vq_left_context = None
+            if req.stream_audio and history_tokens:
+                last_history = history_tokens[-1]
+                if last_history is not None and last_history.shape[-1] > 0:
+                    vq_left_context = (
+                        last_history[:, -max_vq_context_frames:]
+                        .detach()
+                        .cpu()
+                        .contiguous()
+                    )
+                    if profile:
+                        logger.info(
+                            "stream: initialized decoder left context from continuation frames={}",
+                            vq_left_context.shape[-1],
+                        )
 
             while True:
-                if stream_decode:
+                if stream_decode and profile:
                     logger.info(
                         "stream: waiting for next chunk from queue, req={}", req_tag
                     )
                 wrapped_result = response_queue.get()
                 _mark("queue_get")
-                if stream_decode:
+                if stream_decode and profile:
                     action = (
                         getattr(wrapped_result.response, "action", None)
                         if hasattr(wrapped_result.response, "action")
@@ -339,7 +360,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                                     ),
                                 )
 
-                        if req.stream_audio:
+                        if req.stream_audio and profile:
                             logger.info(
                                 "stream: decoding segment seg_idx={} codes_shape={} req={}",
                                 seg_idx + 1,
@@ -358,11 +379,29 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                         try:
                             if req.stream_audio and result.codes is not None:
                                 new_codes = result.codes
+                                if first_codes_at is None:
+                                    first_codes_at = time.perf_counter()
+                                    _mark(
+                                        "first_token_chunk_from_worker",
+                                        tt_first_codes_ms=round(
+                                            (first_codes_at - t_start) * 1000.0, 1
+                                        ),
+                                        first_chunk_frames=int(new_codes.shape[-1]),
+                                        codes_device_before_decode=str(new_codes.device),
+                                    )
                                 context_frames_before = (
                                     vq_left_context.shape[-1]
                                     if vq_left_context is not None
                                     else 0
                                 )
+
+                                if first_decode_start_at is None:
+                                    first_decode_start_at = time.perf_counter()
+                                    _mark(
+                                        "first_decode_start",
+                                        codes_device_before_decode=str(new_codes.device),
+                                        decoder_device=str(self._get_decoder_device()),
+                                    )
 
                                 segment, vq_left_context, full_decoded_size = (
                                     self._decode_stream_codes_with_context(
@@ -372,7 +411,22 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                                     )
                                 )
 
-                                if stream_decode_idx < 3:
+                                if first_decode_end_at is None:
+                                    first_decode_end_at = time.perf_counter()
+                                    _mark(
+                                        "first_decode_end",
+                                        tt_first_decode_ms=round(
+                                            (
+                                                first_decode_end_at
+                                                - (first_decode_start_at or first_decode_end_at)
+                                            )
+                                            * 1000.0,
+                                            1,
+                                        ),
+                                        first_chunk_samples=len(segment),
+                                    )
+
+                                if profile and stream_decode_idx < 3:
                                     logger.info(
                                         "stream_vq_context_decode: new_frames={} context_frames={} decode_frames={} decoded_samples={} emitted_samples={}",
                                         new_codes.shape[-1],
@@ -408,7 +462,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                                 segment_idx=seg_idx,
                                 samples=len(segment),
                             )
-                            if req.stream_audio:
+                            if req.stream_audio and profile:
                                 logger.info(
                                     "stream: segment_decoded seg_idx={} samples={} req={}",
                                     seg_idx,
@@ -417,47 +471,58 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                                 )
 
                             if req.stream_audio:
-                                processed_segment, pending_pcm_tail = (
-                                    self._crossfade_stream_segment(
-                                        segment=segment,
-                                        pending_tail=pending_pcm_tail,
-                                        sample_rate=sample_rate,
-                                        fade_ms=8.0,
-                                    )
-                                )
-
-                                if processed_segment.size > 0:
-                                    _mark("yield_segment", segment_idx=seg_idx)
+                                if segment.size > 0:
+                                    if seg_idx == 1:
+                                        now = time.perf_counter()
+                                        _mark(
+                                            "first_audio_yield",
+                                            ttfa_ms=round((now - t_start) * 1000.0, 1),
+                                            tt_first_codes_ms=(
+                                                round(
+                                                    (first_codes_at - t_start)
+                                                    * 1000.0,
+                                                    1,
+                                                )
+                                                if first_codes_at is not None
+                                                else None
+                                            ),
+                                            tt_first_decode_ms=(
+                                                round(
+                                                    (
+                                                        (first_decode_end_at or now)
+                                                        - (
+                                                            first_decode_start_at
+                                                            or now
+                                                        )
+                                                    )
+                                                    * 1000.0,
+                                                    1,
+                                                )
+                                                if first_decode_start_at is not None
+                                                else None
+                                            ),
+                                            first_chunk_samples=len(segment),
+                                        )
+                                    else:
+                                        _mark("yield_segment", segment_idx=seg_idx)
                                     yield InferenceResult(
                                         code="segment",
-                                        audio=(sample_rate, processed_segment),
+                                        audio=(sample_rate, segment),
                                         error=None,
                                     )
-                                    segments.append(processed_segment)
+                                    segments.append(segment)
                             else:
                                 segments.append(segment)
 
                         if self.empty_cache_per_segment and torch.cuda.is_available():
                             torch.cuda.empty_cache()
                     else:
-                        if stream_decode:
+                        if stream_decode and profile:
                             logger.info(
                                 "stream: got_next (end of stream), total_segments={} req={}",
                                 seg_idx,
                                 req_tag,
                             )
-
-                        if req.stream_audio and pending_pcm_tail is not None:
-                            _mark("yield_final_tail")
-                            tail = self._flush_stream_tail(pending_pcm_tail)
-                            if tail is not None:
-                                yield InferenceResult(
-                                    code="segment",
-                                    audio=(sample_rate, tail),
-                                    error=None,
-                                )
-                                segments.append(tail)
-                            pending_pcm_tail = None
 
                         _mark("got_next")
                         break
@@ -527,15 +592,17 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             repetition_penalty=req.repetition_penalty,
             temperature=req.temperature,
             compile=self.compile,
-            iterative_prompt=req.chunk_length > 0,
+            iterative_prompt=req.chunk_length > 0 and not req.low_latency_first_audio,
             chunk_length=req.chunk_length,
             prompt_tokens=prompt_tokens,
             prompt_text=prompt_texts,
             continuation_tokens=continuation_tokens,
             continuation_text=continuation_text,
+            stream_audio=req.stream_audio,
             stream_tokens=stream_tokens,
             stream_chunk_size=req.stream_chunk_size,
             initial_stream_chunk_size=req.initial_stream_chunk_size,
+            low_latency_first_audio=req.low_latency_first_audio,
             ack_queue=ack_queue,
             cancel_event=cancel_event,
         )
@@ -561,17 +628,27 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         to ensure acoustic continuity. Returns the new audio segment, updated
         context for the next chunk, and the full size of the decoded buffer.
         """
-        new_codes_cpu = new_codes.detach().cpu()
+        new_codes_fast = new_codes.detach()
+        if new_codes_fast.dtype != torch.long:
+            new_codes_fast = new_codes_fast.to(dtype=torch.long)
 
         if left_context_codes is not None and left_context_codes.numel() > 0:
-            decode_codes_cpu = torch.cat([left_context_codes, new_codes_cpu], dim=1)
+            if left_context_codes.device != new_codes_fast.device:
+                left_context_codes = left_context_codes.to(
+                    device=new_codes_fast.device,
+                    non_blocking=True,
+                )
+            if left_context_codes.dtype != torch.long:
+                left_context_codes = left_context_codes.to(dtype=torch.long)
+            decode_codes = torch.cat([left_context_codes, new_codes_fast], dim=1)
             context_frames = left_context_codes.shape[-1]
         else:
-            decode_codes_cpu = new_codes_cpu
+            decode_codes = new_codes_fast
             context_frames = 0
 
-        decoded = self.get_audio_segment(
-            GenerateResponse(action="sample", codes=decode_codes_cpu)
+        decoded = self.get_audio_segment_fast(
+            GenerateResponse(action="sample", codes=decode_codes),
+            validate_debug=self.runtime.model.profile_inference,
         )
 
         # DAC uses a specific hop length / frame length for its VQ codebooks.
@@ -589,7 +666,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
         if max_context_frames > 0:
             # Take the end of current decoded codes as the context for the next segment.
-            next_context = decode_codes_cpu[:, -max_context_frames:].contiguous()
+            next_context = decode_codes[:, -max_context_frames:].detach().contiguous()
         else:
             next_context = None
 
@@ -599,66 +676,65 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             decoded.size,
         )
 
-    def _flush_stream_tail(self, pending_tail: np.ndarray | None) -> np.ndarray | None:
-        return pending_tail
-
-    def _crossfade_stream_segment(
+    def get_audio_segment_fast(
         self,
+        result: GenerateResponse,
         *,
-        segment: np.ndarray,
-        pending_tail: np.ndarray | None,
-        sample_rate: int,
-        fade_ms: float = 8.0,
-    ) -> tuple[np.ndarray, np.ndarray | None]:
-        segment = np.asarray(segment, dtype=np.float32)
-        if segment.size == 0:
-            return segment, pending_tail
+        validate_debug: bool = False,
+    ) -> np.ndarray:
+        """
+        Decode generated VQ tokens without normalizing through CPU.
 
-        fade_samples = max(1, int(sample_rate * fade_ms / 1000.0))
+        The normal get_audio_segment path is intentionally conservative for
+        external/cache inputs. Streaming generated chunks are already tensors
+        from the model worker, so this path keeps codes on GPU until the final
+        PCM numpy conversion.
+        """
 
-        if pending_tail is None:
-            if segment.size <= fade_samples:
-                return np.zeros(0, dtype=np.float32), segment.copy()
-            return segment[:-fade_samples].copy(), segment[-fade_samples:].copy()
+        codes = result.codes
+        if codes is None or estimate_code_frames(codes) == 0:
+            return np.zeros(0, dtype=np.float32)
+        if not isinstance(codes, torch.Tensor):
+            return self.get_audio_segment(result)
 
-        pending_tail = np.asarray(pending_tail, dtype=np.float32)
+        codes = codes.detach()
+        if codes.ndim == 3:
+            if codes.shape[0] != 1:
+                raise ValueError(
+                    f"generated codes have unexpected shape {tuple(codes.shape)}"
+                )
+            codes = codes[0]
+        if codes.ndim != 2:
+            raise ValueError(
+                f"generated codes must be [C, T], got {tuple(codes.shape)}"
+            )
+        if codes.dtype != torch.long:
+            codes = codes.to(dtype=torch.long)
 
-        if segment.size <= fade_samples:
-            combined = np.concatenate([pending_tail, segment])
-            if combined.size <= fade_samples:
-                return np.zeros(0, dtype=np.float32), combined.copy()
-            # If still smaller than fade_samples but combined > fade_samples, we proceed
-            segment = combined
-            pending_tail = None
+        decoder_device = self._get_decoder_device()
+        if codes.device != decoder_device:
+            codes = codes.to(device=decoder_device, non_blocking=True)
 
-        if pending_tail is None:
-            return segment[:-fade_samples].copy(), segment[-fade_samples:].copy()
+        with self._decoder_lock:
+            if validate_debug:
+                codes = validate_codes_for_decoder_device(
+                    codes,
+                    self.decoder_model,
+                    name="generated streaming codes",
+                )
 
-        crossfade_len = min(pending_tail.size, segment.size, fade_samples)
-        old_keep = pending_tail[:-crossfade_len]
-        old_tail = pending_tail[-crossfade_len:]
-        new_head = segment[:crossfade_len]
+            with torch.inference_mode():
+                if isinstance(self.decoder_model, DAC):
+                    segment = self.decoder_model.from_indices(codes[None])[0].squeeze()
+                else:
+                    segment = self.decode_vq_tokens(codes=codes)
 
-        fade_out = np.linspace(1.0, 0.0, crossfade_len, endpoint=False, dtype=np.float32)
-        fade_in = np.linspace(0.0, 1.0, crossfade_len, endpoint=False, dtype=np.float32)
-
-        blended = old_tail * fade_out + new_head * fade_in
-
-        body_end = max(crossfade_len, segment.size - fade_samples)
-        body = segment[crossfade_len:body_end]
-        new_tail = segment[-fade_samples:].copy()
-
-        output = np.concatenate([old_keep, blended, body]).astype(np.float32, copy=False)
-        output = np.clip(output, -1.0, 1.0)
-
-        return output, new_tail
+        return segment.float().detach().cpu().numpy().astype(np.float32, copy=False)
 
     def get_audio_segment(self, result: GenerateResponse) -> np.ndarray:
         """
         Decode the VQ tokens to audio.
         """
-        from fish_speech.codec.codes import estimate_code_frames
-
         if result.codes is None or estimate_code_frames(result.codes) == 0:
             return np.zeros(0, dtype=np.float32)
 

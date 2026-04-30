@@ -528,6 +528,22 @@ class BaseTransformer(nn.Module):
             # It seems missing in init, but we keep existing logic
             if hasattr(self, "audio_projector"):
                 audio_embeds = self.audio_projector(audio_parts)
+                if audio_masks is None:
+                    raise ValueError("audio_masks must be provided with audio_parts")
+                audio_masks = audio_masks.to(device=x.device, dtype=torch.bool)
+                if audio_masks.ndim != 2 or tuple(audio_masks.shape) != tuple(
+                    x.shape[:2]
+                ):
+                    raise ValueError(
+                        "audio_masks must have shape [B, T], "
+                        f"got {tuple(audio_masks.shape)} for x={tuple(x.shape)}"
+                    )
+                audio_embeds = audio_embeds.reshape(-1, x.shape[-1])
+                if int(audio_masks.sum().item()) != int(audio_embeds.shape[0]):
+                    raise ValueError(
+                        "audio_masks/audio_embeds mismatch: "
+                        f"mask={int(audio_masks.sum().item())} embeds={audio_embeds.shape[0]}"
+                    )
                 if self.config.scale_codebook_embeddings:
                     x[audio_masks] = audio_embeds / math.sqrt(2)
                 else:

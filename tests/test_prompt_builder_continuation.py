@@ -26,6 +26,24 @@ def test_external_continuation_full_policy_keeps_full_codes():
     assert selected[0][1].dtype == torch.long
 
 
+def test_external_continuation_full_policy_keeps_all_turns():
+    first = torch.zeros((9, 3), dtype=torch.long)
+    second = torch.ones((9, 4), dtype=torch.long)
+
+    selected = _prepare_external_continuation(
+        ["first", "second"],
+        [first, second],
+        expected_codebooks=9,
+        policy="full",
+        tail_frames=0,
+        max_history_segments=1,
+    )
+
+    assert [text for text, _ in selected] == ["first", "second"]
+    assert torch.equal(selected[0][1], first)
+    assert torch.equal(selected[1][1], second)
+
+
 def test_external_continuation_tail_policy_crops_codes_only_when_requested():
     codes = torch.arange(90).reshape(9, 10)
     selected = _prepare_external_continuation(

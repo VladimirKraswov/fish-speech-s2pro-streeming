@@ -62,9 +62,7 @@ def _select_continuation_history(
         return []
 
     if policy == "full":
-        if max_history_segments <= 0:
-            return history
-        return history[-max_history_segments:]
+        return history
 
     if policy == "last_segment":
         if max_history_segments <= 0:
@@ -199,10 +197,20 @@ def generate_committed_segments(
     stream_tokens: bool = False,
     stream_chunk_size: int = 8,
     initial_stream_chunk_size: int = 10,
+    low_latency_first_audio: bool = False,
     cancel_event: Any | None = None,
 ):
     runtime = load_runtime_config()
     model_cfg = runtime.model
+    profile = bool(model_cfg.profile_inference)
+
+    if low_latency_first_audio:
+        if initial_stream_chunk_size == 10:
+            initial_stream_chunk_size = 3
+        if stream_chunk_size == 8:
+            stream_chunk_size = 4
+        if max_new_tokens <= 0:
+            max_new_tokens = 96
 
     raw_segments = [segment for segment in (segments or []) if segment.strip()]
     if not raw_segments and text and text.strip():
@@ -237,15 +245,16 @@ def generate_committed_segments(
         max_chars = 0
         split_source = "disabled_globally"
 
-    logger.info(
-        "long_form_split: source={} input_segments={} output_segments={} target_chars={} max_chars={} text_chars={}",
-        split_source,
-        len(raw_segments),
-        len(committed_segments),
-        target_chars,
-        max_chars,
-        sum(len(s) for s in raw_segments),
-    )
+    if profile:
+        logger.info(
+            "long_form_split: source={} input_segments={} output_segments={} target_chars={} max_chars={} text_chars={}",
+            split_source,
+            len(raw_segments),
+            len(committed_segments),
+            target_chars,
+            max_chars,
+            sum(len(s) for s in raw_segments),
+        )
 
     assert 0 < top_p <= 1, "top_p must be in (0, 1]"
     assert 0 < temperature < 2, "temperature must be in (0, 2)"
@@ -289,20 +298,21 @@ def generate_committed_segments(
     continuation_token_list = [tokens for _, tokens in selected_external_continuation]
     use_continuation = bool(selected_external_continuation)
 
-    logger.info(
-        "generation_prompt_inputs: "
-        "reference_text_count={} reference_token_count={} reference_token_frames={} "
-        "continuation_source={} continuation_text_count={} continuation_token_count={} continuation_token_frames={} "
-        "original_continuation_frames={}",
-        len(reference_texts),
-        len(reference_tokens),
-        _count_code_frames(reference_tokens),
-        external_policy,
-        len(continuation_texts),
-        len(continuation_token_list),
-        _count_code_frames(continuation_token_list),
-        _count_code_frames(_as_list(continuation_tokens)),
-    )
+    if profile:
+        logger.info(
+            "generation_prompt_inputs: "
+            "reference_text_count={} reference_token_count={} reference_token_frames={} "
+            "continuation_source={} continuation_text_count={} continuation_token_count={} continuation_token_frames={} "
+            "original_continuation_frames={}",
+            len(reference_texts),
+            len(reference_tokens),
+            _count_code_frames(reference_tokens),
+            external_policy,
+            len(continuation_texts),
+            len(continuation_token_list),
+            _count_code_frames(continuation_token_list),
+            _count_code_frames(_as_list(continuation_tokens)),
+        )
 
     model_size = sum(p.numel() for p in model.parameters() if p.requires_grad)
     tokenizer = model.tokenizer
@@ -351,7 +361,8 @@ def generate_committed_segments(
             selected_external_continuation,
         )
 
-    logger.info("Generating {} committed segment(s)", len(committed_segments))
+    if profile:
+        logger.info("Generating {} committed segment(s)", len(committed_segments))
 
     requested_max_new_tokens = int(max_new_tokens or 0)
 
@@ -366,29 +377,36 @@ def generate_committed_segments(
             if cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError("Streaming request cancelled")
 
-            logger.info(
-                "--- Sample {}, Segment {} ({} bytes) ---",
-                sample_idx,
-                batch_idx,
-                len(batch_text.encode("utf-8")),
-            )
-            logger.info("Segment text: {}", batch_text)
+            if profile:
+                logger.info(
+                    "--- Sample {}, Segment {} ({} bytes) ---",
+                    sample_idx,
+                    batch_idx,
+                    len(batch_text.encode("utf-8")),
+                )
+                logger.info("Segment text: {}", batch_text)
 
-            selected_history = _select_generated_history(
-                generated_history,
-                policy=model_cfg.long_form_context_policy,
-                tail_frames=model_cfg.long_form_tail_frames,
-                max_history_segments=model_cfg.long_form_max_history_segments,
-            )
+            if iterative_prompt:
+                selected_history = _select_generated_history(
+                    generated_history,
+                    policy=model_cfg.long_form_context_policy,
+                    tail_frames=model_cfg.long_form_tail_frames,
+                    max_history_segments=model_cfg.long_form_max_history_segments,
+                )
+                context_policy = model_cfg.long_form_context_policy
+            else:
+                selected_history = []
+                context_policy = "disabled_by_request"
 
-            logger.info(
-                "long_form_context: segment_idx={} policy={} history_segments={} history_frames={} tail_frames={}",
-                batch_idx,
-                model_cfg.long_form_context_policy,
-                len(selected_history),
-                _count_code_frames([codes for _, codes in selected_history]),
-                model_cfg.long_form_tail_frames,
-            )
+            if profile:
+                logger.info(
+                    "long_form_context: segment_idx={} policy={} history_segments={} history_frames={} tail_frames={}",
+                    batch_idx,
+                    context_policy,
+                    len(selected_history),
+                    _count_code_frames([codes for _, codes in selected_history]),
+                    model_cfg.long_form_tail_frames,
+                )
 
             conversation = deepcopy(base_conversation)
             for hist_text, hist_codes in selected_history:
@@ -446,31 +464,33 @@ def generate_committed_segments(
                 tokenizer, num_codebooks=model.config.num_codebooks
             )
 
-            logger.info("Encoded prompt shape: {}", encoded.shape)
-            if audio_parts is not None:
-                logger.info("Audio parts shape: {}", audio_parts.shape)
-            if audio_masks is not None:
-                logger.info(
-                    "Audio masks non-zero count: {}",
-                    torch.count_nonzero(audio_masks),
-                )
+            if profile:
+                logger.info("Encoded prompt shape: {}", encoded.shape)
+                if audio_parts is not None:
+                    logger.info("Audio parts shape: {}", audio_parts.shape)
+                if audio_masks is not None:
+                    logger.info(
+                        "Audio masks non-zero count: {}",
+                        torch.count_nonzero(audio_masks),
+                    )
 
             prompt_len = encoded.size(1)
             available_new_tokens = max(0, max_length - prompt_len)
 
-            logger.info(
-                "prompt_budget: prompt_len={} cache={} requested_max_new_tokens={} "
-                "available_new_tokens={} runtime_cap={} ref_turns={} continuation_turns={} "
-                "continuation_frames={}",
-                prompt_len,
-                max_length,
-                requested_max_new_tokens,
-                available_new_tokens,
-                runtime.model.max_new_tokens_cap,
-                len(reference_texts),
-                len(continuation_texts),
-                _count_code_frames(continuation_token_list),
-            )
+            if profile:
+                logger.info(
+                    "prompt_budget: prompt_len={} cache={} requested_max_new_tokens={} "
+                    "available_new_tokens={} runtime_cap={} ref_turns={} continuation_turns={} "
+                    "continuation_frames={}",
+                    prompt_len,
+                    max_length,
+                    requested_max_new_tokens,
+                    available_new_tokens,
+                    runtime.model.max_new_tokens_cap,
+                    len(reference_texts),
+                    len(continuation_texts),
+                    _count_code_frames(continuation_token_list),
+                )
 
             if prompt_len > max_length:
                 raise ValueError(
@@ -514,35 +534,36 @@ def generate_committed_segments(
                     effective_max_new_tokens = text_based_cap
                     clip_reasons.append("text_cap")
 
-            logger.info(
-                "segment_budget: segment_idx={} text_len={} requested={} available={} runtime_cap={} text_cap={} effective={}",
-                batch_idx,
-                len(batch_text),
-                requested_max_new_tokens,
-                available_new_tokens,
-                cap,
-                text_based_cap,
-                effective_max_new_tokens,
-            )
+            if profile:
+                logger.info(
+                    "segment_budget: segment_idx={} text_len={} requested={} available={} runtime_cap={} text_cap={} effective={}",
+                    batch_idx,
+                    len(batch_text),
+                    requested_max_new_tokens,
+                    available_new_tokens,
+                    cap,
+                    text_based_cap,
+                    effective_max_new_tokens,
+                )
 
-            logger.info(
-                "effective_generation_budget: prompt_len={} cache={} "
-                "requested_max_new_tokens={} effective_max_new_tokens={} "
-                "available_new_tokens={} runtime_cap={} text_cap={} clip_reasons={} "
-                "ref_turns={} continuation_turns={} continuation_frames={} text_len={}",
-                prompt_len,
-                max_length,
-                requested_max_new_tokens,
-                effective_max_new_tokens,
-                available_new_tokens,
-                cap,
-                text_based_cap,
-                clip_reasons,
-                len(reference_texts),
-                len(continuation_texts),
-                _count_code_frames(continuation_token_list),
-                len(batch_text),
-            )
+                logger.info(
+                    "effective_generation_budget: prompt_len={} cache={} "
+                    "requested_max_new_tokens={} effective_max_new_tokens={} "
+                    "available_new_tokens={} runtime_cap={} text_cap={} clip_reasons={} "
+                    "ref_turns={} continuation_turns={} continuation_frames={} text_len={}",
+                    prompt_len,
+                    max_length,
+                    requested_max_new_tokens,
+                    effective_max_new_tokens,
+                    available_new_tokens,
+                    cap,
+                    text_based_cap,
+                    clip_reasons,
+                    len(reference_texts),
+                    len(continuation_texts),
+                    _count_code_frames(continuation_token_list),
+                    len(batch_text),
+                )
 
             if clip_reasons:
                 logger.warning(
@@ -574,15 +595,16 @@ def generate_committed_segments(
                 if cancel_event is not None and cancel_event.is_set():
                     raise RuntimeError("Streaming request cancelled")
 
-                logger.info(
-                    "stream: generate_committed_segments starting token stream "
-                    "segment_idx={} initial_stream_chunk_size={} stream_chunk_size={} "
-                    "effective_max_new_tokens={}",
-                    batch_idx,
-                    initial_stream_chunk_size,
-                    stream_chunk_size,
-                    effective_max_new_tokens,
-                )
+                if profile:
+                    logger.info(
+                        "stream: generate_committed_segments starting token stream "
+                        "segment_idx={} initial_stream_chunk_size={} stream_chunk_size={} "
+                        "effective_max_new_tokens={}",
+                        batch_idx,
+                        initial_stream_chunk_size,
+                        stream_chunk_size,
+                        effective_max_new_tokens,
+                    )
 
                 gen = generate(
                     model=model,
@@ -597,6 +619,7 @@ def generate_committed_segments(
                     repetition_penalty=repetition_penalty,
                     stream_chunk_size=stream_chunk_size,
                     initial_stream_chunk_size=initial_stream_chunk_size,
+                    low_latency_first_audio=low_latency_first_audio,
                     compile=compile,
                 )
 
@@ -620,7 +643,7 @@ def generate_committed_segments(
                         code_frames = int(codes_chunk.shape[-1])
                         total_code_frames += code_frames
 
-                        if chunk_idx < 3:
+                        if profile and chunk_idx < 3:
                             logger.info(
                                 "stream: generate_committed_segments chunk_idx={} "
                                 "chunk.shape={} codes_chunk.shape={} total_code_frames={}",
@@ -639,14 +662,15 @@ def generate_committed_segments(
 
                     chunk_idx += 1
 
-                logger.info(
-                    "stream: generate_committed_segments finished chunk_idx={} "
-                    "total_chunks={} total_code_frames={} effective_max_new_tokens={}",
-                    chunk_idx,
-                    len(codes_list),
-                    total_code_frames,
-                    effective_max_new_tokens,
-                )
+                if profile:
+                    logger.info(
+                        "stream: generate_committed_segments finished chunk_idx={} "
+                        "total_chunks={} total_code_frames={} effective_max_new_tokens={}",
+                        chunk_idx,
+                        len(codes_list),
+                        total_code_frames,
+                        effective_max_new_tokens,
+                    )
 
                 truncation_margin = max(2, int(stream_chunk_size))
                 if total_code_frames >= max(1, effective_max_new_tokens - truncation_margin):
@@ -665,7 +689,7 @@ def generate_committed_segments(
 
                 codes = torch.cat(codes_list, dim=1).clone() if codes_list else None
 
-                if codes is not None:
+                if iterative_prompt and codes is not None:
                     generated_history.append((batch_text, codes.cpu()))
 
                 codes_list.clear()
@@ -697,6 +721,7 @@ def generate_committed_segments(
                     top_p=top_p,
                     top_k=top_k,
                     repetition_penalty=repetition_penalty,
+                    low_latency_first_audio=low_latency_first_audio,
                     compile=compile,
                 )
 
@@ -754,7 +779,8 @@ def generate_committed_segments(
                         batch_text[:240],
                     )
 
-                generated_history.append((batch_text, codes.cpu()))
+                if iterative_prompt:
+                    generated_history.append((batch_text, codes.cpu()))
 
                 yield GenerateResponse(action="sample", codes=codes, text=batch_text)
                 del y, encoded

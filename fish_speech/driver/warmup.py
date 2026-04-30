@@ -17,6 +17,7 @@ def run_driver_warmup(driver) -> None:
         text=warmup.text,
         segments=[warmup.text],
         reference_id=warmup.reference_id,
+        use_memory_cache="on",
         stream_audio=warmup.streaming,
         generation=DriverGenerationOptions(
             chunk_length=warmup.chunk_length,
@@ -24,6 +25,7 @@ def run_driver_warmup(driver) -> None:
             stream_tokens=warmup.stream_tokens,
             initial_stream_chunk_size=warmup.initial_stream_chunk_size,
             stream_chunk_size=warmup.stream_chunk_size,
+            low_latency_first_audio=warmup.low_latency_first_audio,
         ),
     )
     for event in driver.synthesize(request):

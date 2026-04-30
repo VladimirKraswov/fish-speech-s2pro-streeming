@@ -30,7 +30,43 @@ Message(role="assistant", parts=[VQPart(codes=old_codes)], modality="voice")
 That makes the model continue naturally from the intro while the server sends
 only the suffix text to TTS.
 
-## Artifacts
+## Prefix Cache Artifacts
+
+For new prefix-cache lookup flows, use `build_prefix_cache`. It writes a flat
+manifest plus inspectable per-artifact directories:
+
+- `pcm/<cache_id>.pcm`: raw PCM16LE without a WAV header;
+- `wav/<cache_id>.wav`: inspectable audio file;
+- `codes/<cache_id>.pt`: normalized CPU `torch.long` DAC/VQ codes with shape
+  `[num_codebooks, T]`;
+- `meta/<cache_id>.json`: text, generation settings, sample rate, duration, and
+  code frame metadata.
+
+Manifest entries are keyed for server/proxy prefix lookup:
+
+```json
+{
+  "cache_id": "voice_ru_chto_takoe_v1",
+  "voice_id": "voice",
+  "text": "Что такое",
+  "normalized_text": "что такое",
+  "word_count": 2,
+  "pcm_path": "pcm/voice_ru_chto_takoe_v1.pcm",
+  "codes_path": "codes/voice_ru_chto_takoe_v1.pt",
+  "code_frames": 120,
+  "audio_meta": {
+    "sample_rate": 44100,
+    "channels": 1,
+    "sample_width": 2
+  },
+  "params_hash": "..."
+}
+```
+
+Prefix phrases are limited to five words. Longer items are rejected before any
+model work starts.
+
+## Legacy Cached Intro Artifacts
 
 Each cached intro directory contains:
 
@@ -43,7 +79,48 @@ Each cached intro directory contains:
 
 The browser needs PCM/WAV. The model needs the DAC/VQ codes.
 
-## Building Artifacts
+## Building Prefix Cache Artifacts
+
+Input may be either a list:
+
+```json
+[
+  {
+    "cache_id": "voice_ru_chto_takoe_v1",
+    "voice_id": "voice",
+    "text": "Что такое"
+  }
+]
+```
+
+or an object with `items`:
+
+```json
+{
+  "items": [
+    {
+      "cache_id": "voice_ru_chto_takoe_v1",
+      "voice_id": "voice",
+      "text": "Что такое"
+    }
+  ]
+}
+```
+
+Run:
+
+```bash
+python -m fish_speech.tools.build_prefix_cache \
+  --input prefixes.json \
+  --output-dir ./prefix_cache \
+  --voice-id voice \
+  --skip-existing
+```
+
+Checkpoint paths, device, precision, and compile mode default to
+`config/runtime.json` unless explicitly passed.
+
+## Building Legacy Cached Intro Artifacts
 
 Input may be either a list:
 
@@ -93,15 +170,15 @@ Cached intro:
 The server/proxy:
 
 1. matches the cached prefix;
-2. immediately sends `cached_intros/what_is/audio.pcm` to the client;
-3. loads `cached_intros/what_is/codes.pt`;
+2. immediately sends `prefix_cache/pcm/voice_ru_chto_takoe_v1.pcm` to the client;
+3. loads `prefix_cache/codes/voice_ru_chto_takoe_v1.pt`;
 4. sends only the suffix to Fish Speech:
 
 ```python
 from fish_speech.codec import load_codes_pt
 from fish_speech.driver import DriverSynthesisRequest
 
-intro_codes = load_codes_pt("cached_intros/what_is/codes.pt")
+intro_codes = load_codes_pt("prefix_cache/codes/voice_ru_chto_takoe_v1.pt")
 
 request = DriverSynthesisRequest(
     text="квантизация модели и зачем она нужна?",

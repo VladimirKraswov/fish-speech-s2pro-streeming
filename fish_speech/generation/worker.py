@@ -204,8 +204,9 @@ def launch_thread_safe_queue(
             t_req_start = time.perf_counter()
             t_last_put = t_req_start
             stream_tokens = kwargs.get("stream_tokens", False)
+            stream_audio = kwargs.get("stream_audio", False)
             put_count = 0
-            if stream_tokens:
+            if stream_tokens and profile_cadence:
                 logger.info(
                     "stream: worker got request req={} initial_stream_chunk_size={} stream_chunk_size={}",
                     req_tag,
@@ -234,7 +235,7 @@ def launch_thread_safe_queue(
                         raise _StreamingRequestCancelled(
                             "Streaming request cancelled"
                         )
-                    if stream_tokens and put_count < 5:
+                    if stream_tokens and profile_cadence and put_count < 5:
                         logger.info(
                             "stream: worker putting chunk put_count={} action={} req={}",
                             put_count,
@@ -264,7 +265,7 @@ def launch_thread_safe_queue(
                         )
                     out = chunk
                     codes = getattr(chunk, "codes", None)
-                    if codes is not None and codes.is_cuda:
+                    if codes is not None and codes.is_cuda and not stream_audio:
                         out = GenerateResponse(
                             action=chunk.action,
                             codes=codes.cpu(),

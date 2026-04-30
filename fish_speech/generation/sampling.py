@@ -11,7 +11,7 @@ RAS_HIGH_TOP_P = 0.9
 def multinomial_sample_one_no_sync(probs_sort):
     q = torch.rand_like(probs_sort)
     q = -torch.log(q)
-    return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.int)
+    return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.long)
 
 
 def logits_to_probs(
@@ -20,11 +20,29 @@ def logits_to_probs(
     top_p: torch.Tensor,
     top_k: int,
 ) -> torch.Tensor:
+    vocab_size = logits.shape[-1]
+    if 0 < top_k < vocab_size:
+        k = min(int(top_k), vocab_size)
+        top_vals, top_idx = torch.topk(logits, k=k, dim=-1)
+        top_vals, order = torch.sort(top_vals, descending=True, dim=-1)
+        top_idx = top_idx.gather(dim=-1, index=order)
+
+        top_vals = top_vals / torch.clip(temperature, min=1e-5)
+        top_probs = torch.nn.functional.softmax(top_vals, dim=-1)
+        cum_probs = torch.cumsum(top_probs, dim=-1)
+        remove = cum_probs > top_p
+        remove[..., 0] = False
+        top_vals = torch.where(remove, float("-Inf"), top_vals)
+        top_probs = torch.nn.functional.softmax(top_vals, dim=-1)
+
+        probs = torch.zeros_like(logits)
+        return probs.scatter(dim=-1, index=top_idx, src=top_probs)
+
     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
     cum_probs = torch.cumsum(torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1)
 
     indices = torch.arange(sorted_logits.shape[-1], device=sorted_logits.device)
-    top_k_mask = indices >= top_k
+    top_k_mask = indices >= top_k if top_k > 0 else torch.zeros_like(indices, dtype=torch.bool)
     sorted_indices_to_remove = (cum_probs > top_p) | top_k_mask
     sorted_indices_to_remove[0] = False
 

@@ -5,7 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_RUNTIME_CONFIG_PATH = ROOT_DIR / "config" / "runtime.json"
@@ -62,7 +62,7 @@ class ModelConfig(BaseModel):
         "last_segment",
     ] = "full"
     external_continuation_tail_frames: int = Field(0, ge=0)
-    external_continuation_max_segments: int = Field(1, ge=0)
+    external_continuation_max_segments: int = Field(0, ge=0)
 
     @field_validator("long_form_context_policy")
     @classmethod
@@ -109,16 +109,11 @@ class WarmupConfig(BaseModel):
     text: str = "Привет. Это дополнительный прогрев стримингового режима для Fish Speech."
     streaming: bool = True
     stream_tokens: bool = True
+    low_latency_first_audio: bool = True
     max_new_tokens: int = Field(96, ge=1)
-    chunk_length: int = Field(180, ge=100, le=300)
-    initial_stream_chunk_size: int = Field(8, ge=1, le=200)
-    stream_chunk_size: int = Field(8, ge=1, le=200)
-
-    @model_validator(mode="after")
-    def validate_chunk_sizes(self) -> "WarmupConfig":
-        if self.initial_stream_chunk_size < self.stream_chunk_size:
-            raise ValueError("initial_stream_chunk_size must be >= stream_chunk_size")
-        return self
+    chunk_length: int = Field(80, ge=0, le=300)
+    initial_stream_chunk_size: int = Field(3, ge=1, le=200)
+    stream_chunk_size: int = Field(4, ge=1, le=200)
 
 
 class DriverConfig(BaseModel):

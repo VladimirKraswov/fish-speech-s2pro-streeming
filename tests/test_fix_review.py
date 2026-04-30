@@ -33,6 +33,14 @@ def test_apply_repetition_penalty_out_of_range():
     assert (out[:5] == 1.0).all()
     assert (out[6:] == 1.0).all()
 
+def test_multinomial_sample_returns_long_indices():
+    from fish_speech.generation.sampling import multinomial_sample_one_no_sync
+
+    idx = multinomial_sample_one_no_sync(torch.ones((2, 4)))
+
+    assert idx.dtype == torch.long
+    assert idx.shape == (2, 1)
+
 def test_dac_forward_logic():
     # Mock DAC and its methods
     model = DAC()

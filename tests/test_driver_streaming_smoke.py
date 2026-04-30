@@ -86,6 +86,55 @@ def test_audio_token_stream(fake_driver):
     assert any(isinstance(e, DriverTokenChunkEvent) for e in events)
     assert any(isinstance(e, DriverAudioChunkEvent) for e in events)
 
+def test_driver_stats_counts_submitted_segments_and_audio_events(fake_driver):
+    list(
+        fake_driver.synthesize(
+            DriverSynthesisRequest(
+                text="hello",
+                stream_audio=False,
+                generation=DriverGenerationOptions(stream_tokens=False),
+            )
+        )
+    )
+    list(
+        fake_driver.synthesize(
+            DriverSynthesisRequest(
+                text="stream me",
+                stream_audio=True,
+                generation=DriverGenerationOptions(stream_tokens=False),
+            )
+        )
+    )
+
+    stats = fake_driver.stats()
+    assert stats.sessions_opened == 2
+    assert stats.generated_segments == 2
+    assert stats.audio_events == 2
+
+
+def test_rename_reference_validates_paths_and_clears_cache(tmp_path):
+    engine = FakeEngine()
+    engine.references_dir = tmp_path
+    engine.ref_by_id = {"old": "cached-old", "new": "cached-new"}
+    (tmp_path / "old").mkdir()
+
+    driver = FishSpeechDriver(engine=engine)
+    driver.rename_reference("old", "new")
+
+    assert not (tmp_path / "old").exists()
+    assert (tmp_path / "new").is_dir()
+    assert "old" not in engine.ref_by_id
+    assert "new" not in engine.ref_by_id
+
+    with pytest.raises(ValueError, match="invalid characters"):
+        driver.rename_reference("new", "bad/name")
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        driver.rename_reference("missing", "another")
+
+    (tmp_path / "existing").mkdir()
+    with pytest.raises(FileExistsError, match="already exists"):
+        driver.rename_reference("new", "existing")
+
 def test_warmup_error_handling():
     fake_driver = MagicMock()
     fake_driver.config.warmup.enabled = True

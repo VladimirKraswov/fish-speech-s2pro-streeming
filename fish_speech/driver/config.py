@@ -44,6 +44,11 @@ class ModelConfig(BaseModel):
     debug_prompt_visualize: bool = False
     validate_generated_codes: bool = False
 
+    # Smooth first live continuation chunk when prefix-cache continuation is used.
+    # This does not replace proxy-side crossfade, but removes sharp click/edge
+    # at the beginning of generated live audio.
+    prefix_continuation_fade_in_ms: int = Field(35, ge=0, le=300)
+
     # Long-form settings
     long_form_auto_split: bool = True
     long_form_target_chars: int = Field(160, ge=40)

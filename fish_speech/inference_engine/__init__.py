@@ -41,6 +41,41 @@ def _validate_text_turns(values: list[Any], *, name: str) -> list[str]:
     return out
 
 
+def _apply_float32_fade_in(
+    audio: np.ndarray,
+    *,
+    sample_rate: int,
+    fade_ms: int,
+) -> np.ndarray:
+    """
+    Apply a short equal-power-ish fade-in to the first generated live chunk.
+
+    Used when prefix cache was already played and Fish Speech is continuing from
+    continuation_tokens. This reduces a sharp boundary/click at the start of the
+    generated suffix.
+
+    True cache->live crossfade is still better to do in the PCM proxy because
+    only the proxy has both cached PCM tail and live PCM head at the same time.
+    """
+    if fade_ms <= 0 or sample_rate <= 0:
+        return audio
+
+    if audio is None or audio.size <= 1:
+        return audio
+
+    fade_samples = int(sample_rate * fade_ms / 1000.0)
+    fade_samples = max(1, min(fade_samples, int(audio.size)))
+
+    out = audio.astype(np.float32, copy=True)
+
+    # Smooth curve: starts softer than linear and reaches 1.0 at the end.
+    x = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
+    curve = np.sin(x * np.pi * 0.5).astype(np.float32)
+
+    out[:fade_samples] *= curve
+    return out
+
+
 class TTSInferenceEngine(ReferenceLoader, VQManager):
     def __init__(
         self,
@@ -244,6 +279,13 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                     sum(len(t) for t in history_texts),
                     sum(int(t.shape[-1]) for t in history_tokens if hasattr(t, "shape")),
                 )
+
+            continuation_fade_in_ms = int(
+                getattr(self.runtime.model, "prefix_continuation_fade_in_ms", 0) or 0
+            )
+            should_fade_first_live_chunk = bool(
+                req.stream_audio and history_tokens and continuation_fade_in_ms > 0
+            )
 
             if req.seed is not None:
                 set_seed(req.seed)
@@ -463,6 +505,23 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                                 )
                             raise
 
+                        if (
+                            should_fade_first_live_chunk
+                            and seg_idx == 0
+                            and segment is not None
+                            and segment.size > 0
+                        ):
+                            segment = _apply_float32_fade_in(
+                                segment,
+                                sample_rate=int(sample_rate),
+                                fade_ms=continuation_fade_in_ms,
+                            )
+                            _mark(
+                                "prefix_continuation_fade_in_applied",
+                                fade_ms=continuation_fade_in_ms,
+                                samples=len(segment),
+                            )
+
                         if segment is not None:
                             seg_idx += 1
                             _mark(
@@ -660,21 +719,15 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             validate_debug=self.runtime.model.validate_generated_codes,
         )
 
-        # DAC uses a specific hop length / frame length for its VQ codebooks.
-        # We must align the cropping precisely to this boundary.
         frame_samples = int(getattr(self.decoder_model, "frame_length", 512))
         context_samples = context_frames * frame_samples
 
         if decoded.size > context_samples:
             decoded_new = decoded[context_samples:]
         else:
-            # If the decoded segment is smaller than context_samples, it means
-            # the decoder didn't produce enough samples or the frame_length is wrong.
-            # We return empty segment to avoid glitches.
             decoded_new = np.zeros(0, dtype=np.float32)
 
         if max_context_frames > 0:
-            # Take the end of current decoded codes as the context for the next segment.
             next_context = decode_codes[:, -max_context_frames:].detach().contiguous()
         else:
             next_context = None
@@ -748,7 +801,6 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             return np.zeros(0, dtype=np.float32)
 
         with self._decoder_lock:
-            # Standardize and validate codes
             codes = validate_codes_for_decoder(
                 result.codes, self.decoder_model, name="generated codes"
             )

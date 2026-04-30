@@ -1,5 +1,7 @@
+import hashlib
 import io
 from contextlib import nullcontext
+from typing import Any
 
 import librosa
 import torch
@@ -30,8 +32,43 @@ def _sample_rate(model) -> int:
     return int(model.sample_rate)
 
 
+def _stable_model_id(model: Any) -> str:
+    """
+    Best-effort cache namespace for a decoder model.
+
+    Avoid using only the device in the VQGAN encode cache key: two decoder
+    instances/checkpoints on the same device must not share cached encodings.
+    """
+    for attr in (
+        "checkpoint_path",
+        "model_path",
+        "config_name",
+        "name_or_path",
+        "_get_name",
+    ):
+        value = getattr(model, attr, None)
+        if callable(value):
+            try:
+                value = value()
+            except Exception:
+                value = None
+        if value:
+            return f"{attr}:{value}"
+
+    return f"object:{type(model).__module__}.{type(model).__qualname__}:{id(model)}"
+
+
+def _audio_hash(audio: bytes) -> str:
+    return hashlib.sha256(audio).hexdigest()
+
+
 def _cache_key(model, audios: list[bytes]):
-    return (str(_model_device(model)), tuple(audios))
+    return (
+        _stable_model_id(model),
+        str(_model_device(model)),
+        _sample_rate(model),
+        tuple(_audio_hash(bytes(audio)) for audio in audios),
+    )
 
 
 @torch.inference_mode()

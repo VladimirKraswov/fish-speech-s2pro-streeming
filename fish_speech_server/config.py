@@ -341,6 +341,33 @@ def _normalize_allowed_path(path: str) -> str:
     return path
 
 
+def _unwrap_frontend_proxy_override(override_patch: dict[str, Any]) -> dict[str, Any]:
+    """
+    Accept both proxy-shaped and proxy-nested overrides.
+
+    Valid examples:
+      {"tts": {"temperature": 0.7}}
+      {"proxy": {"tts": {"temperature": 0.7}}}
+
+    The allowed-path checker already normalizes the optional "proxy." prefix, but
+    the merge target is runtime.proxy. Therefore a top-level "proxy" wrapper must
+    be removed before deep_merge()/ProxyConfig validation.
+    """
+    if "proxy" not in override_patch:
+        return override_patch
+
+    if len(override_patch) != 1:
+        raise ValueError(
+            "frontend override cannot mix top-level 'proxy' with direct proxy fields"
+        )
+
+    proxy_patch = override_patch["proxy"]
+    if not isinstance(proxy_patch, dict):
+        raise ValueError("proxy override must be a JSON object")
+
+    return proxy_patch
+
+
 def merge_frontend_proxy_override(
     override_patch: dict[str, Any],
     runtime: ServerRuntimeConfig | None = None,
@@ -370,6 +397,7 @@ def merge_frontend_proxy_override(
                 "frontend override contains disallowed paths: " + ", ".join(disallowed)
             )
 
+    override_patch = _unwrap_frontend_proxy_override(override_patch)
     merged = deep_merge(runtime.proxy.model_dump(mode="python"), override_patch)
     return ProxyConfig.model_validate(merged)
 

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
+import struct
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
@@ -16,8 +18,14 @@ FISH_API_KEY = os.environ.get("FISH_API_KEY", "").strip()
 CONNECT_TIMEOUT = float(os.environ.get("PROXY_CONNECT_TIMEOUT", "10"))
 WRITE_TIMEOUT = float(os.environ.get("PROXY_WRITE_TIMEOUT", "30"))
 # read=None because upstream is a stream
-REQUEST_TIMEOUT = httpx.Timeout(connect=CONNECT_TIMEOUT, read=None, write=WRITE_TIMEOUT, pool=None)
+REQUEST_TIMEOUT = httpx.Timeout(
+    connect=CONNECT_TIMEOUT,
+    read=None,
+    write=WRITE_TIMEOUT,
+    pool=None,
+)
 DEFAULT_REFERENCE_ID = os.environ.get("DEFAULT_REFERENCE_ID", "voice")
+SEGMENT_PCM_BYTES = int(os.environ.get("STREAM_SEGMENT_PCM_BYTES", "32768"))
 
 
 @asynccontextmanager
@@ -44,6 +52,141 @@ def _auth_headers() -> dict[str, str]:
     if FISH_API_KEY:
         headers["Authorization"] = f"Bearer {FISH_API_KEY}"
     return headers
+
+
+def _wav_header(
+    *,
+    sample_rate: int,
+    channels: int,
+    bits_per_sample: int,
+    data_size: int,
+) -> bytes:
+    if bits_per_sample != 16:
+        raise ValueError("Only 16-bit PCM WAV is supported")
+    if channels <= 0:
+        raise ValueError("channels must be positive")
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be positive")
+    if data_size < 0:
+        raise ValueError("data_size must be non-negative")
+
+    block_align = channels * (bits_per_sample // 8)
+    byte_rate = sample_rate * block_align
+    riff_size = 36 + data_size
+
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        riff_size,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,
+        channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        bits_per_sample,
+        b"data",
+        data_size,
+    )
+
+
+def _parse_wav_header(buf: bytes) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Parse enough of a WAV header to find the PCM data offset.
+
+    Returns (sample_rate, channels, bits_per_sample, data_offset), or None if
+    more bytes are needed. This deliberately ignores the data chunk's declared
+    size because the upstream streaming header may use 0xFFFFFFFF.
+    """
+    if len(buf) < 12:
+        return None
+
+    if buf[0:4] != b"RIFF" or buf[8:12] != b"WAVE":
+        raise ValueError("upstream did not return a RIFF/WAVE stream")
+
+    pos = 12
+    channels = None
+    sample_rate = None
+    bits_per_sample = None
+
+    while True:
+        if len(buf) < pos + 8:
+            return None
+
+        chunk_id = buf[pos : pos + 4]
+        chunk_size = struct.unpack_from("<I", buf, pos + 4)[0]
+        chunk_data_start = pos + 8
+
+        if chunk_id == b"fmt ":
+            needed = chunk_data_start + chunk_size + (chunk_size % 2)
+            if len(buf) < needed:
+                return None
+
+            if chunk_size < 16:
+                raise ValueError("invalid WAV fmt chunk")
+
+            audio_format, channels, sample_rate = struct.unpack_from(
+                "<HHI",
+                buf,
+                chunk_data_start,
+            )
+            bits_per_sample = struct.unpack_from(
+                "<H",
+                buf,
+                chunk_data_start + 14,
+            )[0]
+
+            if audio_format != 1:
+                raise ValueError(f"only PCM WAV is supported, got format={audio_format}")
+
+            pos = needed
+            continue
+
+        if chunk_id == b"data":
+            if channels is None or sample_rate is None or bits_per_sample is None:
+                raise ValueError("WAV data chunk arrived before fmt chunk")
+
+            return sample_rate, channels, bits_per_sample, chunk_data_start
+
+        needed = chunk_data_start + chunk_size + (chunk_size % 2)
+        if len(buf) < needed:
+            return None
+
+        pos = needed
+
+
+def _align_down(value: int, frame_bytes: int) -> int:
+    if frame_bytes <= 0:
+        return value
+    return value - (value % frame_bytes)
+
+
+def _wav_ndjson_line(
+    pcm: bytes,
+    *,
+    sample_rate: int,
+    channels: int,
+    bits_per_sample: int,
+) -> bytes:
+    wav_bytes = _wav_header(
+        sample_rate=sample_rate,
+        channels=channels,
+        bits_per_sample=bits_per_sample,
+        data_size=len(pcm),
+    ) + pcm
+
+    return (
+        json.dumps(
+            {
+                "type": "wav",
+                "b64": base64.b64encode(wav_bytes).decode("ascii"),
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
 
 
 @app.get("/")
@@ -131,13 +274,14 @@ async def stream_segments(
     reference_id: str | None = Query(None),
 ) -> StreamingResponse:
     """
-    Convert the upstream chunked WAV response into NDJSON where each line contains
-    one complete WAV segment as base64.
-    This avoids the browser waiting on a long chunked WAV and lets JS play each
-    segment immediately via AudioContext.decodeAudioData.
-    """
-    import base64
+    Convert the upstream streaming WAV response into NDJSON where each line
+    contains one finite WAV segment as base64.
 
+    The upstream /v1/tts streaming path sends one WAV header followed by raw PCM.
+    Its RIFF/data sizes may be intentionally set to 0xFFFFFFFF, so this endpoint
+    must not wait for complete upstream RIFF files. Instead it parses the first
+    header once, chunks raw PCM, and wraps each PCM chunk in a fresh finite WAV.
+    """
     effective_reference_id = (reference_id or DEFAULT_REFERENCE_ID).strip()
     payload: dict[str, object] = {
         "text": text,
@@ -161,84 +305,128 @@ async def stream_segments(
         raise HTTPException(status_code=upstream.status_code, detail=detail)
 
     async def iter_ndjson() -> AsyncIterator[bytes]:
-        buffer = bytearray()
+        header_buffer = bytearray()
+        pending_pcm = bytearray()
+        header_parsed = False
+        sample_rate = 0
+        channels = 0
+        bits_per_sample = 0
+        frame_bytes = 2
+        target_pcm_bytes = max(512, SEGMENT_PCM_BYTES)
+
+        async def flush_segments(force: bool = False) -> AsyncIterator[bytes]:
+            nonlocal pending_pcm
+
+            if not header_parsed:
+                return
+
+            threshold = _align_down(target_pcm_bytes, frame_bytes)
+            if threshold <= 0:
+                threshold = frame_bytes
+
+            while pending_pcm:
+                if not force and len(pending_pcm) < threshold:
+                    return
+
+                out_len = len(pending_pcm) if force else threshold
+                out_len = _align_down(out_len, frame_bytes)
+                if out_len <= 0:
+                    return
+
+                pcm = bytes(pending_pcm[:out_len])
+                del pending_pcm[:out_len]
+
+                if pcm:
+                    yield _wav_ndjson_line(
+                        pcm,
+                        sample_rate=sample_rate,
+                        channels=channels,
+                        bits_per_sample=bits_per_sample,
+                    )
+
         try:
             async for chunk in upstream.aiter_bytes():
                 if not chunk:
                     continue
-                buffer.extend(chunk)
 
-                while True:
-                    # Need at least RIFF header + chunk size.
-                    if len(buffer) < 12:
-                        break
+                if not header_parsed:
+                    header_buffer.extend(chunk)
+                    parsed = _parse_wav_header(header_buffer)
 
-                    # Find the next RIFF header.
-                    start = buffer.find(b"RIFF")
-                    if start == -1:
-                        # Keep only a tiny tail in case the marker is split.
-                        if len(buffer) > 8:
-                            del buffer[:-8]
-                        break
-                    if start > 0:
-                        del buffer[:start]
-                        if len(buffer) < 12:
-                            break
-
-                    if buffer[8:12] != b"WAVE":
-                        # False positive; skip one byte and resync.
-                        del buffer[:1]
+                    if parsed is None:
                         continue
 
-                    total_size = int.from_bytes(buffer[4:8], "little") + 8
-                    if total_size <= 0 or total_size > 100_000_000:
-                        del buffer[:1]
-                        continue
+                    sample_rate, channels, bits_per_sample, data_offset = parsed
+                    if bits_per_sample != 16:
+                        yield (
+                            json.dumps(
+                                {
+                                    "type": "error",
+                                    "message": (
+                                        f"unsupported bits_per_sample={bits_per_sample}"
+                                    ),
+                                },
+                                ensure_ascii=False,
+                            ).encode("utf-8")
+                            + b"\n"
+                        )
+                        return
 
-                    if len(buffer) < total_size:
-                        break
+                    frame_bytes = channels * (bits_per_sample // 8)
+                    header_parsed = True
 
-                    wav_bytes = bytes(buffer[:total_size])
-                    del buffer[:total_size]
-                    line = json.dumps(
-                        {
-                            "type": "wav",
-                            "b64": base64.b64encode(wav_bytes).decode("ascii"),
-                        },
-                        ensure_ascii=False,
-                    ).encode("utf-8") + b"\n"
-                    yield line
+                    pcm = bytes(header_buffer[data_offset:])
+                    header_buffer.clear()
+                    if pcm:
+                        pending_pcm.extend(pcm)
+
+                    async for line in flush_segments(force=False):
+                        yield line
+
+                else:
+                    pending_pcm.extend(chunk)
+
+                    async for line in flush_segments(force=False):
+                        yield line
+
         except (httpx.RemoteProtocolError, httpx.ReadError):
-            # Same rationale as in /stream: use everything already received.
+            # Use everything already received; some upstreams end chunked WAV
+            # streams without a terminating chunk.
             pass
+        except Exception as exc:
+            yield (
+                json.dumps(
+                    {
+                        "type": "error",
+                        "message": str(exc),
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                + b"\n"
+            )
+            return
         finally:
-            if buffer:
-                # Best-effort: if the tail contains a full WAV, emit it.
-                while len(buffer) >= 12:
-                    start = buffer.find(b"RIFF")
-                    if start == -1:
-                        break
-                    if start > 0:
-                        del buffer[:start]
-                        continue
-                    if buffer[8:12] != b"WAVE":
-                        del buffer[:1]
-                        continue
-                    total_size = int.from_bytes(buffer[4:8], "little") + 8
-                    if len(buffer) < total_size:
-                        break
-                    wav_bytes = bytes(buffer[:total_size])
-                    del buffer[:total_size]
-                    line = json.dumps(
-                        {
-                            "type": "wav",
-                            "b64": base64.b64encode(wav_bytes).decode("ascii"),
-                        },
-                        ensure_ascii=False,
-                    ).encode("utf-8") + b"\n"
+            try:
+                async for line in flush_segments(force=True):
                     yield line
-            await upstream.aclose()
-            yield b'{"type":"end"}\n'
+
+                if not header_parsed:
+                    yield (
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "message": (
+                                    "upstream finished before WAV data header was parsed"
+                                ),
+                            },
+                            ensure_ascii=False,
+                        ).encode("utf-8")
+                        + b"\n"
+                    )
+
+                yield b'{"type":"end"}\n'
+            finally:
+                await upstream.aclose()
 
     headers = {
         "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
@@ -246,4 +434,8 @@ async def stream_segments(
         "Expires": "0",
         "X-Accel-Buffering": "no",
     }
-    return StreamingResponse(iter_ndjson(), media_type="application/x-ndjson", headers=headers)
+    return StreamingResponse(
+        iter_ndjson(),
+        media_type="application/x-ndjson",
+        headers=headers,
+    )

@@ -59,12 +59,23 @@ class ServeReferenceAudio(BaseModel):
             return values
 
         audio = values.get("audio")
-        if isinstance(audio, str) and len(audio) > 255:
+        if isinstance(audio, str):
+            raw = audio.strip()
+
+            # Support data URLs as well as plain base64 strings. We no longer
+            # rely on a length threshold, because valid tiny test WAV/base64
+            # payloads should still be decoded correctly.
+            if "," in raw and raw.lower().startswith("data:"):
+                raw = raw.split(",", 1)[1]
+
             try:
-                values = dict(values)
-                values["audio"] = base64.b64decode(audio)
+                decoded = base64.b64decode(raw, validate=True)
             except Exception:
-                pass
+                decoded = None
+
+            if decoded is not None:
+                values = dict(values)
+                values["audio"] = decoded
 
         return values
 

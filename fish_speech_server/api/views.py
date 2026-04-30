@@ -79,7 +79,40 @@ from fish_speech_server.services.stateful_inference import stateful_inference_as
 
 MAX_NUM_SAMPLES = int(os.getenv("NUM_SAMPLES", 1))
 
+REFERENCE_ID_RE = re.compile(r"^[a-zA-Z0-9\-_ ]+$")
+
 routes = Routes()
+
+
+def _validate_reference_id(value: str, field: str = "Reference ID") -> str:
+    value = (value or "").strip()
+
+    if not value:
+        raise ValueError(f"{field} cannot be empty")
+
+    if len(value) > 255 or not REFERENCE_ID_RE.fullmatch(value):
+        raise ValueError(f"{field} contains invalid characters or is too long")
+
+    return value
+
+
+def _validate_reference_stem(value: str | None) -> str | None:
+    if value is None:
+        return None
+
+    value = value.strip()
+    if not value:
+        return None
+
+    # Stem is later handed to the driver. Keep it filename-safe even if the
+    # driver also validates, so the HTTP layer cannot pass path traversal input.
+    if len(value) > 255 or "/" in value or "\\" in value or ".." in value:
+        raise ValueError("Stem contains invalid characters or is too long")
+
+    if not re.fullmatch(r"^[a-zA-Z0-9._\- ]+$", value):
+        raise ValueError("Stem contains invalid characters or is too long")
+
+    return value
 
 
 @routes.http("/v1/health")
@@ -405,10 +438,10 @@ async def add_reference(
     text: str = Body(...),
 ):
     temp_file_path = None
+    reference_id = (id or "").strip()
 
     try:
-        if not id or not id.strip():
-            raise ValueError("Reference ID cannot be empty")
+        reference_id = _validate_reference_id(id, "Reference ID")
         if not text or not text.strip():
             raise ValueError("Reference text cannot be empty")
 
@@ -424,44 +457,48 @@ async def add_reference(
             temp_file.write(audio_content)
             temp_file_path = temp_file.name
 
-        driver.add_reference(id, temp_file_path, text)
+        driver.add_reference(reference_id, temp_file_path, text)
 
         response = AddReferenceResponse(
             success=True,
-            message=f"Reference voice '{id}' added successfully",
-            reference_id=id,
+            message=f"Reference voice '{reference_id}' added successfully",
+            reference_id=reference_id,
         )
         return format_response(response)
 
     except FileExistsError as e:
-        logger.warning(f"Reference ID '{id}' already exists: {e}")
+        logger.warning(f"Reference ID '{reference_id}' already exists: {e}")
         response = AddReferenceResponse(
             success=False,
-            message=f"Reference ID '{id}' already exists",
-            reference_id=id,
+            message=f"Reference ID '{reference_id}' already exists",
+            reference_id=reference_id,
         )
         return format_response(response, status_code=409)
 
     except ValueError as e:
-        logger.warning(f"Invalid input for reference '{id}': {e}")
-        response = AddReferenceResponse(success=False, message=str(e), reference_id=id)
+        logger.warning(f"Invalid input for reference '{reference_id}': {e}")
+        response = AddReferenceResponse(
+            success=False,
+            message=str(e),
+            reference_id=reference_id,
+        )
         return format_response(response, status_code=400)
 
     except (FileNotFoundError, OSError) as e:
-        logger.error(f"File system error for reference '{id}': {e}")
+        logger.error(f"File system error for reference '{reference_id}': {e}")
         response = AddReferenceResponse(
             success=False,
             message="File system error occurred",
-            reference_id=id,
+            reference_id=reference_id,
         )
         return format_response(response, status_code=500)
 
     except Exception as e:
-        logger.error(f"Unexpected error adding reference '{id}': {e}", exc_info=True)
+        logger.error(f"Unexpected error adding reference '{reference_id}': {e}", exc_info=True)
         response = AddReferenceResponse(
             success=False,
             message="Internal server error occurred",
-            reference_id=id,
+            reference_id=reference_id,
         )
         return format_response(response, status_code=500)
 
@@ -484,9 +521,10 @@ async def add_reference_encoded(
     lab: UploadFile = Body(...),
     stem: str | None = Body(None),
 ):
+    reference_id = (id or "").strip()
+
     try:
-        if not id or not id.strip():
-            raise ValueError("Reference ID cannot be empty")
+        reference_id = _validate_reference_id(id, "Reference ID")
 
         codes_bytes = await codes.read()
         lab_bytes = await lab.read()
@@ -498,19 +536,24 @@ async def add_reference_encoded(
         if not lab_text:
             raise ValueError("Lab content is empty")
 
-        stem_val = stem.strip() if stem and stem.strip() else None
+        stem_val = _validate_reference_stem(stem)
 
         app_state = request.app.state
         model_manager: ModelManager = app_state.model_manager
         driver = model_manager.driver
 
-        status = driver.add_reference_encoded(id, codes_bytes, lab_text, stem=stem_val)
+        status = driver.add_reference_encoded(
+            reference_id,
+            codes_bytes,
+            lab_text,
+            stem=stem_val,
+        )
 
         response = AddEncodedReferenceResponse(
             success=True,
             status=status,
-            message=f"Reference '{id}' {status}",
-            reference_id=id,
+            message=f"Reference '{reference_id}' {status}",
+            reference_id=reference_id,
         )
         return format_response(response)
 
@@ -521,7 +564,7 @@ async def add_reference_encoded(
                 success=False,
                 status="error",
                 message=str(e),
-                reference_id=id or "",
+                reference_id=reference_id,
             ),
             status_code=400,
         )
@@ -533,7 +576,7 @@ async def add_reference_encoded(
                 success=False,
                 status="error",
                 message="Internal server error",
-                reference_id=id,
+                reference_id=reference_id,
             ),
             status_code=500,
         )
@@ -567,9 +610,10 @@ async def list_references():
 
 @routes.http.delete("/v1/references/delete")
 async def delete_reference(reference_id: str = Body(...)):
+    reference_id = (reference_id or "").strip()
+
     try:
-        if not reference_id or not reference_id.strip():
-            raise ValueError("Reference ID cannot be empty")
+        reference_id = _validate_reference_id(reference_id, "Reference ID")
 
         app_state = request.app.state
         model_manager: ModelManager = app_state.model_manager
@@ -951,8 +995,16 @@ async def synthesize_ndjson(req: Annotated[ServeTTSRequest, Body(exclusive=True)
         model_manager = app_state.model_manager
         driver = model_manager.driver
 
+        stream_req = req.model_copy(
+            update={
+                "streaming": True,
+                "stream_tokens": True,
+                "format": "wav",
+            }
+        )
+
         async def gen():
-            async for event in inference_async(req, driver, yield_tokens=True):
+            async for event in inference_async(stream_req, driver, yield_tokens=True):
                 if isinstance(event, bytes):
                     yield (
                         json.dumps(
@@ -1093,19 +1145,15 @@ async def update_reference(
     old_reference_id: str = Body(...),
     new_reference_id: str = Body(...),
 ):
+    old_reference_id = (old_reference_id or "").strip()
+    new_reference_id = (new_reference_id or "").strip()
+
     try:
-        if not old_reference_id or not old_reference_id.strip():
-            raise ValueError("Old reference ID cannot be empty")
-        if not new_reference_id or not new_reference_id.strip():
-            raise ValueError("New reference ID cannot be empty")
+        old_reference_id = _validate_reference_id(old_reference_id, "Old reference ID")
+        new_reference_id = _validate_reference_id(new_reference_id, "New reference ID")
+
         if old_reference_id == new_reference_id:
             raise ValueError("New reference ID must be different from old reference ID")
-
-        id_pattern = r"^[a-zA-Z0-9\-_ ]+$"
-        if not re.match(id_pattern, new_reference_id) or len(new_reference_id) > 255:
-            raise ValueError(
-                "New reference ID contains invalid characters or is too long"
-            )
 
         app_state = request.app.state
         model_manager: ModelManager = app_state.model_manager
@@ -1154,8 +1202,8 @@ async def update_reference(
         response = UpdateReferenceResponse(
             success=False,
             message=str(e),
-            old_reference_id=old_reference_id if "old_reference_id" in locals() else "",
-            new_reference_id=new_reference_id if "new_reference_id" in locals() else "",
+            old_reference_id=old_reference_id,
+            new_reference_id=new_reference_id,
         )
         return format_response(response, status_code=400)
 
@@ -1174,7 +1222,7 @@ async def update_reference(
         response = UpdateReferenceResponse(
             success=False,
             message="Internal server error occurred",
-            old_reference_id=old_reference_id if "old_reference_id" in locals() else "",
-            new_reference_id=new_reference_id if "new_reference_id" in locals() else "",
+            old_reference_id=old_reference_id,
+            new_reference_id=new_reference_id,
         )
         return format_response(response, status_code=500)

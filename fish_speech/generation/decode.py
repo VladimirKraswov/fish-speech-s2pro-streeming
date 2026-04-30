@@ -89,6 +89,31 @@ def _mask_logits_to_max_exclusive(
     return logits.masked_fill(blocked, float("-inf"))
 
 
+def _semantic_logit_bias(
+    model: DualARTransformer,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    Get cached semantic logit bias tensor.
+    """
+    if hasattr(model, "_semantic_logit_bias_cache"):
+        cache = model._semantic_logit_bias_cache
+        if cache.device == device and cache.dtype == dtype:
+            return cache
+
+    vocab_size = model.config.vocab_size
+    semantic_logit_bias = torch.full(
+        (1, 1, vocab_size), float("-inf"), device=device, dtype=dtype
+    )
+
+    semantic_logit_bias[0, 0, model.semantic_token_mask_for_sampling] = 0.0
+    semantic_logit_bias[0, 0, _model_im_end_id(model)] = 0.0
+
+    model._semantic_logit_bias_cache = semantic_logit_bias
+    return semantic_logit_bias
+
+
 def decode_one_token_ar(
     model: DualARTransformer,
     x: torch.Tensor,
@@ -101,6 +126,7 @@ def decode_one_token_ar(
     audio_parts: torch.Tensor,
     previous_tokens: Optional[torch.Tensor] = None,
     repetition_penalty: float = 1.0,
+    disable_fast_first: bool = False,
 ) -> torch.Tensor:
     forward_result = model.forward_generate(
         x,
@@ -113,7 +139,7 @@ def decode_one_token_ar(
 
     biased_logits = logits + semantic_logit_bias
 
-    if repetition_penalty != 1.0 and previous_tokens is not None:
+    if not disable_fast_first and repetition_penalty != 1.0 and previous_tokens is not None:
         # Penalize only semantic tokens in the window
         # We assume previous_tokens[0] contains main tokens (semantic + IM_END)
         window = previous_tokens[0]
@@ -129,22 +155,23 @@ def decode_one_token_ar(
         biased_logits, temperature=temperature, top_p=top_p, top_k=top_k
     )[0]
 
-    high_temp = torch.tensor(
-        RAS_HIGH_TEMP, device=temperature.device, dtype=temperature.dtype
-    )
-    high_top_p = torch.tensor(RAS_HIGH_TOP_P, device=top_p.device, dtype=top_p.dtype)
-    main_token_high = sample(
-        biased_logits, temperature=high_temp, top_p=high_top_p, top_k=top_k
-    )[0]
-
-    if previous_tokens is not None:
-        in_window = (previous_tokens[0] == main_token_normal).any()
-        is_semantic = model.semantic_token_mask_for_sampling[main_token_normal]
-
-        should_use_high = in_window & is_semantic
-        main_token_normal = torch.where(
-            should_use_high, main_token_high, main_token_normal
+    if not disable_fast_first:
+        high_temp = torch.tensor(
+            RAS_HIGH_TEMP, device=temperature.device, dtype=temperature.dtype
         )
+        high_top_p = torch.tensor(RAS_HIGH_TOP_P, device=top_p.device, dtype=top_p.dtype)
+        main_token_high = sample(
+            biased_logits, temperature=high_temp, top_p=high_top_p, top_k=top_k
+        )[0]
+
+        if previous_tokens is not None:
+            in_window = (previous_tokens[0] == main_token_normal).any()
+            is_semantic = model.semantic_token_mask_for_sampling[main_token_normal]
+
+            should_use_high = in_window & is_semantic
+            main_token_normal = torch.where(
+                should_use_high, main_token_high, main_token_normal
+            )
 
     codebooks = [main_token_normal]
 
@@ -203,6 +230,7 @@ def decode_n_tokens(
     stream_chunk_size: Optional[int] = None,
     initial_stream_chunk_size: Optional[int] = None,
     initial_token_chunk: Optional[torch.Tensor] = None,
+    low_latency_first_audio: bool = False,
     compile: bool = False,
 ) -> Iterator[torch.Tensor]:
     """
@@ -241,6 +269,7 @@ def decode_n_tokens(
 
     im_end_id = _model_im_end_id(model)
     do_stream_log = stream_chunk_size is not None
+    generated_so_far = 0
 
     for i in tqdm(range(num_new_tokens)):
         if do_stream_log and i < 3:
@@ -250,6 +279,12 @@ def decode_n_tokens(
                 cur_token.shape,
                 input_pos.shape,
             )
+        disable_fast_first = (
+            low_latency_first_audio
+            and initial_stream_chunk_size is not None
+            and generated_so_far < initial_stream_chunk_size
+        )
+
         try:
             use_math = _use_sdpa_math()
             if use_math:
@@ -266,6 +301,7 @@ def decode_n_tokens(
                         audio_masks=audio_masks,
                         audio_parts=audio_parts,
                         repetition_penalty=repetition_penalty,
+                        disable_fast_first=disable_fast_first,
                     )
             else:
                 next_token = decode_one_token(
@@ -280,6 +316,7 @@ def decode_n_tokens(
                     audio_masks=audio_masks,
                     audio_parts=audio_parts,
                     repetition_penalty=repetition_penalty,
+                    disable_fast_first=disable_fast_first,
                 )
         except Exception as e:
             logger.exception(
@@ -301,6 +338,7 @@ def decode_n_tokens(
         ).detach().clone()
 
         new_tokens.append(next_token)
+        generated_so_far += 1
 
         if stream_chunk_size is not None:
             target_chunk_size = (
@@ -388,9 +426,14 @@ def generate(
     codebook_dim = 1 + model.config.num_codebooks
 
     input_pos = torch.arange(0, T, device=device, dtype=torch.long)
-    empty = torch.empty((codebook_dim, cache_len), dtype=prompt.dtype, device=device)
-    empty[:, :T] = prompt
-    seq = empty
+    stream_chunk_size = sampling_kwargs.get("stream_chunk_size", None)
+
+    if stream_chunk_size is None:
+        empty = torch.empty((codebook_dim, cache_len), dtype=prompt.dtype, device=device)
+        empty[:, :T] = prompt
+        seq = empty
+    else:
+        seq = None
 
     temp_val = sampling_kwargs.get("temperature", 1.0)
     top_p_val = sampling_kwargs.get("top_p", 0.9)
@@ -400,13 +443,11 @@ def generate(
     temperature = torch.tensor(temp_val, device=device, dtype=dtype)
     top_p = torch.tensor(top_p_val, device=device, dtype=dtype)
 
-    vocab_size = model.config.vocab_size
-    semantic_logit_bias = torch.full(
-        (1, 1, vocab_size), float("-inf"), device=device, dtype=dtype
+    semantic_logit_bias = _semantic_logit_bias(
+        model,
+        device=device,
+        dtype=dtype,
     )
-
-    semantic_logit_bias[0, 0, model.semantic_token_mask_for_sampling] = 0.0
-    semantic_logit_bias[0, 0, _model_im_end_id(model)] = 0.0
 
     prefill_decode = decode_one_token_ar
 
@@ -427,11 +468,14 @@ def generate(
         audio_parts,
         repetition_penalty=repetition_penalty,
     )
-    seq[:, T : T + 1] = first_token
+
+    if seq is not None:
+        seq[:, T : T + 1] = first_token
 
     input_pos = torch.tensor([T], device=device, dtype=torch.long)
     stream_chunk_size = sampling_kwargs.pop("stream_chunk_size", None)
     initial_stream_chunk_size = sampling_kwargs.pop("initial_stream_chunk_size", None)
+    low_latency_first_audio = sampling_kwargs.pop("low_latency_first_audio", False)
     compile = sampling_kwargs.pop("compile", False)
 
     im_end_id = _model_im_end_id(model)
@@ -457,6 +501,7 @@ def generate(
         stream_chunk_size=stream_chunk_size,
         initial_stream_chunk_size=initial_stream_chunk_size,
         initial_token_chunk=first_token.clone() if stream_chunk_size is not None else None,
+        low_latency_first_audio=low_latency_first_audio,
         compile=compile,
     )
 
@@ -465,11 +510,11 @@ def generate(
             x = next(iter(decode_iter))
         except StopIteration:
             seq = seq[:, : T + 1]
-            del first_token, prompt, empty, input_pos
+            del first_token, prompt, input_pos
             return seq
         seq = seq[:, : T + 1 + x.size(1)]
         seq[:, T + 1 :] = x
-        del first_token, x, prompt, empty, input_pos
+        del first_token, x, prompt, input_pos
         return seq
 
     return _iter_no_grad(decode_iter)

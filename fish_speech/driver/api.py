@@ -100,16 +100,19 @@ class FishSpeechDriver:
         }[model_cfg.precision]
 
         device = model_cfg.device
-        if torch.backends.mps.is_available():
-            device = "mps"
-        elif not torch.cuda.is_available():
+        if device == "auto":
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
+        elif device == "cuda" and not torch.cuda.is_available():
+            logger.warning("Configured device cuda is not available, falling back to cpu")
             device = "cpu"
-        if device != model_cfg.device:
-            logger.warning(
-                "Configured device {} overridden to available device {}",
-                model_cfg.device,
-                device,
-            )
+        elif device == "mps" and not torch.backends.mps.is_available():
+            logger.warning("Configured device mps is not available, falling back to cpu")
+            device = "cpu"
 
         return cls.from_model_paths(
             llama_checkpoint_path=paths.llama_checkpoint_path,
@@ -299,6 +302,9 @@ class FishSpeechDriver:
         )
 
     def close(self) -> None:
+        if self._closed:
+            return
+
         self._closed = True
         llama_queue = getattr(self.engine, "llama_queue", None)
         if llama_queue is not None:

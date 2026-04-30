@@ -221,11 +221,16 @@ def generate_committed_segments(
             target_chars = max(40, int(chunk_length))
             max_chars = max(target_chars, int(target_chars * 1.5))
             split_source = "request_chunk_length"
-        else:
-            # chunk_length <= 0 means disable request-level auto splitting
+        elif chunk_length == 0:
+            # chunk_length == 0 means disable request-level auto splitting
             target_chars = 0
             max_chars = 0
             split_source = "disabled_by_request"
+        else:
+            # chunk_length < 0 means use runtime config
+            target_chars = model_cfg.long_form_target_chars
+            max_chars = model_cfg.long_form_max_chars
+            split_source = "runtime_long_form_config"
 
         if target_chars > 0:
             committed_segments = []

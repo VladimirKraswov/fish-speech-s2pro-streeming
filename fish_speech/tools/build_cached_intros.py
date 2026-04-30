@@ -79,8 +79,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--compile",
-        dest="compile",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=None,
         help="Enable torch.compile for generation.",
     )
@@ -204,8 +203,65 @@ def _resolve_settings(args: argparse.Namespace) -> BuildSettings:
     )
 
 
-def _intro_complete(intro_dir: Path) -> bool:
-    return intro_dir.is_dir() and all((intro_dir / name).is_file() for name in ARTIFACT_NAMES)
+def params_hash(payload: dict[str, Any]) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _params_payload(settings: BuildSettings) -> dict[str, Any]:
+    return {
+        "reference_id": settings.reference_id,
+        "seed": settings.seed,
+        "top_p": settings.top_p,
+        "temperature": settings.temperature,
+        "repetition_penalty": settings.repetition_penalty,
+        "chunk_length": settings.chunk_length,
+        "max_new_tokens": settings.max_new_tokens,
+        "initial_stream_chunk_size": settings.initial_stream_chunk_size,
+        "stream_chunk_size": settings.stream_chunk_size,
+        "model": {
+            "llama_checkpoint_path": settings.llama_checkpoint_path,
+            "decoder_checkpoint_path": settings.decoder_checkpoint_path,
+            "decoder_config_name": settings.decoder_config_name,
+        },
+    }
+
+
+def _intro_complete(
+    intro_dir: Path,
+    item: IntroItem,
+    settings: BuildSettings,
+) -> bool:
+    if not (intro_dir.is_dir() and all((intro_dir / name).is_file() for name in ARTIFACT_NAMES)):
+        return False
+
+    # Read and verify meta
+    try:
+        meta_path = intro_dir / "meta.json"
+        with meta_path.open("r", encoding="utf-8") as f:
+            meta = json.load(f)
+
+        expected_hash = params_hash(_params_payload(settings))
+
+        checks = {
+            "id": meta.get("id") == item.id,
+            "text": meta.get("text") == item.text,
+            "params_hash": meta.get("params_hash") == expected_hash,
+        }
+
+        if all(checks.values()):
+            return True
+
+        failed = [k for k, v in checks.items() if not v]
+        logger.info(
+            "Cached intro {} is stale (failed checks: {}), will regenerate",
+            item.id,
+            failed,
+        )
+        return False
+    except Exception as e:
+        logger.warning("Failed to verify meta for {}: {}, will regenerate", item.id, e)
+        return False
 
 
 def _manifest_entry_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
@@ -285,14 +341,19 @@ def _generate_intro(
     overwrite: bool,
     skip_existing: bool,
 ) -> tuple[str, dict[str, Any] | None]:
+    is_complete = _intro_complete(intro_dir, item, settings)
+
     if intro_dir.exists():
-        if skip_existing and _intro_complete(intro_dir):
+        if skip_existing and is_complete:
             logger.info("Skipping existing intro: {}", item.id)
             return "skipped", _load_existing_manifest_entry(intro_dir)
-        if not overwrite:
+        if not overwrite and is_complete:
             raise FileExistsError(
                 f"Intro {item.id!r} already exists; use --overwrite or --skip-existing"
             )
+
+    if skip_existing and not is_complete and intro_dir.exists():
+        logger.info("Regenerating stale/incomplete intro: {}", item.id)
 
     tmp_dir = intro_dir.parent / f".{item.id}.tmp"
     if tmp_dir.exists():
@@ -353,6 +414,7 @@ def _generate_intro(
         )
         (tmp_dir / "audio.pcm").write_bytes(_pcm16le(audio))
 
+        param_payload = _params_payload(settings)
         meta = {
             "id": item.id,
             "text": item.text,
@@ -371,6 +433,8 @@ def _generate_intro(
             "top_p": settings.top_p,
             "temperature": settings.temperature,
             "repetition_penalty": settings.repetition_penalty,
+            "params_hash": params_hash(param_payload),
+            "params": param_payload,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         _write_json(tmp_dir / "meta.json", meta)

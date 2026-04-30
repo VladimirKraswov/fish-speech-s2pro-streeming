@@ -115,8 +115,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--compile",
-        dest="compile",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=None,
         help="Enable torch.compile for generation.",
     )
@@ -334,11 +333,45 @@ def _relative_artifact_paths(cache_id: str) -> dict[str, str]:
     }
 
 
-def _artifact_complete(output_dir: Path, cache_id: str) -> bool:
-    paths = _artifact_paths(output_dir, cache_id)
-    return all(
-        path.is_file() for path in (paths.pcm, paths.wav, paths.codes, paths.meta)
-    )
+def _artifact_complete(
+    output_dir: Path,
+    item: PrefixCacheItem,
+    settings: BuildSettings,
+) -> bool:
+    paths = _artifact_paths(output_dir, item.cache_id)
+    if not all(path.is_file() for path in (paths.pcm, paths.wav, paths.codes, paths.meta)):
+        return False
+
+    # Read and verify meta
+    try:
+        with paths.meta.open("r", encoding="utf-8") as f:
+            meta = json.load(f)
+
+        expected_params = _params_payload(settings, voice_id=item.voice_id)
+        expected_hash = params_hash(expected_params)
+
+        checks = {
+            "cache_id": meta.get("cache_id") == item.cache_id,
+            "voice_id": meta.get("voice_id") == item.voice_id,
+            "text": meta.get("text") == item.text,
+            "normalized_text": meta.get("normalized_text") == item.normalized_text,
+            "word_count": meta.get("word_count") == item.word_count,
+            "params_hash": meta.get("params_hash") == expected_hash,
+        }
+
+        if all(checks.values()):
+            return True
+
+        failed = [k for k, v in checks.items() if not v]
+        logger.info(
+            "Cache item {} is stale (failed checks: {}), will regenerate",
+            item.cache_id,
+            failed,
+        )
+        return False
+    except Exception as e:
+        logger.warning("Failed to verify meta for {}: {}, will regenerate", item.cache_id, e)
+        return False
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -443,7 +476,9 @@ def _generate_prefix(
     skip_existing: bool,
 ) -> tuple[str, dict[str, Any] | None]:
     final_paths = _artifact_paths(output_dir, item.cache_id)
-    if _artifact_complete(output_dir, item.cache_id):
+    is_complete = _artifact_complete(output_dir, item, settings)
+
+    if is_complete:
         if skip_existing:
             logger.info("Skipping existing prefix cache item: {}", item.cache_id)
             return "skipped", _load_existing_manifest_entry(output_dir, item.cache_id)
@@ -452,16 +487,19 @@ def _generate_prefix(
                 f"Prefix cache item {item.cache_id!r} already exists; "
                 "use --overwrite or --skip-existing"
             )
-    elif any(
-        path.exists()
-        for path in (
-            final_paths.pcm,
-            final_paths.wav,
-            final_paths.codes,
-            final_paths.meta,
-        )
-    ):
-        if not overwrite:
+    else:
+        # Not complete or stale
+        if skip_existing:
+            logger.info("Regenerating stale/incomplete cache item: {}", item.cache_id)
+        elif not overwrite and any(
+            path.exists()
+            for path in (
+                final_paths.pcm,
+                final_paths.wav,
+                final_paths.codes,
+                final_paths.meta,
+            )
+        ):
             raise FileExistsError(
                 f"Prefix cache item {item.cache_id!r} has partial artifacts; "
                 "use --overwrite to replace them"

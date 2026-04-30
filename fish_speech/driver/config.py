@@ -42,6 +42,7 @@ class ModelConfig(BaseModel):
     memory_history_max_entries: int = Field(100000, ge=1)
 
     debug_prompt_visualize: bool = False
+    validate_generated_codes: bool = False
 
     # Long-form settings
     long_form_auto_split: bool = True

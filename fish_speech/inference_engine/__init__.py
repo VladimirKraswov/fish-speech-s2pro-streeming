@@ -549,6 +549,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                 )
             elif req.stream_audio:
                 _mark("stream_done", total_segments=len(segments))
+                logger.info("stream: stream_done req={}", req_tag)
             elif not req.stream_audio:
                 if all_codes:
                     full_codes = torch.cat(all_codes, dim=1)
@@ -656,7 +657,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
         decoded = self.get_audio_segment_fast(
             GenerateResponse(action="sample", codes=decode_codes),
-            validate_debug=self.runtime.model.profile_inference,
+            validate_debug=self.runtime.model.validate_generated_codes,
         )
 
         # DAC uses a specific hop length / frame length for its VQ codebooks.

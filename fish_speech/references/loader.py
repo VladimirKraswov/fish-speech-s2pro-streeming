@@ -59,7 +59,7 @@ class ReferenceLoader:
             raise FileNotFoundError(f"Reference ID '{id}' does not exist")
 
         ref_audios = list_files(
-            ref_folder, AUDIO_EXTENSIONS, recursive=True, sort=False
+            ref_folder, AUDIO_EXTENSIONS, recursive=False, sort=False
         )
         ref_codes = list(ref_folder.glob("*.codes.pt"))
 

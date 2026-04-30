@@ -36,6 +36,8 @@ UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=None)
 FISH_API_KEY = os.getenv("FISH_API_KEY", "").strip()
 PREFIX_CACHE_SALT = os.getenv("FISH_PREFIX_CACHE_SALT", "").strip()
 PREFIX_CACHE_SCHEMA_VERSION = 2
+PREFIX_CACHE_MAX_ENTRIES = 4096
+PREFIX_CACHE_EMIT_BYTES = 8192
 
 DEFAULT_REFERENCE_ID = _RUNTIME.proxy.default_reference_id
 SESSION_TTL_SEC = _RUNTIME.proxy.session_ttl_sec
@@ -91,6 +93,23 @@ class SessionAppendRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     text: str = Field(..., min_length=1, max_length=4000)
     source_ts_ms: int | None = None
+    cache: str | None = Field(None, min_length=1, max_length=4000)
+    cash: str | None = Field(None, min_length=1, max_length=4000)
+
+
+class PrefixCacheAddRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    config_text: str = Field(..., min_length=2, max_length=100_000)
+    text: str | None = Field(None, min_length=1, max_length=4000)
+    texts: list[str] | None = Field(None, min_length=1, max_length=4096)
+    clear_existing: bool = False
+    fail_fast: bool = False
+
+
+class PrefixCacheKeyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    config_text: str = Field(..., min_length=2, max_length=100_000)
+    text: str = Field(..., min_length=1, max_length=4000)
 
 
 class SessionFlushRequest(BaseModel):
@@ -105,6 +124,18 @@ class SessionFinishRequest(BaseModel):
 
 @dataclass
 class IntroCacheEntry:
+    key: str
+    created_at: float
+    expires_at: float
+    audio_meta: dict[str, Any]
+    pcm: bytes
+    text: str
+    codes: list[list[int]] | None = None
+    code_frames: int = 0
+
+
+@dataclass
+class PrefixCacheEntry:
     key: str
     created_at: float
     expires_at: float
@@ -189,6 +220,73 @@ class IntroCache:
         return len(self._items)
 
 
+class PrefixCacheLibrary:
+    def __init__(self, *, max_entries: int = PREFIX_CACHE_MAX_ENTRIES) -> None:
+        self.max_entries = max_entries
+        self._items: dict[str, PrefixCacheEntry] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._lock = asyncio.Lock()
+
+    async def get(self, key: str) -> PrefixCacheEntry | None:
+        async with self._lock:
+            return self._items.get(key)
+
+    async def get_or_create(
+        self,
+        *,
+        key: str,
+        text: str,
+        config: ProxyConfig,
+        client: httpx.AsyncClient,
+    ) -> tuple[PrefixCacheEntry, bool]:
+        async with self._lock:
+            entry = self._items.get(key)
+            if entry is not None:
+                return entry, False
+
+            if key not in self._locks:
+                self._locks[key] = asyncio.Lock()
+            lock = self._locks[key]
+
+        async with lock:
+            async with self._lock:
+                entry = self._items.get(key)
+                if entry is not None:
+                    return entry, False
+
+            entry = await _generate_prefix_cache_entry(
+                key=key,
+                text=text,
+                config=config,
+                client=client,
+            )
+
+            async with self._lock:
+                if len(self._items) >= self.max_entries and key not in self._items:
+                    oldest_key = min(
+                        self._items.keys(), key=lambda k: self._items[k].created_at
+                    )
+                    self._items.pop(oldest_key, None)
+                    self._locks.pop(oldest_key, None)
+
+                self._items[key] = entry
+                return entry, True
+
+    async def clear(self) -> None:
+        async with self._lock:
+            self._items.clear()
+            self._locks.clear()
+            logger.info("prefix cache cleared")
+
+    async def list_entries(self) -> list[PrefixCacheEntry]:
+        async with self._lock:
+            return list(self._items.values())
+
+    async def count(self) -> int:
+        async with self._lock:
+            return len(self._items)
+
+
 @dataclass
 class SessionRecord:
     session_id: str
@@ -205,6 +303,9 @@ class SessionRecord:
     input_closed: bool = False
     synthesis_session_id: str | None = None
     intro_preloaded_cache_key: str | None = None
+    prefix_preloaded_cache_key: str | None = None
+    pending_prefix_cache_text: str | None = None
+    pending_prefix_cache_key: str | None = None
     audio_meta: dict[str, Any] | None = None
     stream_started: bool = False
     stream_finished: bool = False
@@ -343,6 +444,7 @@ class SessionStore:
                         "stream_finished": rec.stream_finished,
                         "queued_commits": rec.commit_queue.qsize(),
                         "synthesis_session_id": rec.synthesis_session_id,
+                        "pending_prefix_cache_text": rec.pending_prefix_cache_text,
                     }
                     for rec in self._items.values()
                 ],
@@ -351,6 +453,7 @@ class SessionStore:
 
 session_store = SessionStore()
 intro_cache = IntroCache()
+prefix_cache_library = PrefixCacheLibrary()
 
 
 def _schedule_close_upstream_synthesis_session(
@@ -733,6 +836,55 @@ def _intro_cache_key(config: ProxyConfig) -> str:
     return hashlib.sha256(dump.encode("utf-8")).hexdigest()
 
 
+def _prefix_cache_key(config: ProxyConfig, text: str) -> str:
+    tts = config.tts
+    prefix_text = text.strip()
+
+    payload = {
+        "cache_schema": PREFIX_CACHE_SCHEMA_VERSION,
+        "cache_kind": "prefix_cache",
+        "prefix_cache_salt": PREFIX_CACHE_SALT,
+        "proxy_version": config.version,
+        "runtime_version": _RUNTIME.version,
+        "llama_checkpoint_path": _RUNTIME.paths.llama_checkpoint_path,
+        "decoder_checkpoint_path": _RUNTIME.paths.decoder_checkpoint_path,
+        "decoder_config_name": _RUNTIME.paths.decoder_config_name,
+        "model_device": _RUNTIME.model.device,
+        "model_precision": _RUNTIME.model.precision,
+        "model_compile": _RUNTIME.model.compile,
+        "upstream_url": UPSTREAM_TTS_URL,
+        "prefix_text": prefix_text,
+        "reference_id": _normalized_reference_id(config),
+        "format": "wav",
+        "seed": tts.seed,
+        "normalize": tts.normalize,
+        "use_memory_cache": tts.use_memory_cache,
+        "max_new_tokens": tts.max_new_tokens,
+        "chunk_length": tts.chunk_length,
+        "top_p": tts.top_p,
+        "repetition_penalty": tts.repetition_penalty,
+        "temperature": tts.temperature,
+        "streaming": True,
+        "stream_tokens": True,
+        "initial_stream_chunk_size": tts.initial_stream_chunk_size,
+        "stream_chunk_size": tts.stream_chunk_size,
+        "first_initial_stream_chunk_size": tts.first_initial_stream_chunk_size,
+        "first_stream_chunk_size": tts.first_stream_chunk_size,
+        "stateful_synthesis": tts.stateful_synthesis,
+        "stateful_history_turns": tts.stateful_history_turns,
+        "stateful_history_chars": tts.stateful_history_chars,
+        "stateful_history_code_frames": tts.stateful_history_code_frames,
+    }
+
+    dump = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(dump.encode("utf-8")).hexdigest()
+
+
 async def _generate_intro_cache_entry(
     *,
     key: str,
@@ -802,26 +954,104 @@ async def _generate_intro_cache_entry(
     )
 
 
+async def _generate_prefix_cache_entry(
+    *,
+    key: str,
+    text: str,
+    config: ProxyConfig,
+    client: httpx.AsyncClient,
+) -> PrefixCacheEntry:
+    payload = build_upstream_payload(text=text, config=config, commit_seq=1)
+    payload["streaming"] = True
+    payload["stream_tokens"] = True
+    payload["format"] = "wav"
+
+    url = UPSTREAM_TTS_URL.replace(
+        "/v1/tts",
+        "/v1/synthesis/intro-cache/generate",
+    )
+
+    logger.info(
+        "generating prefix cache key=%s text=%r ref=%s url=%s",
+        key[:8],
+        text[:100],
+        payload["reference_id"],
+        url,
+    )
+
+    resp = await client.post(
+        url,
+        json=payload,
+        headers=_auth_headers({"Accept": "application/json"}),
+    )
+
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"prefix-cache generation failed status={resp.status_code}: {resp.text}"
+        )
+
+    data = resp.json()
+    pcm_b64 = data.get("pcm_b64") or ""
+    audio_meta = data.get("audio_meta") or {}
+    codes = data.get("codes")
+    code_frames = int(data.get("code_frames") or 0)
+
+    if not pcm_b64:
+        raise RuntimeError("prefix-cache generation returned empty pcm_b64")
+
+    pcm = base64.b64decode(pcm_b64)
+
+    if not pcm:
+        raise RuntimeError("prefix-cache generation returned empty PCM")
+
+    if config.tts.stateful_synthesis and (not codes or code_frames <= 0):
+        raise RuntimeError(
+            "prefix-cache generation returned PCM but no continuation codes; "
+            "seamless prefix-cache requires codes"
+        )
+
+    now = time.time()
+    return PrefixCacheEntry(
+        key=key,
+        created_at=now,
+        expires_at=float("inf"),
+        audio_meta=audio_meta,
+        pcm=pcm,
+        text=text,
+        codes=codes,
+        code_frames=code_frames,
+    )
+
+
 async def _preload_intro_cache_context(
     *,
     rec: SessionRecord,
     config: ProxyConfig,
-    entry: IntroCacheEntry,
+    entry: IntroCacheEntry | PrefixCacheEntry,
     client: httpx.AsyncClient,
+    commit_seq: int = 0,
+    commit_reason: str = "intro_cache",
+    cache_kind: str = "intro_cache",
 ) -> bool:
     if not config.tts.stateful_synthesis:
         return False
 
     if not rec.synthesis_session_id:
         raise RuntimeError(
-            "cannot emit seamless intro cache: upstream synthesis session is missing"
+            "cannot emit seamless cache: upstream synthesis session is missing"
         )
 
-    if rec.intro_preloaded_cache_key == entry.key:
+    preloaded_key = (
+        rec.prefix_preloaded_cache_key
+        if cache_kind == "prefix_cache"
+        else rec.intro_preloaded_cache_key
+    )
+
+    if preloaded_key == entry.key:
         return True
 
     if not entry.codes or entry.code_frames <= 0:
-        raise RuntimeError("cannot preload intro cache context: cached entry has no codes")
+        raise RuntimeError("cannot preload cache context: cached entry has no codes")
 
     url = UPSTREAM_TTS_URL.replace(
         "/v1/tts",
@@ -832,8 +1062,8 @@ async def _preload_intro_cache_context(
         "synthesis_session_id": rec.synthesis_session_id,
         "text": entry.text,
         "codes": entry.codes,
-        "commit_seq": 0,
-        "commit_reason": "intro_cache",
+        "commit_seq": commit_seq,
+        "commit_reason": commit_reason,
     }
 
     resp = await client.post(
@@ -844,13 +1074,17 @@ async def _preload_intro_cache_context(
 
     if resp.status_code != 200:
         raise RuntimeError(
-            f"intro context preload failed status={resp.status_code}: {resp.text}"
+            f"{cache_kind} context preload failed status={resp.status_code}: {resp.text}"
         )
 
-    rec.intro_preloaded_cache_key = entry.key
+    if cache_kind == "prefix_cache":
+        rec.prefix_preloaded_cache_key = entry.key
+    else:
+        rec.intro_preloaded_cache_key = entry.key
 
     logger.info(
-        "intro context preloaded session=%s synthesis=%s key=%s code_frames=%s",
+        "%s context preloaded session=%s synthesis=%s key=%s code_frames=%s",
+        cache_kind,
         rec.session_id[:8],
         rec.synthesis_session_id[:8],
         entry.key[:8],
@@ -1008,6 +1242,172 @@ async def emit_intro_cache(
             "req_id": req_id,
             "session_id": rec.session_id,
             "cache_key": entry.key,
+            "pcm_bytes": total_emitted,
+        }
+    )
+
+
+def _resolve_prefix_cache_alias(
+    cache: str | None,
+    cash: str | None,
+) -> str | None:
+    cache_text = cache.strip() if cache is not None else None
+    cash_text = cash.strip() if cash is not None else None
+
+    if cache_text is not None and cash_text is not None and cache_text != cash_text:
+        raise HTTPException(400, detail="cache and cash must match when both are set")
+
+    return cache_text if cache_text is not None else cash_text
+
+
+def _prefix_cache_public_item(entry: PrefixCacheEntry) -> dict[str, Any]:
+    return {
+        "key": entry.key,
+        "key_short": entry.key[:8],
+        "text": entry.text,
+        "pcm_bytes": len(entry.pcm),
+        "code_frames": entry.code_frames,
+        "audio_meta": entry.audio_meta,
+    }
+
+
+def _prefix_cache_event_base(
+    *,
+    req_id: str,
+    rec: SessionRecord,
+    commit_seq: int,
+    entry: PrefixCacheEntry,
+) -> dict[str, Any]:
+    return {
+        "req_id": req_id,
+        "session_id": rec.session_id,
+        "commit_seq": commit_seq,
+        "cache_key": entry.key,
+        "cache_key_short": entry.key[:8],
+        "cache_text": entry.text,
+    }
+
+
+async def emit_prefix_cache(
+    *,
+    rec: SessionRecord,
+    config: ProxyConfig,
+    client: httpx.AsyncClient,
+    req_id: str,
+    commit_item: dict[str, Any],
+) -> AsyncGenerator[bytes, None]:
+    async def emit(obj: dict[str, Any]) -> bytes:
+        return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+
+    commit_seq = int(commit_item["seq"])
+    cache_text = (commit_item.get("prefix_cache_text") or "").strip()
+    if not cache_text:
+        return
+
+    cache_key = commit_item.get("prefix_cache_key") or _prefix_cache_key(
+        config,
+        cache_text,
+    )
+    entry = await prefix_cache_library.get(cache_key)
+    if entry is None:
+        raise RuntimeError(
+            f"prefix-cache entry not found for text={cache_text!r} key={cache_key[:8]}"
+        )
+
+    preloaded = await _preload_intro_cache_context(
+        rec=rec,
+        config=config,
+        entry=entry,
+        client=client,
+        commit_seq=0,
+        commit_reason="prefix_cache",
+        cache_kind="prefix_cache",
+    )
+
+    event_base = _prefix_cache_event_base(
+        req_id=req_id,
+        rec=rec,
+        commit_seq=commit_seq,
+        entry=entry,
+    )
+
+    if preloaded:
+        yield await emit(
+            {
+                "type": "prefix_cache_context_preloaded",
+                **event_base,
+                "synthesis_session_id": rec.synthesis_session_id,
+                "code_frames": entry.code_frames,
+            }
+        )
+
+    if rec.audio_meta is not None:
+        for k, v in entry.audio_meta.items():
+            if rec.audio_meta.get(k) != v:
+                logger.warning(
+                    "prefix-cache meta mismatch session=%s",
+                    rec.session_id[:8],
+                )
+                raise RuntimeError(
+                    "prefix-cache audio format mismatch with session format"
+                )
+
+    yield await emit(
+        {
+            "type": "prefix_cache_start",
+            **event_base,
+            "text_preview": entry.text[:180],
+            "text_len": len(entry.text),
+            "code_frames": entry.code_frames,
+            "pcm_bytes": len(entry.pcm),
+        }
+    )
+
+    if rec.audio_meta is None:
+        rec.audio_meta = entry.audio_meta
+        yield await emit(
+            {
+                "type": "meta",
+                "session_id": rec.session_id,
+                "commit_seq": commit_seq,
+                **rec.audio_meta,
+            }
+        )
+
+    pcm = entry.pcm
+    frame_bytes = rec.audio_meta["channels"] * rec.audio_meta["sample_width"]
+    chunk_size = _align_down(PREFIX_CACHE_EMIT_BYTES, frame_bytes)
+    if chunk_size <= 0:
+        chunk_size = frame_bytes
+
+    total_emitted = 0
+    for i in range(0, len(pcm), chunk_size):
+        chunk = pcm[i : i + chunk_size]
+        if not chunk:
+            continue
+
+        pcm_seq = rec.next_pcm_seq
+        rec.next_pcm_seq += 1
+        total_emitted += len(chunk)
+
+        yield await emit(
+            {
+                "type": "pcm",
+                **event_base,
+                "seq": pcm_seq,
+                "first_pcm_for_commit": (i == 0),
+                "prefix_cache": True,
+                "pcm_bytes": len(chunk),
+                "data": base64.b64encode(chunk).decode("ascii"),
+            }
+        )
+        await asyncio.sleep(0)
+
+    yield await emit(
+        {
+            "type": "prefix_cache_done",
+            **event_base,
+            "code_frames": entry.code_frames,
             "pcm_bytes": total_emitted,
         }
     )
@@ -1501,6 +1901,12 @@ async def _queue_commits(
             "text_len": len(text),
         }
 
+        if seq == 1 and rec.pending_prefix_cache_text:
+            item["prefix_cache_text"] = rec.pending_prefix_cache_text
+            item["prefix_cache_key"] = rec.pending_prefix_cache_key
+            rec.pending_prefix_cache_text = None
+            rec.pending_prefix_cache_key = None
+
         rec.commit_history.append(item)
         await rec.commit_queue.put({"type": "commit", **item})
         items.append(item)
@@ -1583,6 +1989,125 @@ async def intro_cache_stats() -> JSONResponse:
 async def intro_cache_clear() -> JSONResponse:
     await intro_cache.clear()
     return JSONResponse({"ok": True, "message": "intro cache cleared"})
+
+
+@app.post("/prefix-cache/add")
+async def prefix_cache_add(req: PrefixCacheAddRequest) -> JSONResponse:
+    config = normalize_config(req.config_text)
+
+    if req.text is not None and req.texts is not None:
+        raise HTTPException(400, detail="provide either text or texts, not both")
+
+    if req.text is None and req.texts is None:
+        raise HTTPException(400, detail="provide text or texts")
+
+    texts = [req.text] if req.text is not None else list(req.texts or [])
+    normalized_texts = [text.strip() for text in texts]
+    if any(not text for text in normalized_texts):
+        raise HTTPException(400, detail="prefix-cache text must not be empty")
+
+    if req.clear_existing:
+        await prefix_cache_library.clear()
+
+    created: list[dict[str, Any]] = []
+    existed: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    items: list[dict[str, Any]] = []
+
+    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
+        for text in normalized_texts:
+            key = _prefix_cache_key(config, text)
+
+            try:
+                entry, was_created = await prefix_cache_library.get_or_create(
+                    key=key,
+                    text=text,
+                    config=config,
+                    client=client,
+                )
+            except Exception as exc:
+                logger.error(
+                    "failed to add prefix-cache text=%r key=%s: %s",
+                    text[:100],
+                    key[:8],
+                    exc,
+                )
+                failed_item = {
+                    "status": "failed",
+                    "text": text,
+                    "key": key,
+                    "key_short": key[:8],
+                    "error": str(exc),
+                }
+                failed.append(failed_item)
+                items.append(failed_item)
+                if req.fail_fast:
+                    break
+                continue
+
+            public = {
+                "status": "created" if was_created else "existed",
+                **_prefix_cache_public_item(entry),
+            }
+
+            if was_created:
+                created.append(public)
+            else:
+                existed.append(public)
+            items.append(public)
+
+    return JSONResponse(
+        {
+            "ok": not failed,
+            "created": created,
+            "existed": existed,
+            "failed": failed,
+            "created_count": len(created),
+            "existed_count": len(existed),
+            "failed_count": len(failed),
+            "items": items,
+        }
+    )
+
+
+@app.get("/prefix-cache/stats")
+async def prefix_cache_stats() -> JSONResponse:
+    entries = await prefix_cache_library.list_entries()
+    return JSONResponse(
+        {
+            "ok": True,
+            "entries": len(entries),
+            "max_entries": prefix_cache_library.max_entries,
+            "items": [_prefix_cache_public_item(entry) for entry in entries],
+        }
+    )
+
+
+@app.post("/prefix-cache/clear")
+async def prefix_cache_clear() -> JSONResponse:
+    await prefix_cache_library.clear()
+    return JSONResponse({"ok": True, "message": "prefix cache cleared"})
+
+
+@app.post("/prefix-cache/key")
+async def prefix_cache_key(req: PrefixCacheKeyRequest) -> JSONResponse:
+    config = normalize_config(req.config_text)
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(400, detail="prefix-cache text must not be empty")
+
+    key = _prefix_cache_key(config, text)
+    entry = await prefix_cache_library.get(key)
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "key": key,
+            "key_short": key[:8],
+            "exists": entry is not None,
+            "text": text,
+        }
+    )
 
 
 @app.post("/session/open")
@@ -1703,6 +2228,7 @@ async def session_get(session_id: str) -> JSONResponse:
             "input_closed": rec.input_closed,
             "synthesis_session_id": rec.synthesis_session_id,
             "stateful_synthesis": config.tts.stateful_synthesis,
+            "pending_prefix_cache_text": rec.pending_prefix_cache_text,
             "stream_started": rec.stream_started,
             "stream_finished": rec.stream_finished,
             "commit_history": rec.commit_history[-100:],
@@ -1718,6 +2244,14 @@ async def session_append(session_id: str, req: SessionAppendRequest) -> JSONResp
         raise HTTPException(404, detail="session not found")
 
     config = ProxyConfig.model_validate(rec.config)
+    prefix_cache_text = _resolve_prefix_cache_alias(req.cache, req.cash)
+    prefix_cache_key: str | None = None
+
+    if prefix_cache_text is not None:
+        if not prefix_cache_text:
+            raise HTTPException(400, detail="cache must not be empty")
+
+        prefix_cache_key = _prefix_cache_key(config, prefix_cache_text)
 
     if len(req.text) + len(rec.buffer_text) > config.session.max_buffer_chars:
         raise HTTPException(400, detail="session buffer limit exceeded")
@@ -1725,6 +2259,37 @@ async def session_append(session_id: str, req: SessionAppendRequest) -> JSONResp
     async with rec.lock:
         if rec.input_closed:
             raise HTTPException(409, detail="session input already finished")
+
+        if prefix_cache_text is not None:
+            if rec.next_commit_seq != 1 or rec.commit_history:
+                raise HTTPException(
+                    400,
+                    detail="cache/cash is allowed only before the first commit",
+                )
+
+            if (
+                rec.pending_prefix_cache_text is not None
+                and rec.pending_prefix_cache_text != prefix_cache_text
+            ):
+                raise HTTPException(
+                    400,
+                    detail="a different prefix-cache is already pending for the first commit",
+                )
+
+            prefix_cache_entry = await prefix_cache_library.get(
+                prefix_cache_key or ""
+            )
+            if prefix_cache_entry is None:
+                raise HTTPException(
+                    404,
+                    detail=(
+                        "prefix-cache entry not found for "
+                        f"text={prefix_cache_text!r} key={(prefix_cache_key or '')[:8]}"
+                    ),
+                )
+
+            rec.pending_prefix_cache_text = prefix_cache_entry.text
+            rec.pending_prefix_cache_key = prefix_cache_entry.key
 
         rec.append_chars += len(req.text)
         rec.buffer_text += req.text
@@ -1903,6 +2468,19 @@ async def session_pcm_stream(session_id: str):
     ) -> AsyncGenerator[bytes, None]:
         commit_seq = int(commit_item["seq"])
         is_first_commit = commit_seq == 1
+        has_prefix_cache = is_first_commit and bool(commit_item.get("prefix_cache_text"))
+
+        if has_prefix_cache:
+            async for event in emit_prefix_cache(
+                rec=rec,
+                config=config,
+                client=client,
+                req_id=req_id,
+                commit_item=commit_item,
+            ):
+                yield event
+
+            await asyncio.sleep(0)
 
         effective_target_emit_bytes = (
             config.playback.first_commit_target_emit_bytes
@@ -2000,7 +2578,7 @@ async def session_pcm_stream(session_id: str):
         first_emit_done = False
         start_buffer_bytes = 0
 
-        fade_in_applied = False
+        fade_in_applied = has_prefix_cache
         sample_rate = 0
         channels = 0
         bits_per_sample = 0

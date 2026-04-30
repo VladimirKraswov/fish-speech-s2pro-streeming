@@ -6,7 +6,19 @@ export interface CommitStageConfig {
   allow_partial_after_ms: number;
 }
 
+export interface IntroCacheConfig {
+  enabled: boolean;
+  text: string;
+  max_entries?: number;
+  ttl_sec?: number;
+  warm_on_session_open?: boolean;
+  ignore_errors?: boolean;
+  emit_bytes?: number;
+  pause_after_ms?: number;
+}
+
 export interface ProxyConfig {
+  version?: number;
   commit: {
     first: CommitStageConfig;
     next: CommitStageConfig;
@@ -61,6 +73,7 @@ export interface ProxyConfig {
     max_buffer_chars: number;
     auto_close_on_finish: boolean;
   };
+  intro_cache?: IntroCacheConfig;
 }
 
 export interface SessionOpenResponse {
@@ -170,6 +183,31 @@ export type StreamEvent =
       commit_seq?: number;
       reason?: string;
       message?: string;
+    }
+  | {
+      type: 'intro_context_preloaded';
+      session_id?: string;
+      synthesis_session_id?: string;
+      cache_key?: string;
+      code_frames?: number;
+    }
+  | {
+      type: 'intro_start';
+      session_id?: string;
+      cache_key?: string;
+      text_preview?: string;
+      text_len?: number;
+    }
+  | {
+      type: 'intro_done';
+      session_id?: string;
+      cache_key?: string;
+      pcm_bytes?: number;
+    }
+  | {
+      type: 'intro_error';
+      session_id?: string;
+      message: string;
     }
   | {
       type: 'error';

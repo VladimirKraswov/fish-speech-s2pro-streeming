@@ -5,9 +5,13 @@ import { LLMSimulator, type ChunkMode } from './lib/simulator';
 import type { CommittedItem, ProxyConfig, StreamEvent } from './types';
 import './app.css';
 
-const HOST = window.location.hostname;
-const PROXY_URL = `http://${HOST}:9000`;
-const SERVER_URL = `http://${HOST}:8080`;
+const PROXY_URL =
+  import.meta.env.VITE_FISH_PROXY_URL ||
+  `${window.location.protocol}//${window.location.hostname}:9000`;
+
+const SERVER_URL =
+  import.meta.env.VITE_FISH_SERVER_URL ||
+  `${window.location.protocol}//${window.location.hostname}:8080`;
 
 const DEFAULT_TEXT =
   'Встретил он по дороге Зайчика, Волка и Медведя, спел им свою песенку и убежал от них. Катился дальше Колобок и повстречалась ему Лисичка. Она и говорит: Колобок, Колобок, какая у тебя красивая песенка. А Колобок отвечает: я тебе её сейчас ещё раз спою.';
@@ -162,6 +166,10 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
 }
 
 const PRESETS = {
+  runtime: {
+    title: 'Runtime default',
+    config: {},
+  },
   balanced: {
     title: 'Balanced',
     config: makePresetConfig('balanced'),
@@ -200,8 +208,8 @@ export function App() {
   const [serverHealth, setServerHealth] = useState<Health>(null);
   const [webUiHealth, setWebUiHealth] = useState<Health>(null);
 
-  const [preset, setPreset] = useState<keyof typeof PRESETS>('balanced');
-  const [configText, setConfigText] = useState(jsonPretty(PRESETS.balanced.config));
+  const [preset, setPreset] = useState<keyof typeof PRESETS>('runtime');
+  const [configText, setConfigText] = useState(jsonPretty(PRESETS.runtime.config));
   const [text, setText] = useState(DEFAULT_TEXT);
 
   const [mode, setMode] = useState<ChunkMode>('words');
@@ -244,6 +252,22 @@ export function App() {
 
     if (event.type === 'upstream_reset_failed') {
       log(`upstream synthesis reset FAILED at commit #${event.commit_seq}, reason=${event.reason}: ${event.message}`);
+    }
+
+    if (event.type === 'intro_context_preloaded') {
+      log(`intro context preloaded synthesis=${event.synthesis_session_id?.slice(0, 8)}, key=${event.cache_key?.slice(0, 8)}`);
+    }
+
+    if (event.type === 'intro_start') {
+      log(`intro started, key=${event.cache_key?.slice(0, 8)}, text_len=${event.text_len}`);
+    }
+
+    if (event.type === 'intro_done') {
+      log(`intro finished, pcm_bytes=${event.pcm_bytes}`);
+    }
+
+    if (event.type === 'intro_error') {
+      log(`intro error: ${event.message}`);
     }
 
     if (event.type === 'commit_start') {

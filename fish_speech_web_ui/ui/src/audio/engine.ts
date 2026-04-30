@@ -13,6 +13,7 @@ export class AudioEngine {
 
   private scheduledUntil = 0;
   private started = false;
+  private scheduledOnce = false;
 
   private pendingBuffers: Float32Array[] = [];
   private pendingSamplesCount = 0;
@@ -78,6 +79,7 @@ export class AudioEngine {
     this.meta = null;
     this.scheduledUntil = 0;
     this.started = false;
+    this.scheduledOnce = false;
 
     this.pendingBuffers = [];
     this.pendingSamplesCount = 0;
@@ -311,7 +313,7 @@ export class AudioEngine {
 
     const leadSec = this.scheduledUntil - now;
 
-    if (leadSec < this.criticalLeadSec) {
+    if (this.scheduledOnce && leadSec < this.criticalLeadSec) {
       this.scheduledUntil = now + this.underrunRestartDelaySec;
       this.setStatus('underrun recovery', true);
     }
@@ -352,6 +354,7 @@ export class AudioEngine {
     this.activeSources.add(source);
     source.start(startTime);
 
+    this.scheduledOnce = true;
     this.scheduledUntil = startTime + audioBuffer.duration;
   }
 

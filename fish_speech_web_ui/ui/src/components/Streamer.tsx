@@ -30,9 +30,9 @@ export const Streamer: FunctionalComponent<StreamerProps> = ({
                 <div>
                     <label class="small">Mode</label>
                     <select value={mode} onChange={(e) => setMode((e.target as HTMLSelectElement).value as ChunkMode)}>
-                        <option value="chars">Chars</option>
+                        <option value="tokens">Tokens</option>
                         <option value="words">Words</option>
-                        <option value="sentences">Sentences</option>
+                        <option value="chars">Chars</option>
                     </select>
                 </div>
                 <div>

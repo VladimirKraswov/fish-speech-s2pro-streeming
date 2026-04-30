@@ -61,7 +61,11 @@ PREFIX_CACHE_GENERATION_FADE_IN_MS = int(
     os.getenv("FISH_PREFIX_CACHE_GENERATION_FADE_IN_MS", "6")
 )
 PREFIX_CACHE_FULL_COMMIT_MODE = _env_flag("FISH_PREFIX_CACHE_FULL_COMMIT_MODE", True)
-PREFIX_CACHE_SKIP_ADJUST_MS = int(os.getenv("FISH_PREFIX_CACHE_SKIP_ADJUST_MS", "0"))
+PREFIX_CACHE_SKIP_ADJUST_MS = int(os.getenv("FISH_PREFIX_CACHE_SKIP_ADJUST_MS", "35"))
+PREFIX_CACHE_STRIP_PREFIX_FROM_TEXT = _env_flag(
+    "FISH_PREFIX_CACHE_STRIP_PREFIX_FROM_TEXT",
+    True,
+)
 PREFIX_CACHE_DISABLE_PRELOAD_IN_FULL_COMMIT_MODE = _env_flag(
     "FISH_PREFIX_CACHE_DISABLE_PRELOAD_IN_FULL_COMMIT_MODE",
     True,
@@ -1431,6 +1435,55 @@ def _join_prefix_and_tail(prefix: str, tail: str) -> str:
     if tail[0] in ".,!?;:…)]}»”":
         return prefix + tail
     return f"{prefix} {tail}"
+
+def _compact_ws(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip())
+
+
+def _strip_prefix_cache_overlap(
+    text: str,
+    prefix: str,
+) -> tuple[str, bool, str]:
+    """
+    If the client sends full text together with cache prefix, remove the cached
+    prefix from the text that will be generated live.
+
+    Example:
+      prefix = "Расскажите, как работает"
+      text   = "Расскажите, как работает квантование модели"
+      ->     "квантование модели"
+
+    This prevents cached PCM + live PCM from speaking the same prefix twice.
+    """
+    raw_text = text or ""
+    prefix = (prefix or "").strip()
+
+    if not prefix or not raw_text.strip():
+        return raw_text, False, "empty"
+
+    lstripped = raw_text.lstrip()
+
+    if lstripped.startswith(prefix):
+        return lstripped[len(prefix) :].lstrip(), True, "exact"
+
+    if _compact_ws(lstripped) == _compact_ws(prefix):
+        return "", True, "normalized_exact"
+
+    parts = [part for part in re.split(r"\s+", prefix) if part]
+    if not parts:
+        return raw_text, False, "empty_prefix_parts"
+
+    pattern = (
+        r"^\s*"
+        + r"\s+".join(re.escape(part) for part in parts)
+        + r"(?=$|\s|[.,!?;:…)\]}»”])"
+    )
+    match = re.match(pattern, raw_text, flags=re.UNICODE)
+
+    if match:
+        return raw_text[match.end() :].lstrip(), True, "normalized_prefix"
+
+    return raw_text, False, "no_match"
 
 
 async def _get_prefix_cache_entry_for_commit(
@@ -2912,8 +2965,39 @@ async def session_pcm_stream(session_id: str):
             else config.playback.fade_in_ms
         )
 
-        generation_tail_text = commit_item["text"]
+        original_generation_tail_text = commit_item["text"]
+        generation_tail_text = original_generation_tail_text
         prefix_cache_text = prefix_cache_entry.text if prefix_cache_entry else ""
+
+        prefix_text_stripped = False
+        prefix_text_strip_method = "disabled"
+
+        if (
+            has_prefix_cache
+            and PREFIX_CACHE_STRIP_PREFIX_FROM_TEXT
+            and prefix_cache_text
+        ):
+            (
+                generation_tail_text,
+                prefix_text_stripped,
+                prefix_text_strip_method,
+            ) = _strip_prefix_cache_overlap(
+                generation_tail_text,
+                prefix_cache_text,
+            )
+
+            if prefix_text_stripped:
+                logger.info(
+                    "prefix-cache stripped duplicated prefix from live text "
+                    "session=%s commit_seq=%s method=%s prefix=%r original=%r tail=%r",
+                    rec.session_id[:8],
+                    commit_item["seq"],
+                    prefix_text_strip_method,
+                    prefix_cache_text[:120],
+                    original_generation_tail_text[:180],
+                    generation_tail_text[:180],
+                )
+
         upstream_text = (
             _join_prefix_and_tail(prefix_cache_text, generation_tail_text)
             if full_commit_mode
@@ -3197,8 +3281,15 @@ async def session_pcm_stream(session_id: str):
                 "full_generation_text_len": len(upstream_text),
                 "prefix_cache_text": prefix_cache_text or None,
                 "prefix_cache_text_len": len(prefix_cache_text),
+                "original_generation_tail_text_preview": (
+                    original_generation_tail_text[:180]
+                ),
+                "original_generation_tail_text_len": len(original_generation_tail_text),
                 "generation_tail_text_preview": generation_tail_text[:180],
                 "generation_tail_text_len": len(generation_tail_text),
+                "prefix_cache_strip_enabled": PREFIX_CACHE_STRIP_PREFIX_FROM_TEXT,
+                "prefix_cache_text_stripped_from_generation_tail": prefix_text_stripped,
+                "prefix_cache_text_strip_method": prefix_text_strip_method,
                 "prefix_entry_skip_bytes": (
                     prefix_cache_entry.prefix_audio_skip_bytes
                     if prefix_cache_entry
@@ -3447,7 +3538,9 @@ async def session_pcm_stream(session_id: str):
                         PREFIX_CACHE_GENERATION_FADE_IN_MS
                     ),
                     "prefix_cache_full_commit_mode": PREFIX_CACHE_FULL_COMMIT_MODE,
-                    "prefix_cache_skip_adjust_ms": PREFIX_CACHE_SKIP_ADJUST_MS,
+                    "prefix_cache_strip_prefix_from_text": (
+                        PREFIX_CACHE_STRIP_PREFIX_FROM_TEXT
+                    ),
                     "prefix_cache_disable_preload_in_full_commit_mode": (
                         PREFIX_CACHE_DISABLE_PRELOAD_IN_FULL_COMMIT_MODE
                     ),

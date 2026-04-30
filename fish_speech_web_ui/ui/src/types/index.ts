@@ -132,6 +132,23 @@ export type StreamEvent =
       effective_target_emit_bytes?: number;
       effective_start_buffer_ms?: number;
       server_perf_ms?: number;
+      has_prefix_cache?: boolean;
+      full_commit_mode?: boolean;
+      prefix_cache_preload_context?: boolean;
+      prefix_cache_key?: string;
+      prefix_cache_key_short?: string;
+      prefix_cache_mode?: string;
+      prefix_cache_lookup_method?: string;
+      full_generation_text_preview?: string;
+      full_generation_text_len?: number;
+      prefix_cache_text?: string;
+      prefix_cache_text_len?: number;
+      generation_tail_text_preview?: string;
+      generation_tail_text_len?: number;
+      prefix_entry_skip_bytes?: number;
+      prefix_runtime_skip_adjust_ms?: number;
+      planned_prefix_audio_skip_bytes?: number;
+      prefix_audio_skip_ms_estimate?: number;
     }
   | {
       type: 'pcm';
@@ -140,6 +157,7 @@ export type StreamEvent =
       seq: number;
       data: string;
       first_pcm_for_commit?: boolean;
+      prefix_cache?: boolean;
     }
   | {
       type: 'pause';
@@ -158,6 +176,10 @@ export type StreamEvent =
       pause_ms?: number;
       fade_in_ms?: number;
       fade_out_ms?: number;
+      has_prefix_cache?: boolean;
+      full_commit_mode?: boolean;
+      skipped_prefix_pcm_bytes?: number;
+      upstream_text_len?: number;
     }
   | {
       type: 'session_done';
@@ -214,6 +236,41 @@ export type StreamEvent =
       message: string;
     }
   | {
+      type: 'prefix_cache_start';
+      session_id?: string;
+      req_id?: string;
+      cache_key?: string;
+      cache_key_short?: string;
+      text_preview?: string;
+      text_len?: number;
+      pcm_bytes?: number;
+      cache_mode?: string;
+      boundary_method?: string;
+    }
+  | {
+      type: 'prefix_cache_done';
+      session_id?: string;
+      req_id?: string;
+      cache_key?: string;
+      cache_key_short?: string;
+      pcm_bytes?: number;
+    }
+  | {
+      type: 'prefix_cache_generation_skip_done';
+      session_id?: string;
+      req_id?: string;
+      skipped_pcm_bytes?: number;
+      skipped_ms_estimate?: number;
+    }
+  | {
+      type: 'prefix_cache_context_preloaded';
+      session_id?: string;
+      synthesis_session_id?: string;
+      cache_key?: string;
+      cache_key_short?: string;
+      code_frames?: number;
+    }
+  | {
       type: 'error';
       session_id?: string;
       req_id?: string;
@@ -226,10 +283,14 @@ export interface PrefixCacheItem {
   text: string;
   pcm_bytes: number;
   code_frames: number;
-  audio_meta?: any;
+  audio_meta?: {
+    sample_rate: number;
+    channels: number;
+    sample_width: number;
+  };
   cache_mode: string;
   generation_text?: string;
-  lookahead_text?: string;
+  lookahead_text?: string | null;
   full_pcm_bytes?: number;
   prefix_audio_skip_bytes?: number;
   prefix_cut_adjust_ms?: number;
@@ -238,14 +299,23 @@ export interface PrefixCacheItem {
 
 export interface PrefixCacheStatsResponse {
   ok: boolean;
-  count: number;
-  entries: PrefixCacheItem[];
+  entries: number;
+  max_entries: number;
+  items: PrefixCacheItem[];
 }
 
 export interface PrefixCacheAddResponse {
   ok: boolean;
-  key: string;
-  key_short: string;
-  already_exists: boolean;
-  item: PrefixCacheItem;
+  created: PrefixCacheItem[];
+  existed: PrefixCacheItem[];
+  failed: unknown[];
+  created_count: number;
+  existed_count: number;
+  failed_count: number;
+  items: PrefixCacheItem[];
+}
+
+export interface PrefixCacheClearResponse {
+  ok: boolean;
+  message: string;
 }

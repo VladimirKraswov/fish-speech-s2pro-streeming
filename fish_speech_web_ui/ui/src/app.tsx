@@ -279,6 +279,22 @@ export function App() {
       log(`intro error: ${event.message}`);
     }
 
+    if (event.type === 'prefix_cache_start') {
+      log(`prefix cache start key=${event.cache_key_short}, text_len=${event.text_len}, pcm_bytes=${event.pcm_bytes}, mode=${event.cache_mode}, method=${event.boundary_method}`);
+    }
+
+    if (event.type === 'prefix_cache_done') {
+      log(`prefix cache done key=${event.cache_key_short}, pcm_bytes=${event.pcm_bytes}`);
+    }
+
+    if (event.type === 'prefix_cache_generation_skip_done') {
+      log(`prefix cache skip done: skipped_pcm_bytes=${event.skipped_pcm_bytes}, skipped_ms=${event.skipped_ms_estimate}ms`);
+    }
+
+    if (event.type === 'prefix_cache_context_preloaded') {
+      log(`prefix cache preloaded synth=${event.synthesis_session_id?.slice(0, 8)}, key=${event.cache_key_short ?? event.cache_key?.slice(0, 8)}`);
+    }
+
     if (event.type === 'commit_start') {
       setActiveCommit(event.text_preview || event.text || '');
       log(
@@ -358,7 +374,7 @@ export function App() {
   const refreshPrefixStats = async () => {
     try {
       const stats = await client.current.getPrefixCacheStats();
-      setPrefixCacheList(stats.entries);
+      setPrefixCacheList(stats.items || []);
     } catch (error) {
       log(`failed to fetch prefix stats: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -380,7 +396,15 @@ export function App() {
     setPrefixAdding(true);
     try {
       const resp = await client.current.addPrefixCache(configText, prefixInput);
-      log(`prefix cache added: ${resp.key_short}`);
+      const item = resp.items?.[0] || resp.created?.[0] || resp.existed?.[0];
+
+      if (item) {
+        log(`prefix cache ${resp.created_count ? 'added' : 'exists'}: ${item.key_short}`);
+        setSelectedCache(item);
+        setPrefixInput(item.text);
+      } else {
+        log(`prefix cache add finished, created=${resp.created_count}, existed=${resp.existed_count}, failed=${resp.failed_count}`);
+      }
       await refreshPrefixStats();
     } catch (error) {
       log(`failed to add prefix cache: ${error instanceof Error ? error.message : String(error)}`);
@@ -772,9 +796,12 @@ export function App() {
                 type="text"
                 placeholder="Prefix text to cache..."
                 value={prefixInput}
-                onInput={(e) => setPrefixInput((e.currentTarget as HTMLInputElement).value)}
+                onInput={(e) => {
+                  setPrefixInput((e.currentTarget as HTMLInputElement).value);
+                  setSelectedCache(null);
+                }}
               />
-              <button class="primary" onClick={addPrefixCache} disabled={prefixAdding || !prefixInput}>
+              <button class="primary" onClick={addPrefixCache} disabled={prefixAdding || !prefixInput || !!configError}>
                 {prefixAdding ? 'Adding...' : 'Add cache'}
               </button>
             </div>

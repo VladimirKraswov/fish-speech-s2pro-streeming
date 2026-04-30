@@ -3,6 +3,7 @@ import type {
   SessionAppendResponse,
   PrefixCacheStatsResponse,
   PrefixCacheAddResponse,
+  PrefixCacheClearResponse,
 } from '../types';
 
 async function readError(resp: Response): Promise<string> {
@@ -108,7 +109,7 @@ export class FishProxyClient {
     return resp.json();
   }
 
-  async clearPrefixCache(): Promise<{ ok: boolean; count: number }> {
+  async clearPrefixCache(): Promise<PrefixCacheClearResponse> {
     const resp = await fetch(`${this.baseUrl}/prefix-cache/clear`, {
       method: 'POST',
     });

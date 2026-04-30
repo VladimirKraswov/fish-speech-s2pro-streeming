@@ -123,6 +123,7 @@ class SessionAppendRequest(BaseModel):
     source_ts_ms: int | None = None
     cache: str | None = Field(None, min_length=1, max_length=4000)
     cash: str | None = Field(None, min_length=1, max_length=4000)
+    cache_key: str | None = Field(None, min_length=1, max_length=128)
 
 
 class PrefixCacheAddRequest(BaseModel):
@@ -268,7 +269,7 @@ class PrefixCacheLibrary:
     def __init__(self, *, max_entries: int = PREFIX_CACHE_MAX_ENTRIES) -> None:
         self.max_entries = max_entries
         self._items: dict[str, PrefixCacheEntry] = {}
-        self._text_to_key: dict[str, str] = {}
+        self._text_to_keys: dict[str, list[str]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._lock = asyncio.Lock()
 
@@ -276,13 +277,10 @@ class PrefixCacheLibrary:
         async with self._lock:
             return self._items.get(key)
 
-    async def get_by_text(self, text: str) -> PrefixCacheEntry | None:
+    async def get_keys_by_text(self, text: str) -> list[str]:
         prefix_text = text.strip()
         async with self._lock:
-            key = self._text_to_key.get(prefix_text)
-            if key is None:
-                return None
-            return self._items.get(key)
+            return list(self._text_to_keys.get(prefix_text) or [])
 
     async def get_or_create(
         self,
@@ -329,18 +327,30 @@ class PrefixCacheLibrary:
                     old_entry = self._items.pop(oldest_key, None)
                     self._locks.pop(oldest_key, None)
 
-                    # Remove from text index if it's the same key
-                    if old_entry and self._text_to_key.get(old_entry.text.strip()) == oldest_key:
-                        self._text_to_key.pop(old_entry.text.strip(), None)
+                    if old_entry:
+                        old_text = old_entry.text.strip()
+                        if old_text in self._text_to_keys:
+                            try:
+                                self._text_to_keys[old_text].remove(oldest_key)
+                                if not self._text_to_keys[old_text]:
+                                    del self._text_to_keys[old_text]
+                            except ValueError:
+                                pass
 
                 self._items[key] = entry
-                self._text_to_key[text.strip()] = key
+                normalized_text = text.strip()
+                if normalized_text not in self._text_to_keys:
+                    self._text_to_keys[normalized_text] = []
+
+                if key not in self._text_to_keys[normalized_text]:
+                    self._text_to_keys[normalized_text].append(key)
+
                 return entry, True
 
     async def clear(self) -> None:
         async with self._lock:
             self._items.clear()
-            self._text_to_key.clear()
+            self._text_to_keys.clear()
             self._locks.clear()
             logger.info("prefix cache cleared")
 
@@ -372,6 +382,7 @@ class SessionRecord:
     prefix_preloaded_cache_key: str | None = None
     pending_prefix_cache_text: str | None = None
     pending_prefix_cache_key: str | None = None
+    pending_prefix_cache_lookup_method: str | None = None
     audio_meta: dict[str, Any] | None = None
     stream_started: bool = False
     stream_finished: bool = False
@@ -1495,6 +1506,14 @@ async def emit_prefix_cache(
 
     commit_seq = int(commit_item["seq"])
     preloaded = False
+
+    if preload_context and entry.cache_mode == "lookahead":
+        logger.warning(
+            "lookahead prefix-cache entry cannot preload standalone codes safely, "
+            "forcing preload_context=False"
+        )
+        preload_context = False
+
     if preload_context:
         preloaded = await _preload_intro_cache_context(
             rec=rec,
@@ -2170,8 +2189,10 @@ async def _queue_commits(
         if seq == 1 and rec.pending_prefix_cache_text:
             item["prefix_cache_text"] = rec.pending_prefix_cache_text
             item["prefix_cache_key"] = rec.pending_prefix_cache_key
+            item["prefix_cache_lookup_method"] = rec.pending_prefix_cache_lookup_method
             rec.pending_prefix_cache_text = None
             rec.pending_prefix_cache_key = None
+            rec.pending_prefix_cache_lookup_method = None
 
         rec.commit_history.append(item)
         await rec.commit_queue.put({"type": "commit", **item})
@@ -2272,6 +2293,20 @@ async def prefix_cache_add(req: PrefixCacheAddRequest) -> JSONResponse:
             400,
             detail="lookahead_text/full_text are not supported with multiple texts",
         )
+
+    if req.lookahead_text and req.full_text:
+        raise HTTPException(
+            400,
+            detail="provide either lookahead_text or full_text, not both",
+        )
+
+    if req.full_text:
+        prefix = (req.text or "").strip()
+        if not req.full_text.strip().startswith(prefix):
+            raise HTTPException(
+                400,
+                detail="full_text must start with prefix text",
+            )
 
     texts = [req.text] if req.text is not None else list(req.texts or [])
     normalized_texts = [text.strip() for text in texts]
@@ -2541,11 +2576,12 @@ async def session_append(session_id: str, req: SessionAppendRequest) -> JSONResp
     prefix_cache_text = _resolve_prefix_cache_alias(req.cache, req.cash)
     prefix_cache_key: str | None = None
 
-    if prefix_cache_text is not None:
-        if not prefix_cache_text:
+    if prefix_cache_text is not None or req.cache_key:
+        if prefix_cache_text is not None and not prefix_cache_text:
             raise HTTPException(400, detail="cache must not be empty")
 
-        prefix_cache_key = _prefix_cache_key(config, prefix_cache_text)
+        if prefix_cache_text is not None:
+            prefix_cache_key = _prefix_cache_key(config, prefix_cache_text)
 
     if len(req.text) + len(rec.buffer_text) > config.session.max_buffer_chars:
         raise HTTPException(400, detail="session buffer limit exceeded")
@@ -2554,7 +2590,7 @@ async def session_append(session_id: str, req: SessionAppendRequest) -> JSONResp
         if rec.input_closed:
             raise HTTPException(409, detail="session input already finished")
 
-        if prefix_cache_text is not None:
+        if prefix_cache_text is not None or req.cache_key:
             if rec.next_commit_seq != 1 or rec.commit_history:
                 raise HTTPException(
                     400,
@@ -2570,19 +2606,52 @@ async def session_append(session_id: str, req: SessionAppendRequest) -> JSONResp
                     detail="a different prefix-cache is already pending for the first commit",
                 )
 
-            prefix_cache_entry = await prefix_cache_library.get(prefix_cache_key or "")
+            prefix_cache_entry = None
+            lookup_method = "none"
 
-            if prefix_cache_entry is None:
-                prefix_cache_entry = await prefix_cache_library.get_by_text(
-                    prefix_cache_text
+            if req.cache_key:
+                prefix_cache_entry = await prefix_cache_library.get(req.cache_key)
+                if prefix_cache_entry is None:
+                    raise HTTPException(
+                        404,
+                        detail=f"prefix-cache entry not found for key={req.cache_key[:8]}",
+                    )
+
+                if prefix_cache_text is not None:
+                    if prefix_cache_entry.text.strip() != prefix_cache_text.strip():
+                        raise HTTPException(
+                            400,
+                            detail=(
+                                f"prefix-cache text mismatch: key={req.cache_key[:8]} "
+                                f"expected={prefix_cache_entry.text[:50]!r} "
+                                f"provided={prefix_cache_text[:50]!r}"
+                            ),
+                        )
+                else:
+                    prefix_cache_text = prefix_cache_entry.text
+
+                lookup_method = "exact_key"
+            else:
+                prefix_cache_entry = await prefix_cache_library.get(
+                    prefix_cache_key or ""
                 )
                 if prefix_cache_entry:
-                    logger.warning(
-                        "prefix-cache exact key match failed, but found entry by text index "
-                        "text=%r key=%s",
-                        prefix_cache_text[:100],
-                        prefix_cache_entry.key[:8],
+                    lookup_method = "config_key_match"
+                else:
+                    keys = await prefix_cache_library.get_keys_by_text(
+                        prefix_cache_text
                     )
+                    if len(keys) > 1:
+                        raise HTTPException(
+                            409,
+                            detail=(
+                                f"ambiguous prefix-cache for text={prefix_cache_text[:50]!r}: "
+                                f"found {len(keys)} entries. Please provide explicit cache_key."
+                            ),
+                        )
+                    if len(keys) == 1:
+                        prefix_cache_entry = await prefix_cache_library.get(keys[0])
+                        lookup_method = "unique_text_fallback"
 
             if prefix_cache_entry is None:
                 raise HTTPException(
@@ -2595,6 +2664,7 @@ async def session_append(session_id: str, req: SessionAppendRequest) -> JSONResp
 
             rec.pending_prefix_cache_text = prefix_cache_entry.text
             rec.pending_prefix_cache_key = prefix_cache_entry.key
+            rec.pending_prefix_cache_lookup_method = lookup_method
 
         rec.append_chars += len(req.text)
         rec.buffer_text += req.text
@@ -3093,6 +3163,10 @@ async def session_pcm_stream(session_id: str):
                 "prefix_cache_key_short": (
                     prefix_cache_entry.key[:8] if prefix_cache_entry else None
                 ),
+                "prefix_cache_mode": (
+                    prefix_cache_entry.cache_mode if prefix_cache_entry else None
+                ),
+                "prefix_cache_lookup_method": commit_item.get("prefix_cache_lookup_method"),
                 "full_generation_text_preview": upstream_text[:180],
                 "full_generation_text_len": len(upstream_text),
                 "prefix_cache_text": prefix_cache_text or None,

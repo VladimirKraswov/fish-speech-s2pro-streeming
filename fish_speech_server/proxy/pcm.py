@@ -141,6 +141,9 @@ class PrefixCacheKeyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     config_text: str = Field(..., min_length=2, max_length=100_000)
     text: str = Field(..., min_length=1, max_length=4000)
+    lookahead_text: str | None = Field(None, min_length=1, max_length=4000)
+    full_text: str | None = Field(None, min_length=1, max_length=8000)
+    prefix_cut_adjust_ms: int = Field(0, ge=-1000, le=1000)
 
 
 class SessionFlushRequest(BaseModel):
@@ -265,11 +268,20 @@ class PrefixCacheLibrary:
     def __init__(self, *, max_entries: int = PREFIX_CACHE_MAX_ENTRIES) -> None:
         self.max_entries = max_entries
         self._items: dict[str, PrefixCacheEntry] = {}
+        self._text_to_key: dict[str, str] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._lock = asyncio.Lock()
 
     async def get(self, key: str) -> PrefixCacheEntry | None:
         async with self._lock:
+            return self._items.get(key)
+
+    async def get_by_text(self, text: str) -> PrefixCacheEntry | None:
+        prefix_text = text.strip()
+        async with self._lock:
+            key = self._text_to_key.get(prefix_text)
+            if key is None:
+                return None
             return self._items.get(key)
 
     async def get_or_create(
@@ -314,15 +326,21 @@ class PrefixCacheLibrary:
                         self._items.keys(),
                         key=lambda k: self._items[k].created_at,
                     )
-                    self._items.pop(oldest_key, None)
+                    old_entry = self._items.pop(oldest_key, None)
                     self._locks.pop(oldest_key, None)
 
+                    # Remove from text index if it's the same key
+                    if old_entry and self._text_to_key.get(old_entry.text.strip()) == oldest_key:
+                        self._text_to_key.pop(old_entry.text.strip(), None)
+
                 self._items[key] = entry
+                self._text_to_key[text.strip()] = key
                 return entry, True
 
     async def clear(self) -> None:
         async with self._lock:
             self._items.clear()
+            self._text_to_key.clear()
             self._locks.clear()
             logger.info("prefix cache cleared")
 
@@ -884,7 +902,13 @@ def _intro_cache_key(config: ProxyConfig) -> str:
     return hashlib.sha256(dump.encode("utf-8")).hexdigest()
 
 
-def _prefix_cache_key(config: ProxyConfig, text: str) -> str:
+def _prefix_cache_key(
+    config: ProxyConfig,
+    text: str,
+    lookahead_text: str | None = None,
+    full_text: str | None = None,
+    prefix_cut_adjust_ms: int = 0,
+) -> str:
     tts = config.tts
     prefix_text = text.strip()
 
@@ -902,6 +926,9 @@ def _prefix_cache_key(config: ProxyConfig, text: str) -> str:
         "model_compile": _RUNTIME.model.compile,
         "upstream_url": UPSTREAM_TTS_URL,
         "prefix_text": prefix_text,
+        "lookahead_text": lookahead_text.strip() if lookahead_text else None,
+        "full_text": full_text.strip() if full_text else None,
+        "prefix_cut_adjust_ms": prefix_cut_adjust_ms,
         "reference_id": _normalized_reference_id(config),
         "format": "wav",
         "seed": tts.seed,
@@ -1519,6 +1546,12 @@ async def emit_prefix_cache(
             "preload_context": preload_context,
             "pause_after_ms": PREFIX_CACHE_PAUSE_AFTER_MS,
             "fade_out_ms": PREFIX_CACHE_FADE_OUT_MS,
+            "cache_mode": entry.cache_mode,
+            "generation_text_preview": (entry.generation_text or entry.text)[:180],
+            "full_pcm_bytes": entry.full_pcm_bytes,
+            "prefix_audio_skip_bytes": entry.prefix_audio_skip_bytes,
+            "prefix_cut_adjust_ms": entry.prefix_cut_adjust_ms,
+            "boundary_method": entry.boundary_method,
         }
     )
 
@@ -2234,6 +2267,12 @@ async def prefix_cache_add(req: PrefixCacheAddRequest) -> JSONResponse:
     if req.text is None and req.texts is None:
         raise HTTPException(400, detail="provide text or texts")
 
+    if req.texts is not None and (req.lookahead_text or req.full_text):
+        raise HTTPException(
+            400,
+            detail="lookahead_text/full_text are not supported with multiple texts",
+        )
+
     texts = [req.text] if req.text is not None else list(req.texts or [])
     normalized_texts = [text.strip() for text in texts]
     if any(not text for text in normalized_texts):
@@ -2249,7 +2288,13 @@ async def prefix_cache_add(req: PrefixCacheAddRequest) -> JSONResponse:
 
     async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
         for text in normalized_texts:
-            key = _prefix_cache_key(config, text)
+            key = _prefix_cache_key(
+                config,
+                text,
+                lookahead_text=req.lookahead_text,
+                full_text=req.full_text,
+                prefix_cut_adjust_ms=req.prefix_cut_adjust_ms,
+            )
 
             try:
                 entry, was_created = await prefix_cache_library.get_or_create(
@@ -2257,6 +2302,9 @@ async def prefix_cache_add(req: PrefixCacheAddRequest) -> JSONResponse:
                     text=text,
                     config=config,
                     client=client,
+                    lookahead_text=req.lookahead_text,
+                    full_text=req.full_text,
+                    prefix_cut_adjust_ms=req.prefix_cut_adjust_ms,
                 )
             except Exception as exc:
                 logger.error(
@@ -2329,7 +2377,13 @@ async def prefix_cache_key(req: PrefixCacheKeyRequest) -> JSONResponse:
     if not text:
         raise HTTPException(400, detail="prefix-cache text must not be empty")
 
-    key = _prefix_cache_key(config, text)
+    key = _prefix_cache_key(
+        config,
+        text,
+        lookahead_text=req.lookahead_text,
+        full_text=req.full_text,
+        prefix_cut_adjust_ms=req.prefix_cut_adjust_ms,
+    )
     entry = await prefix_cache_library.get(key)
 
     return JSONResponse(
@@ -2517,6 +2571,19 @@ async def session_append(session_id: str, req: SessionAppendRequest) -> JSONResp
                 )
 
             prefix_cache_entry = await prefix_cache_library.get(prefix_cache_key or "")
+
+            if prefix_cache_entry is None:
+                prefix_cache_entry = await prefix_cache_library.get_by_text(
+                    prefix_cache_text
+                )
+                if prefix_cache_entry:
+                    logger.warning(
+                        "prefix-cache exact key match failed, but found entry by text index "
+                        "text=%r key=%s",
+                        prefix_cache_text[:100],
+                        prefix_cache_entry.key[:8],
+                    )
+
             if prefix_cache_entry is None:
                 raise HTTPException(
                     404,
@@ -2760,21 +2827,25 @@ async def session_pcm_stream(session_id: str):
         prefix_audio_skip_ms_estimate = 0.0
 
         if full_commit_mode and prefix_cache_entry is not None:
+            # prefix_cache_full_commit mode: skip part of the upstream generation
             meta = prefix_cache_entry.audio_meta
             meta_sample_rate = int(meta["sample_rate"])
             meta_channels = int(meta["channels"])
             meta_sample_width = int(meta["sample_width"])
             meta_frame_bytes = meta_channels * meta_sample_width
+
+            if prefix_cache_entry.prefix_audio_skip_bytes is not None:
+                base_skip = prefix_cache_entry.prefix_audio_skip_bytes
+            else:
+                base_skip = len(prefix_cache_entry.pcm)
+
             adjust_bytes = _pcm_bytes_for_duration_ms_allow_negative(
                 meta_sample_rate,
                 meta_channels,
                 meta_sample_width * 8,
                 PREFIX_CACHE_SKIP_ADJUST_MS,
             )
-            planned_prefix_audio_skip_bytes = max(
-                0,
-                len(prefix_cache_entry.pcm) + adjust_bytes,
-            )
+            planned_prefix_audio_skip_bytes = max(0, base_skip + adjust_bytes)
             planned_prefix_audio_skip_bytes = _align_down(
                 planned_prefix_audio_skip_bytes,
                 meta_frame_bytes,
@@ -2989,6 +3060,8 @@ async def session_pcm_stream(session_id: str):
                             channels=channels,
                             sample_width=bits_per_sample // 8,
                         ),
+                        "expected_skip_bytes": planned_prefix_audio_skip_bytes,
+                        "planned_prefix_audio_skip_bytes": planned_prefix_audio_skip_bytes,
                     }
                 )
                 await asyncio.sleep(0)
@@ -3026,10 +3099,14 @@ async def session_pcm_stream(session_id: str):
                 "prefix_cache_text_len": len(prefix_cache_text),
                 "generation_tail_text_preview": generation_tail_text[:180],
                 "generation_tail_text_len": len(generation_tail_text),
+                "prefix_entry_skip_bytes": (
+                    prefix_cache_entry.prefix_audio_skip_bytes
+                    if prefix_cache_entry
+                    else None
+                ),
+                "prefix_runtime_skip_adjust_ms": PREFIX_CACHE_SKIP_ADJUST_MS,
                 "planned_prefix_audio_skip_bytes": planned_prefix_audio_skip_bytes,
-                "prefix_audio_skip_bytes": planned_prefix_audio_skip_bytes,
                 "prefix_audio_skip_ms_estimate": prefix_audio_skip_ms_estimate,
-                "prefix_audio_skip_adjust_ms": PREFIX_CACHE_SKIP_ADJUST_MS,
                 "server_perf_ms": int(time.perf_counter() * 1000),
             }
         )

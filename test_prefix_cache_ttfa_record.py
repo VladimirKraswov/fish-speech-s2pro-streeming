@@ -14,11 +14,8 @@ from typing import Any
 import httpx
 
 
-FULL_TEXT = "Что такое нейросети и какие виды вы знаете?"
-PREFIX_TEXT = "Что такое"
-TAIL_TEXT = "нейросети и какие виды вы знаете?"
-
-PRIMARY_METRIC = "append_sent_to_first_pcm"
+DEFAULT_PREFIX_TEXT = "Что такое"
+DEFAULT_TAIL_TEXT = "нейросети и какие виды вы знаете?"
 
 
 def deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
@@ -36,6 +33,7 @@ def build_config(reference_id: str, *, extreme: bool = False) -> str:
         "tts": {
             "reference_id": reference_id,
             "stateful_synthesis": True,
+            "stateful_fallback_to_stateless": False,
             "stream_tokens": True,
         },
         "intro_cache": {
@@ -95,8 +93,14 @@ class RunCapture:
     prefix_cache_pcm_bytes: int = 0
     generation_pcm_bytes: int = 0
 
+    event_counts: dict[str, int] = field(default_factory=dict)
+    errors: list[dict[str, Any]] = field(default_factory=list)
+
     def mark_once(self, name: str, ts: float) -> None:
         self.timestamps.setdefault(name, ts)
+
+    def count_event(self, event_type: str) -> None:
+        self.event_counts[event_type] = self.event_counts.get(event_type, 0) + 1
 
 
 def ms_between(start: float | None, end: float | None) -> float | None:
@@ -125,7 +129,9 @@ async def post_json(
     elapsed_ms = (time.perf_counter() - start) * 1000.0
 
     if resp.status_code >= 400:
-        raise RuntimeError(f"{path} failed status={resp.status_code}: {resp.text}")
+        raise RuntimeError(
+            f"{path} failed status={resp.status_code}: {resp.text}"
+        )
 
     return resp.json(), elapsed_ms
 
@@ -154,10 +160,13 @@ async def collect_events(
 
                 now = time.perf_counter()
                 event = json.loads(line)
+                event["_client_received_perf"] = now
+
                 f.write(json.dumps(event, ensure_ascii=False) + "\n")
                 f.flush()
 
-                event_type = event.get("type")
+                event_type = event.get("type") or "unknown"
+                capture.count_event(event_type)
 
                 if event_type == "session_start":
                     capture.mark_once("session_start", now)
@@ -189,7 +198,7 @@ async def collect_events(
                     capture.mark_once("session_done", now)
 
                 elif event_type in {"error", "intro_error", "upstream_reset_failed"}:
-                    capture.mark_once(f"error_{event_type}", now)
+                    capture.errors.append(event)
 
                 if event_type != "pcm":
                     continue
@@ -198,7 +207,6 @@ async def collect_events(
                 if not chunk:
                     continue
 
-                # Главная точка: первый любой звук, который пользователь может услышать.
                 capture.mark_once("first_pcm", now)
 
                 capture.combined_pcm.extend(chunk)
@@ -226,6 +234,14 @@ async def run_variant(
     run_dir = out_dir / name
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    files = {
+        "events_ndjson": str(run_dir / "events.ndjson"),
+        "metrics_json": str(run_dir / "metrics.json"),
+        "prefix_cache_wav": str(run_dir / "prefix_cache.wav"),
+        "generation_wav": str(run_dir / "generation.wav"),
+        "combined_wav": str(run_dir / "combined.wav"),
+    }
+
     open_data, session_open_http = await post_json(
         client,
         "/session/open",
@@ -252,7 +268,6 @@ async def run_variant(
     )
 
     append_sent = time.perf_counter()
-    capture.mark_once("append_sent", append_sent)
 
     append_data, append_http = await post_json(
         client,
@@ -271,30 +286,50 @@ async def run_variant(
     if capture.audio_meta is None:
         raise RuntimeError(f"{name}: stream did not emit audio meta")
 
-    prefix_wav = run_dir / "prefix_cache.wav"
-    generation_wav = run_dir / "generation.wav"
-    combined_wav = run_dir / "combined.wav"
-
-    # Создаём все WAV всегда, чтобы структура run была одинаковой.
-    write_wav(prefix_wav, bytes(capture.prefix_pcm), capture.audio_meta)
-    write_wav(generation_wav, bytes(capture.generation_pcm), capture.audio_meta)
-    write_wav(combined_wav, bytes(capture.combined_pcm), capture.audio_meta)
+    write_wav(
+        run_dir / "prefix_cache.wav",
+        bytes(capture.prefix_pcm),
+        capture.audio_meta,
+    )
+    write_wav(
+        run_dir / "generation.wav",
+        bytes(capture.generation_pcm),
+        capture.audio_meta,
+    )
+    write_wav(
+        run_dir / "combined.wav",
+        bytes(capture.combined_pcm),
+        capture.audio_meta,
+    )
 
     timestamps = capture.timestamps
 
-    append_sent_to_first_pcm = ms_between(
-        timestamps.get("append_sent"),
-        timestamps.get("first_pcm"),
-    )
+    metrics = {
+        "run": name,
+        "session_id": session_id,
+        "synthesis_session_id": open_data.get("synthesis_session_id"),
+        "append_payload": append_payload,
+        "append_response": append_data,
+        "finish_response": finish_data,
+        "files": files,
+        "event_counts": capture.event_counts,
+        "errors": capture.errors,
+        "audio_meta": capture.audio_meta,
 
-    key_metrics = {
-        # ОСНОВНАЯ МЕТРИКА ПОЛЬЗОВАТЕЛЬСКОГО TTFA.
-        "append_sent_to_first_pcm": append_sent_to_first_pcm,
-
+        # HTTP timings.
         "session_open_http": round(session_open_http, 2),
         "append_http": round(append_http, 2),
         "finish_http": round(finish_http, 2),
 
+        # PRIMARY USER TTFA.
+        # Это главная пользовательская метрика:
+        # от отправки /append до первого PCM, который реально можно проигрывать.
+        "append_sent_to_first_pcm": ms_between(
+            append_sent,
+            timestamps.get("first_pcm"),
+        ),
+
+        # Additional timing metrics.
         "session_start_to_first_pcm": ms_between(
             timestamps.get("session_start"),
             timestamps.get("first_pcm"),
@@ -312,67 +347,25 @@ async def run_variant(
             timestamps.get("first_gen_pcm"),
         ),
         "append_sent_to_first_gen_pcm": ms_between(
-            timestamps.get("append_sent"),
+            append_sent,
             timestamps.get("first_gen_pcm"),
         ),
         "append_sent_to_session_done": ms_between(
-            timestamps.get("append_sent"),
+            append_sent,
             timestamps.get("session_done"),
         ),
+        "commit1_start_to_commit1_done": ms_between(
+            timestamps.get("commit1_start"),
+            timestamps.get("commit1_done"),
+        ),
 
+        # Audio sizes.
         "total_pcm_bytes": capture.total_pcm_bytes,
         "prefix_cache_pcm_bytes": capture.prefix_cache_pcm_bytes,
         "generation_pcm_bytes": capture.generation_pcm_bytes,
-    }
 
-    metrics = {
-        "run": name,
-        "session_id": session_id,
-        "synthesis_session_id": open_data.get("synthesis_session_id"),
-
-        "primary_metric": {
-            "name": PRIMARY_METRIC,
-            "value_ms": append_sent_to_first_pcm,
-            "meaning": (
-                "Главный пользовательский TTFA: время от отправки /append "
-                "до первого PCM-аудио любого типа, то есть до первого звука."
-            ),
-        },
-
-        "key_metrics": key_metrics,
-
-        # Дублируем наверх для удобного grep/jq.
-        "append_sent_to_first_pcm": append_sent_to_first_pcm,
-
-        "http": {
-            "session_open_http": round(session_open_http, 2),
-            "append_http": round(append_http, 2),
-            "finish_http": round(finish_http, 2),
-        },
-
-        "payloads": {
-            "append_payload": append_payload,
-            "append_response": append_data,
-            "finish_response": finish_data,
-        },
-
-        "timestamps_present": sorted(timestamps.keys()),
-
-        "bytes": {
-            "total_pcm_bytes": capture.total_pcm_bytes,
-            "prefix_cache_pcm_bytes": capture.prefix_cache_pcm_bytes,
-            "generation_pcm_bytes": capture.generation_pcm_bytes,
-        },
-
-        "audio_meta": capture.audio_meta,
-
-        "files": {
-            "events_ndjson": str(run_dir / "events.ndjson"),
-            "metrics_json": str(run_dir / "metrics.json"),
-            "prefix_cache_wav": str(prefix_wav),
-            "generation_wav": str(generation_wav),
-            "combined_wav": str(combined_wav),
-        },
+        # Raw marks for debugging.
+        "marks_available": sorted(timestamps.keys()),
     }
 
     (run_dir / "metrics.json").write_text(
@@ -383,25 +376,27 @@ async def run_variant(
     return metrics
 
 
-def print_primary_summary(summary: dict[str, Any]) -> None:
+def print_key_metrics(summary: dict[str, Any]) -> None:
     runs = summary["runs"]
 
-    print("\n" + "=" * 88)
+    print()
+    print("=" * 88)
     print("ГЛАВНАЯ МЕТРИКА ПОЛЬЗОВАТЕЛЬСКОГО TTFA")
     print("=" * 88)
-    print(f"{PRIMARY_METRIC} = время от отправки /append до первого PCM-аудио")
+    print("append_sent_to_first_pcm = время от отправки /append до первого PCM-аудио")
     print("-" * 88)
 
     for run in runs:
         value = run.get("append_sent_to_first_pcm")
-        print(f"{run['run']:28s} | {PRIMARY_METRIC:30s} | {str(value):>10s} ms")
+        value_str = "None" if value is None else f"{value:.2f} ms"
+        print(f"{run['run']:30s} | append_sent_to_first_pcm | {value_str:>14s}")
 
     print("=" * 88)
-
-    print("\nKEY METRICS")
+    print()
+    print("KEY METRICS")
     print("-" * 88)
 
-    metric_order = [
+    metric_names = [
         "append_sent_to_first_pcm",
         "session_open_http",
         "append_http",
@@ -418,25 +413,35 @@ def print_primary_summary(summary: dict[str, Any]) -> None:
     ]
 
     for run in runs:
-        print(f"\n[{run['run']}]")
-        km = run["key_metrics"]
+        print()
+        print(f"[{run['run']}]")
 
-        for metric in metric_order:
-            value = km.get(metric)
-            marker = ">>> " if metric == PRIMARY_METRIC else "    "
-            suffix = "  <-- PRIMARY USER TTFA" if metric == PRIMARY_METRIC else ""
-            print(f"{marker}{metric:42s}: {value}{suffix}")
+        for key in metric_names:
+            value = run.get(key)
+            if key == "append_sent_to_first_pcm":
+                print(f">>> {key:42s}: {value}  <-- PRIMARY USER TTFA")
+            else:
+                print(f"    {key:42s}: {value}")
 
+        files = run["files"]
         print("    files:")
-        print(f"      events:       {run['files']['events_ndjson']}")
-        print(f"      metrics:      {run['files']['metrics_json']}")
-        print(f"      prefix_cache: {run['files']['prefix_cache_wav']}")
-        print(f"      generation:   {run['files']['generation_wav']}")
-        print(f"      combined:     {run['files']['combined_wav']}")
+        print(f"      events:       {files['events_ndjson']}")
+        print(f"      metrics:      {files['metrics_json']}")
+        print(f"      prefix_cache: {files['prefix_cache_wav']}")
+        print(f"      generation:   {files['generation_wav']}")
+        print(f"      combined:     {files['combined_wav']}")
+
+    print()
+    print("summary_metrics.json:")
+    print(summary["summary_metrics_json"])
 
 
 async def async_main(args: argparse.Namespace) -> int:
     out_dir = args.out_dir / datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    prefix_text = args.prefix_text
+    tail_text = args.tail_text
+    full_text = args.full_text or f"{prefix_text} {tail_text}"
 
     normal_config_text = build_config(args.reference_id, extreme=False)
     extreme_config_text = build_config(args.reference_id, extreme=True)
@@ -450,7 +455,7 @@ async def async_main(args: argparse.Namespace) -> int:
             "/prefix-cache/add",
             {
                 "config_text": normal_config_text,
-                "texts": [PREFIX_TEXT],
+                "texts": [prefix_text],
                 "clear_existing": args.clear_existing,
                 "fail_fast": True,
             },
@@ -469,7 +474,7 @@ async def async_main(args: argparse.Namespace) -> int:
                 client,
                 name="no_cache_extreme_ttfa",
                 config_text=extreme_config_text,
-                append_payload={"text": FULL_TEXT},
+                append_payload={"text": full_text},
                 out_dir=out_dir,
                 stream_ready_timeout_sec=args.stream_ready_timeout_sec,
             )
@@ -480,7 +485,7 @@ async def async_main(args: argparse.Namespace) -> int:
                 client,
                 name="no_cache_normal_ttfa",
                 config_text=normal_config_text,
-                append_payload={"text": FULL_TEXT},
+                append_payload={"text": full_text},
                 out_dir=out_dir,
                 stream_ready_timeout_sec=args.stream_ready_timeout_sec,
             )
@@ -491,74 +496,65 @@ async def async_main(args: argparse.Namespace) -> int:
                 client,
                 name="prefix_cache",
                 config_text=normal_config_text,
-                append_payload={"cache": PREFIX_TEXT, "text": TAIL_TEXT},
+                append_payload={
+                    "cache": prefix_text,
+                    "text": tail_text,
+                },
                 out_dir=out_dir,
                 stream_ready_timeout_sec=args.stream_ready_timeout_sec,
             )
         )
 
+    summary_path = out_dir / "summary_metrics.json"
+
     summary = {
         "out_dir": str(out_dir),
-
-        "primary_metric": {
-            "name": PRIMARY_METRIC,
-            "meaning": (
-                "Главный пользовательский TTFA: время от отправки /append "
-                "до первого PCM-аудио любого типа."
-            ),
-        },
-
-        "prefix_cache_add": {
-            "http_ms": round(prefix_cache_add_http, 2),
-            "response": add_data,
-        },
-
-        "full_text": FULL_TEXT,
-        "prefix_cache": PREFIX_TEXT,
-        "tail": TAIL_TEXT,
-
+        "summary_metrics_json": str(summary_path),
+        "base_url": args.base_url,
+        "reference_id": args.reference_id,
+        "full_text": full_text,
+        "prefix_cache": prefix_text,
+        "tail": tail_text,
+        "prefix_cache_add_http": round(prefix_cache_add_http, 2),
+        "prefix_cache_add_response": add_data,
         "runs": metrics,
     }
 
-    (out_dir / "summary_metrics.json").write_text(
+    summary_path.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
 
-    print_primary_summary(summary)
-
-    print("\nsummary_metrics.json:")
-    print(out_dir / "summary_metrics.json")
-
+    print_key_metrics(summary)
     return 0
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Record TTFA and WAV artifacts for explicit prefix-cache sessions."
+        description=(
+            "Record user TTFA and WAV artifacts for explicit prefix-cache sessions."
+        )
     )
-
     parser.add_argument("--base-url", default="http://127.0.0.1:9000")
     parser.add_argument("--reference-id", default="voice")
-
+    parser.add_argument("--prefix-text", default=DEFAULT_PREFIX_TEXT)
+    parser.add_argument("--tail-text", default=DEFAULT_TAIL_TEXT)
+    parser.add_argument("--full-text", default=None)
     parser.add_argument(
         "--out-dir",
         type=Path,
         default=Path("prefix_cache_ttfa_runs"),
     )
-
     parser.add_argument(
         "--stream-ready-timeout-sec",
         type=float,
         default=10.0,
     )
-
     parser.add_argument(
         "--clear-existing",
         action="store_true",
         help="Clear in-memory prefix-cache before adding the test prefix.",
     )
-
     return parser.parse_args()
 
 

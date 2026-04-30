@@ -36,8 +36,21 @@ UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=None)
 FISH_API_KEY = os.getenv("FISH_API_KEY", "").strip()
 PREFIX_CACHE_SALT = os.getenv("FISH_PREFIX_CACHE_SALT", "").strip()
 PREFIX_CACHE_SCHEMA_VERSION = 2
-PREFIX_CACHE_MAX_ENTRIES = 4096
-PREFIX_CACHE_EMIT_BYTES = 8192
+
+PREFIX_CACHE_MAX_ENTRIES = int(os.getenv("FISH_PREFIX_CACHE_MAX_ENTRIES", "4096"))
+PREFIX_CACHE_EMIT_BYTES = int(os.getenv("FISH_PREFIX_CACHE_EMIT_BYTES", "8192"))
+
+# Пауза после озвученного prefix-cache перед генерацией хвоста.
+# Не портит append_sent_to_first_pcm: первый звук уже отдан из cache.
+PREFIX_CACHE_PAUSE_AFTER_MS = int(os.getenv("FISH_PREFIX_CACHE_PAUSE_AFTER_MS", "90"))
+
+# Затухание конца prefix-cache, чтобы склейка не щёлкала.
+PREFIX_CACHE_FADE_OUT_MS = int(os.getenv("FISH_PREFIX_CACHE_FADE_OUT_MS", "14"))
+
+# Мягкий вход генерации после prefix-cache.
+PREFIX_CACHE_GENERATION_FADE_IN_MS = int(
+    os.getenv("FISH_PREFIX_CACHE_GENERATION_FADE_IN_MS", "6")
+)
 
 DEFAULT_REFERENCE_ID = _RUNTIME.proxy.default_reference_id
 SESSION_TTL_SEC = _RUNTIME.proxy.session_ttl_sec
@@ -189,7 +202,9 @@ class IntroCache:
                 )
             except Exception as exc:
                 logger.error(
-                    "failed to generate intro cache for key=%s: %s", key[:8], exc
+                    "failed to generate intro cache for key=%s: %s",
+                    key[:8],
+                    exc,
                 )
                 raise
 
@@ -199,7 +214,8 @@ class IntroCache:
                     and key not in self._items
                 ):
                     oldest_key = min(
-                        self._items.keys(), key=lambda k: self._items[k].created_at
+                        self._items.keys(),
+                        key=lambda k: self._items[k].created_at,
                     )
                     self._items.pop(oldest_key, None)
                     self._locks.pop(oldest_key, None)
@@ -264,7 +280,8 @@ class PrefixCacheLibrary:
             async with self._lock:
                 if len(self._items) >= self.max_entries and key not in self._items:
                     oldest_key = min(
-                        self._items.keys(), key=lambda k: self._items[k].created_at
+                        self._items.keys(),
+                        key=lambda k: self._items[k].created_at,
                     )
                     self._items.pop(oldest_key, None)
                     self._locks.pop(oldest_key, None)
@@ -1134,7 +1151,6 @@ async def emit_intro_cache(
             }
         )
 
-    # Check if meta matches if already set
     if rec.audio_meta is not None:
         for k, v in entry.audio_meta.items():
             if rec.audio_meta.get(k) != v:
@@ -1172,8 +1188,7 @@ async def emit_intro_cache(
 
     pcm = entry.pcm
     frame_bytes = rec.audio_meta["channels"] * rec.audio_meta["sample_width"]
-    chunk_size = config.intro_cache.emit_bytes
-    chunk_size = _align_down(chunk_size, frame_bytes)
+    chunk_size = _align_down(config.intro_cache.emit_bytes, frame_bytes)
     if chunk_size <= 0:
         chunk_size = frame_bytes
 
@@ -1308,6 +1323,7 @@ async def emit_prefix_cache(
         config,
         cache_text,
     )
+
     entry = await prefix_cache_library.get(cache_key)
     if entry is None:
         raise RuntimeError(
@@ -1360,6 +1376,8 @@ async def emit_prefix_cache(
             "text_len": len(entry.text),
             "code_frames": entry.code_frames,
             "pcm_bytes": len(entry.pcm),
+            "pause_after_ms": PREFIX_CACHE_PAUSE_AFTER_MS,
+            "fade_out_ms": PREFIX_CACHE_FADE_OUT_MS,
         }
     )
 
@@ -1374,8 +1392,47 @@ async def emit_prefix_cache(
             }
         )
 
-    pcm = entry.pcm
-    frame_bytes = rec.audio_meta["channels"] * rec.audio_meta["sample_width"]
+    pcm = bytes(entry.pcm)
+
+    sample_rate = int(rec.audio_meta["sample_rate"])
+    channels = int(rec.audio_meta["channels"])
+    sample_width = int(rec.audio_meta["sample_width"])
+    bits_per_sample = sample_width * 8
+    frame_bytes = channels * sample_width
+
+    if PREFIX_CACHE_FADE_OUT_MS > 0 and pcm:
+        fade_out_bytes = _align_down(
+            _pcm_bytes_for_duration_ms(
+                sample_rate,
+                channels,
+                bits_per_sample,
+                PREFIX_CACHE_FADE_OUT_MS,
+            ),
+            frame_bytes,
+        )
+
+        tail_len = min(len(pcm), fade_out_bytes)
+        tail_len = _align_down(tail_len, frame_bytes)
+
+        if tail_len > 0:
+            start = len(pcm) - tail_len
+            buf = bytearray(pcm)
+            buf[start:] = _apply_pcm16_fade(
+                bytes(buf[start:]),
+                channels=channels,
+                fade_in_frames=0,
+                fade_out_frames=int(sample_rate * PREFIX_CACHE_FADE_OUT_MS / 1000.0),
+            )
+            pcm = bytes(buf)
+
+    if PREFIX_CACHE_PAUSE_AFTER_MS > 0:
+        pcm += _pcm_silence_bytes(
+            sample_rate=sample_rate,
+            channels=channels,
+            bits_per_sample=bits_per_sample,
+            duration_ms=PREFIX_CACHE_PAUSE_AFTER_MS,
+        )
+
     chunk_size = _align_down(PREFIX_CACHE_EMIT_BYTES, frame_bytes)
     if chunk_size <= 0:
         chunk_size = frame_bytes
@@ -1409,6 +1466,8 @@ async def emit_prefix_cache(
             **event_base,
             "code_frames": entry.code_frames,
             "pcm_bytes": total_emitted,
+            "pause_after_ms": PREFIX_CACHE_PAUSE_AFTER_MS,
+            "fade_out_ms": PREFIX_CACHE_FADE_OUT_MS,
         }
     )
 
@@ -2136,7 +2195,8 @@ async def session_open(req: SessionOpenRequest) -> JSONResponse:
         except Exception as exc:
             if config.tts.stateful_fallback_to_stateless:
                 logger.warning(
-                    "failed to open upstream synthesis session; falling back to stateless: %s",
+                    "failed to open upstream synthesis session; "
+                    "falling back to stateless: %s",
                     exc,
                 )
                 rec.synthesis_session_id = None
@@ -2171,7 +2231,9 @@ async def session_open(req: SessionOpenRequest) -> JSONResponse:
         except Exception as exc:
             if not config.intro_cache.ignore_errors:
                 if rec.synthesis_session_id:
-                    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as cleanup_client:
+                    async with httpx.AsyncClient(
+                        timeout=UPSTREAM_TIMEOUT
+                    ) as cleanup_client:
                         await _close_upstream_synthesis_session(
                             cleanup_client,
                             rec.synthesis_session_id,
@@ -2182,7 +2244,11 @@ async def session_open(req: SessionOpenRequest) -> JSONResponse:
                     502,
                     detail=f"failed to warm intro cache: {exc}",
                 )
-            logger.warning("failed to warm intro cache for session %s: %s", rec.session_id[:8], exc)
+            logger.warning(
+                "failed to warm intro cache for session %s: %s",
+                rec.session_id[:8],
+                exc,
+            )
 
     logger.info(
         "session open id=%s ref=%s emit_bytes=%s stateful=%s intro_warm=%s",
@@ -2276,9 +2342,7 @@ async def session_append(session_id: str, req: SessionAppendRequest) -> JSONResp
                     detail="a different prefix-cache is already pending for the first commit",
                 )
 
-            prefix_cache_entry = await prefix_cache_library.get(
-                prefix_cache_key or ""
-            )
+            prefix_cache_entry = await prefix_cache_library.get(prefix_cache_key or "")
             if prefix_cache_entry is None:
                 raise HTTPException(
                     404,
@@ -2492,6 +2556,11 @@ async def session_pcm_stream(session_id: str):
             if is_first_commit
             else config.playback.start_buffer_ms
         )
+        effective_fade_in_ms = (
+            PREFIX_CACHE_GENERATION_FADE_IN_MS
+            if has_prefix_cache
+            else config.playback.fade_in_ms
+        )
 
         should_reset, reset_reason = _should_reset_upstream_session(
             rec,
@@ -2509,7 +2578,8 @@ async def session_pcm_stream(session_id: str):
                 rec.last_upstream_reset_commit_seq = commit_item["seq"]
 
                 logger.info(
-                    "upstream synthesis reset session=%s commit_seq=%s reason=%s old=%s new=%s",
+                    "upstream synthesis reset session=%s commit_seq=%s "
+                    "reason=%s old=%s new=%s",
                     rec.session_id[:8],
                     commit_item["seq"],
                     reset_reason,
@@ -2578,7 +2648,7 @@ async def session_pcm_stream(session_id: str):
         first_emit_done = False
         start_buffer_bytes = 0
 
-        fade_in_applied = has_prefix_cache
+        fade_in_applied = False
         sample_rate = 0
         channels = 0
         bits_per_sample = 0
@@ -2604,7 +2674,7 @@ async def session_pcm_stream(session_id: str):
                         bytes(pending_pcm[:fade_in_bytes]),
                         channels=channels,
                         fade_in_frames=int(
-                            sample_rate * config.playback.fade_in_ms / 1000.0
+                            sample_rate * effective_fade_in_ms / 1000.0
                         ),
                         fade_out_frames=0,
                     )
@@ -2671,6 +2741,8 @@ async def session_pcm_stream(session_id: str):
                 "text_len": len(commit_item["text"]),
                 "effective_target_emit_bytes": effective_target_emit_bytes,
                 "effective_start_buffer_ms": effective_start_buffer_ms,
+                "effective_fade_in_ms": effective_fade_in_ms,
+                "has_prefix_cache": has_prefix_cache,
                 "server_perf_ms": int(time.perf_counter() * 1000),
             }
         )
@@ -2724,7 +2796,7 @@ async def session_pcm_stream(session_id: str):
                             sample_rate,
                             channels,
                             bits_per_sample,
-                            config.playback.fade_in_ms,
+                            effective_fade_in_ms,
                         ),
                         frame_bytes,
                     )
@@ -2871,8 +2943,9 @@ async def session_pcm_stream(session_id: str):
                 "upstream_bytes": upstream_bytes,
                 "boundary": boundary_kind,
                 "pause_ms": pause_ms,
-                "fade_in_ms": config.playback.fade_in_ms,
+                "fade_in_ms": effective_fade_in_ms,
                 "fade_out_ms": config.playback.fade_out_ms,
+                "has_prefix_cache": has_prefix_cache,
             }
         )
 
@@ -2899,6 +2972,11 @@ async def session_pcm_stream(session_id: str):
                     "client_initial_start_delay_ms": (
                         config.playback.client_initial_start_delay_ms
                     ),
+                    "prefix_cache_pause_after_ms": PREFIX_CACHE_PAUSE_AFTER_MS,
+                    "prefix_cache_fade_out_ms": PREFIX_CACHE_FADE_OUT_MS,
+                    "prefix_cache_generation_fade_in_ms": (
+                        PREFIX_CACHE_GENERATION_FADE_IN_MS
+                    ),
                     "synthesis_session_id": rec.synthesis_session_id,
                 }
             )
@@ -2918,7 +2996,11 @@ async def session_pcm_stream(session_id: str):
                         except Exception as exc:
                             if not config.intro_cache.ignore_errors:
                                 raise
-                            logger.warning("intro emission failed for session %s: %s", session_id[:8], exc)
+                            logger.warning(
+                                "intro emission failed for session %s: %s",
+                                session_id[:8],
+                                exc,
+                            )
                             yield await emit(
                                 {
                                     "type": "intro_error",

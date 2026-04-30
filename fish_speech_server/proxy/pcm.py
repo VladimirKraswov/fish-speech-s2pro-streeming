@@ -1506,14 +1506,6 @@ async def emit_prefix_cache(
 
     commit_seq = int(commit_item["seq"])
     preloaded = False
-
-    if preload_context and entry.cache_mode == "lookahead":
-        logger.warning(
-            "lookahead prefix-cache entry cannot preload standalone codes safely, "
-            "forcing preload_context=False"
-        )
-        preload_context = False
-
     if preload_context:
         preloaded = await _preload_intro_cache_context(
             rec=rec,
@@ -2412,6 +2404,19 @@ async def prefix_cache_key(req: PrefixCacheKeyRequest) -> JSONResponse:
     if not text:
         raise HTTPException(400, detail="prefix-cache text must not be empty")
 
+    if req.lookahead_text and req.full_text:
+        raise HTTPException(
+            400,
+            detail="provide either lookahead_text or full_text, not both",
+        )
+
+    if req.full_text:
+        if not req.full_text.strip().startswith(text):
+            raise HTTPException(
+                400,
+                detail="full_text must start with prefix text",
+            )
+
     key = _prefix_cache_key(
         config,
         text,
@@ -2597,15 +2602,6 @@ async def session_append(session_id: str, req: SessionAppendRequest) -> JSONResp
                     detail="cache/cash is allowed only before the first commit",
                 )
 
-            if (
-                rec.pending_prefix_cache_text is not None
-                and rec.pending_prefix_cache_text != prefix_cache_text
-            ):
-                raise HTTPException(
-                    400,
-                    detail="a different prefix-cache is already pending for the first commit",
-                )
-
             prefix_cache_entry = None
             lookup_method = "none"
 
@@ -2632,33 +2628,55 @@ async def session_append(session_id: str, req: SessionAppendRequest) -> JSONResp
 
                 lookup_method = "exact_key"
             else:
-                prefix_cache_entry = await prefix_cache_library.get(
-                    prefix_cache_key or ""
-                )
-                if prefix_cache_entry:
+                # Text-based lookup with ambiguity check
+                keys = await prefix_cache_library.get_keys_by_text(prefix_cache_text)
+                if not keys:
+                    raise HTTPException(
+                        404,
+                        detail=(
+                            "prefix-cache entry not found for "
+                            f"text={prefix_cache_text[:50]!r}"
+                        ),
+                    )
+
+                if len(keys) > 1:
+                    # Check if one of the keys exactly matches the config-based key
+                    # BUT the user requested to prioritize ambiguity check first.
+                    # Actually, the user says: "Don't do silent config_key_match before ambiguity check"
+                    raise HTTPException(
+                        409,
+                        detail=(
+                            f"ambiguous prefix-cache for text={prefix_cache_text[:50]!r}: "
+                            f"found {len(keys)} entries. Please provide explicit cache_key."
+                        ),
+                    )
+
+                prefix_cache_entry = await prefix_cache_library.get(keys[0])
+                if prefix_cache_key and keys[0] == prefix_cache_key:
                     lookup_method = "config_key_match"
                 else:
-                    keys = await prefix_cache_library.get_keys_by_text(
-                        prefix_cache_text
-                    )
-                    if len(keys) > 1:
-                        raise HTTPException(
-                            409,
-                            detail=(
-                                f"ambiguous prefix-cache for text={prefix_cache_text[:50]!r}: "
-                                f"found {len(keys)} entries. Please provide explicit cache_key."
-                            ),
-                        )
-                    if len(keys) == 1:
-                        prefix_cache_entry = await prefix_cache_library.get(keys[0])
-                        lookup_method = "unique_text_fallback"
+                    lookup_method = "unique_text_fallback"
 
             if prefix_cache_entry is None:
                 raise HTTPException(
                     404,
                     detail=(
                         "prefix-cache entry not found for "
-                        f"text={prefix_cache_text!r} key={(prefix_cache_key or '')[:8]}"
+                        f"text={prefix_cache_text!r}"
+                    ),
+                )
+
+            # Safety check: if already have a pending prefix, it must be the same entry
+            if (
+                rec.pending_prefix_cache_key is not None
+                and rec.pending_prefix_cache_key != prefix_cache_entry.key
+            ):
+                raise HTTPException(
+                    400,
+                    detail=(
+                        "a different prefix-cache is already pending for the first commit: "
+                        f"existing_key={rec.pending_prefix_cache_key[:8]} "
+                        f"new_key={prefix_cache_entry.key[:8]}"
                     ),
                 )
 
@@ -2856,6 +2874,14 @@ async def session_pcm_stream(session_id: str):
                 config,
                 commit_item,
             )
+
+            if prefix_cache_preload_context and prefix_cache_entry and prefix_cache_entry.cache_mode == "lookahead":
+                logger.warning(
+                    "lookahead prefix-cache entry cannot preload standalone codes safely, "
+                    "forcing prefix_cache_preload_context=False"
+                )
+                prefix_cache_preload_context = False
+
             async for event in emit_prefix_cache(
                 rec=rec,
                 config=config,

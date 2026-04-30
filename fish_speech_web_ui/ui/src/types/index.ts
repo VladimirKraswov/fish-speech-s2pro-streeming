@@ -81,6 +81,7 @@ export interface SessionOpenResponse {
   session_id: string;
   config: ProxyConfig;
   ttl_sec: number;
+  synthesis_session_id?: string | null;
 }
 
 export interface CommittedItem {
@@ -194,6 +195,7 @@ export type StreamEvent =
   | {
       type: 'intro_start';
       session_id?: string;
+      req_id?: string;
       cache_key?: string;
       text_preview?: string;
       text_len?: number;
@@ -201,12 +203,14 @@ export type StreamEvent =
   | {
       type: 'intro_done';
       session_id?: string;
+      req_id?: string;
       cache_key?: string;
       pcm_bytes?: number;
     }
   | {
       type: 'intro_error';
       session_id?: string;
+      req_id?: string;
       message: string;
     }
   | {

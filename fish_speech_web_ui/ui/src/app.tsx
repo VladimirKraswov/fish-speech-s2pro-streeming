@@ -386,9 +386,10 @@ export function App() {
       const chunkLength = data.config?.tts?.chunk_length ?? 'n/a';
       const historyTurns = data.config?.tts?.stateful_history_turns ?? 'n/a';
       const historyFrames = data.config?.tts?.stateful_history_code_frames ?? 'n/a';
+      const synthId = data.synthesis_session_id?.slice(0, 8) ?? 'none';
 
       log(
-        `session opened: ${data.session_id.slice(0, 8)}, mode=${stateful}, max_new_tokens=${maxTokens}, chunk_length=${chunkLength}, history_turns=${historyTurns}, history_frames=${historyFrames}`,
+        `session opened: ${data.session_id.slice(0, 8)}, mode=${stateful}, synth=${synthId}, max_new_tokens=${maxTokens}, chunk_length=${chunkLength}, history_turns=${historyTurns}, history_frames=${historyFrames}`,
       );
 
       abortController.current = new AbortController();
@@ -608,8 +609,8 @@ export function App() {
             <div>
               <h2>Runtime preset</h2>
               <p>
-                JSON override для `/session/open`. Balanced — основной профиль для плавной речи,
-                Low latency — быстрее, Stable — самые мягкие переходы.
+                JSON override для `/session/open`. Runtime default использует `runtime.json` без override.
+                Balanced, Low latency и Stable — явные UI overrides.
               </p>
             </div>
           </div>

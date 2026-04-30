@@ -1,0 +1,12 @@
+{
+  "target_files": [
+    "fish_speech/content_sequence.py",
+    "fish_speech/conversation.py",
+    "fish_speech/codec/codes.py",
+    "fish_speech/generation/prompt_builder.py",
+    "fish_speech/inference_engine/__init__.py",
+    "fish_speech/tools/build_prefix_cache.py"
+  ],
+  "created": "2026-04-30",
+  "kind": "in-place patch script with backups"
+}

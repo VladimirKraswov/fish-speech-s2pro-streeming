@@ -1,4 +1,6 @@
 # Internal prompt representation for Fish Speech driver generation.
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from typing import List, Literal, Union
 
@@ -64,11 +66,11 @@ class AudioPart(BasePart):
 class EncodedMessage:
     tokens: torch.Tensor
     labels: torch.Tensor
+    vq_parts: list[torch.Tensor] = field(default_factory=list)
+    audio_parts: list[torch.Tensor] = field(default_factory=list)
     vq_mask_tokens: torch.Tensor | None = None
     vq_mask_labels: torch.Tensor | None = None
-    vq_parts: list[torch.Tensor]
     vq_require_losses: torch.Tensor | None = None
-    audio_parts: list[torch.Tensor]
     audio_masks: torch.Tensor | None = None
     metadata: dict | None = None
 
@@ -108,10 +110,8 @@ class ContentSequence:
 
         self.parts = fixed_parts
 
-        # If modality is specified, add it at the beginning if it's not already there
         if self.modality and not (
             len(self.parts) > 0
-            and isinstance(self.parts[0], dict) is False
             and isinstance(self.parts[0], TextPart)
             and self.parts[0].text is not None
             and self.parts[0].text.startswith(MODALITY_TOKENS[self.modality])
@@ -125,14 +125,6 @@ class ContentSequence:
         add_end: bool = False,
         speaker: Union[str, int] | None = None,
     ):
-        """
-        Append a part or list of parts to the sequence.
-
-        Args:
-            part_or_parts: A single part or list of parts to add
-            add_end: Whether to add the IM_END_TOKEN after these parts
-            speaker: Optional speaker identifier (name or ID) to add before the parts
-        """
         parts_to_add = (
             [part_or_parts] if not isinstance(part_or_parts, list) else part_or_parts
         )
@@ -152,19 +144,10 @@ class ContentSequence:
         self: "ContentSequence",
         tokenizer: FishTokenizer,
         add_shift: bool = True,
-        ignore_loss_tokens: list[str] = [],
+        ignore_loss_tokens: list[str] | None = None,
     ) -> EncodedMessage:
-        """
-        Encode the sequence parts into tokens for the model.
+        ignore_loss_tokens = ignore_loss_tokens or []
 
-        Args:
-            tokenizer: The tokenizer to use
-            add_shift: Whether to shift tokens for next-token prediction
-            ignore_loss_tokens: List of token strings to ignore when calculating loss
-
-        Returns:
-            EncodedMessage with tensors ready for the model
-        """
         all_tokens = []
         all_labels = []
 
@@ -198,6 +181,11 @@ class ContentSequence:
 
             elif isinstance(part, VQPart):
                 curr_codes = part.codes.clone().to(torch.long)
+                if curr_codes.ndim != 2:
+                    raise ValueError(
+                        f"VQ codes must be 2D [C, T], got shape={tuple(curr_codes.shape)}"
+                    )
+
                 semantic_codes = curr_codes[0]
 
                 if (semantic_codes < 0).any() or (
@@ -212,8 +200,10 @@ class ContentSequence:
 
                 vq_parts.append(curr_codes)
                 vq_require_losses.append(part.cal_loss is True)
+
             elif isinstance(part, AudioPart):
                 raise NotImplementedError("AudioPart is not supported by encode() yet")
+
             else:
                 raise ValueError(f"Unsupported part type: {type(part)}")
 
@@ -234,30 +224,30 @@ class ContentSequence:
         if not all_tokens:
             tokens = torch.empty(0, dtype=torch.long)
             labels = torch.empty(0, dtype=torch.long)
-            vq_masks = torch.empty(0, dtype=torch.bool)
-            audio_masks = torch.empty(0, dtype=torch.bool)
+            vq_masks_tensor = torch.empty(0, dtype=torch.bool)
+            audio_masks_tensor = torch.empty(0, dtype=torch.bool)
         else:
             tokens = torch.cat(all_tokens, dim=0)
             labels = torch.cat(all_labels, dim=0)
-            vq_masks = torch.cat(vq_masks, dim=0)
-            audio_masks = torch.cat(audio_masks, dim=0)
+            vq_masks_tensor = torch.cat(vq_masks, dim=0)
+            audio_masks_tensor = torch.cat(audio_masks, dim=0)
 
-        vq_require_losses = torch.tensor(vq_require_losses, dtype=torch.bool)
+        vq_require_losses_tensor = torch.tensor(vq_require_losses, dtype=torch.bool)
 
-        vq_mask_tokens = vq_masks
-        vq_mask_labels = vq_masks
+        vq_mask_tokens = vq_masks_tensor
+        vq_mask_labels = vq_masks_tensor
 
         if add_shift and len(tokens) > 0:
             tokens = tokens[:-1]
             labels = labels[1:]
-            vq_masks = vq_masks[:-1]
+            vq_masks_tensor = vq_masks_tensor[:-1]
             vq_mask_tokens = vq_mask_tokens[:-1]
             vq_mask_labels = vq_mask_labels[1:]
-            audio_masks = audio_masks[:-1]
+            audio_masks_tensor = audio_masks_tensor[:-1]
 
-        for i in ignore_loss_token_ids:
-            if i is not None:
-                labels[labels == i] = -100
+        for token_id in ignore_loss_token_ids:
+            if token_id is not None:
+                labels[labels == token_id] = -100
 
         return EncodedMessage(
             tokens=tokens,
@@ -265,9 +255,9 @@ class ContentSequence:
             vq_parts=vq_parts,
             vq_mask_tokens=vq_mask_tokens,
             vq_mask_labels=vq_mask_labels,
-            vq_require_losses=vq_require_losses,
+            vq_require_losses=vq_require_losses_tensor,
             audio_parts=audio_parts,
-            audio_masks=audio_masks,
+            audio_masks=audio_masks_tensor,
             metadata=self.metadata,
         )
 
@@ -275,22 +265,20 @@ class ContentSequence:
         self: "ContentSequence",
         tokenizer: FishTokenizer,
         num_codebooks: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         encoded = self.encode(tokenizer, add_shift=False)
         tokens = encoded.tokens
 
         values = torch.zeros((num_codebooks + 1, len(tokens)), dtype=torch.long)
         values[0] = tokens
 
-        if (encoded.vq_parts is None or len(encoded.vq_parts) == 0) and (
-            encoded.audio_parts is None or len(encoded.audio_parts) == 0
-        ):
+        if not encoded.vq_parts and not encoded.audio_parts:
             return values, None, None
 
         audio_parts = None
         audio_masks = None
 
-        if encoded.vq_parts is not None and len(encoded.vq_parts) > 0:
+        if encoded.vq_parts:
             vq_parts = encoded.vq_parts
             if len(vq_parts) > 1:
                 all_vq_codes = torch.cat(vq_parts, dim=1)
@@ -306,7 +294,10 @@ class ContentSequence:
                     f"codes.C={all_vq_codes.shape[0]}, model.C={num_codebooks}"
                 )
 
-            num_vq_tokens = encoded.vq_mask_tokens.sum().item()
+            if encoded.vq_mask_tokens is None:
+                raise ValueError("Missing VQ token mask")
+
+            num_vq_tokens = int(encoded.vq_mask_tokens.sum().item())
             if all_vq_codes.shape[-1] != num_vq_tokens:
                 raise ValueError(
                     f"VQ codes and mask mismatch: codes.T={all_vq_codes.shape[-1]}, "
@@ -315,8 +306,10 @@ class ContentSequence:
 
             values[1:, encoded.vq_mask_tokens] = all_vq_codes.to(dtype=torch.long)
 
-        if encoded.audio_parts is not None and len(encoded.audio_parts) > 0:
+        if encoded.audio_parts:
             audio_parts = torch.cat(encoded.audio_parts, dim=0)
+            if encoded.audio_masks is None:
+                raise ValueError("Missing audio mask")
             audio_masks = encoded.audio_masks[None, :]
 
         return values, audio_masks, audio_parts
@@ -324,15 +317,15 @@ class ContentSequence:
     def visualize(
         self: "ContentSequence",
         tokenizer: FishTokenizer,
-        ignore_loss_tokens: list[str] = [],
+        ignore_loss_tokens: list[str] | None = None,
         merge_semantic_tokens: bool = False,
     ):
-        """
-        Visualize the encoded sequence with color-coded tokens.
-        Blue/cyan tokens contribute to loss, green tokens do not.
-        """
+        ignore_loss_tokens = ignore_loss_tokens or []
+
         encoded = self.encode(
-            tokenizer, add_shift=False, ignore_loss_tokens=ignore_loss_tokens
+            tokenizer,
+            add_shift=False,
+            ignore_loss_tokens=ignore_loss_tokens,
         )
 
         colors = {
@@ -356,9 +349,9 @@ class ContentSequence:
             print(f"{color}{x}\033[0m", end="")
             green_idx += 1
 
-        def print_semantic_token(x, count):
+        def print_semantic_token(label_value, count):
             val = f"[<|semantic|>x{count}]"
-            if x == -100:
+            if int(label_value) == -100:
                 print_in_green(val)
             else:
                 print_in_blue(val)
@@ -368,26 +361,31 @@ class ContentSequence:
 
         for tok, lab in zip(encoded.tokens, encoded.labels):
             token_id = int(tok.item())
+            label_value = int(lab.item())
 
             if merge_semantic_tokens:
-                if (
-                    tokenizer.semantic_begin_id <= token_id <= tokenizer.semantic_end_id
-                    and (semantic_label is None or semantic_label == lab)
-                ):
+                is_semantic = (
+                    tokenizer.semantic_begin_id
+                    <= token_id
+                    <= tokenizer.semantic_end_id
+                )
+                same_label = semantic_label is None or semantic_label == label_value
+
+                if is_semantic and same_label:
                     count_semantic_tokens += 1
-                    semantic_label = lab
+                    semantic_label = label_value
                     continue
-                elif count_semantic_tokens > 0:
+
+                if count_semantic_tokens > 0:
                     print_semantic_token(semantic_label, count_semantic_tokens)
                     count_semantic_tokens = 0
                     semantic_label = None
 
             val = tokenizer.decode([token_id])
-
             if not val:
                 val = f"<{token_id}>"
 
-            if lab == -100:
+            if label_value == -100:
                 print_in_green(val)
             else:
                 print_in_blue(val)

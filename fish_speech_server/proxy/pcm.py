@@ -34,6 +34,15 @@ if os.getenv("UPSTREAM_TTS_URL"):
 
 UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=None)
 FISH_API_KEY = os.getenv("FISH_API_KEY", "").strip()
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
 PREFIX_CACHE_SALT = os.getenv("FISH_PREFIX_CACHE_SALT", "").strip()
 PREFIX_CACHE_SCHEMA_VERSION = 2
 
@@ -50,6 +59,12 @@ PREFIX_CACHE_FADE_OUT_MS = int(os.getenv("FISH_PREFIX_CACHE_FADE_OUT_MS", "14"))
 # Мягкий вход генерации после prefix-cache.
 PREFIX_CACHE_GENERATION_FADE_IN_MS = int(
     os.getenv("FISH_PREFIX_CACHE_GENERATION_FADE_IN_MS", "6")
+)
+PREFIX_CACHE_FULL_COMMIT_MODE = _env_flag("FISH_PREFIX_CACHE_FULL_COMMIT_MODE", True)
+PREFIX_CACHE_SKIP_ADJUST_MS = int(os.getenv("FISH_PREFIX_CACHE_SKIP_ADJUST_MS", "0"))
+PREFIX_CACHE_DISABLE_PRELOAD_IN_FULL_COMMIT_MODE = _env_flag(
+    "FISH_PREFIX_CACHE_DISABLE_PRELOAD_IN_FULL_COMMIT_MODE",
+    True,
 )
 
 DEFAULT_REFERENCE_ID = _RUNTIME.proxy.default_reference_id
@@ -115,6 +130,9 @@ class PrefixCacheAddRequest(BaseModel):
     config_text: str = Field(..., min_length=2, max_length=100_000)
     text: str | None = Field(None, min_length=1, max_length=4000)
     texts: list[str] | None = Field(None, min_length=1, max_length=4096)
+    lookahead_text: str | None = Field(None, min_length=1, max_length=4000)
+    full_text: str | None = Field(None, min_length=1, max_length=8000)
+    prefix_cut_adjust_ms: int = Field(0, ge=-1000, le=1000)
     clear_existing: bool = False
     fail_fast: bool = False
 
@@ -157,6 +175,13 @@ class PrefixCacheEntry:
     text: str
     codes: list[list[int]] | None = None
     code_frames: int = 0
+    cache_mode: str = "standalone"
+    generation_text: str | None = None
+    lookahead_text: str | None = None
+    full_pcm_bytes: int = 0
+    prefix_audio_skip_bytes: int | None = None
+    prefix_cut_adjust_ms: int = 0
+    boundary_method: str = "standalone_duration"
 
 
 class IntroCache:
@@ -254,6 +279,9 @@ class PrefixCacheLibrary:
         text: str,
         config: ProxyConfig,
         client: httpx.AsyncClient,
+        lookahead_text: str | None = None,
+        full_text: str | None = None,
+        prefix_cut_adjust_ms: int = 0,
     ) -> tuple[PrefixCacheEntry, bool]:
         async with self._lock:
             entry = self._items.get(key)
@@ -275,6 +303,9 @@ class PrefixCacheLibrary:
                 text=text,
                 config=config,
                 client=client,
+                lookahead_text=lookahead_text,
+                full_text=full_text,
+                prefix_cut_adjust_ms=prefix_cut_adjust_ms,
             )
 
             async with self._lock:
@@ -977,7 +1008,22 @@ async def _generate_prefix_cache_entry(
     text: str,
     config: ProxyConfig,
     client: httpx.AsyncClient,
+    lookahead_text: str | None = None,
+    full_text: str | None = None,
+    prefix_cut_adjust_ms: int = 0,
 ) -> PrefixCacheEntry:
+    cache_mode = "standalone"
+    generation_text = text
+    lookahead = lookahead_text.strip() if lookahead_text else None
+    explicit_full_text = full_text.strip() if full_text else None
+
+    if explicit_full_text:
+        generation_text = explicit_full_text
+        cache_mode = "lookahead"
+    elif lookahead:
+        generation_text = _join_prefix_and_tail(text, lookahead)
+        cache_mode = "lookahead"
+
     payload = build_upstream_payload(text=text, config=config, commit_seq=1)
     payload["streaming"] = True
     payload["stream_tokens"] = True
@@ -989,37 +1035,89 @@ async def _generate_prefix_cache_entry(
     )
 
     logger.info(
-        "generating prefix cache key=%s text=%r ref=%s url=%s",
+        "generating prefix cache key=%s text=%r mode=%s generation_text=%r ref=%s url=%s",
         key[:8],
         text[:100],
+        cache_mode,
+        generation_text[:100],
         payload["reference_id"],
         url,
     )
 
-    resp = await client.post(
-        url,
-        json=payload,
-        headers=_auth_headers({"Accept": "application/json"}),
-    )
+    async def generate_cache_payload(payload_text: str) -> tuple[bytes, dict[str, Any], list[list[int]] | None, int]:
+        request_payload = dict(payload)
+        request_payload["text"] = payload_text
 
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"prefix-cache generation failed status={resp.status_code}: {resp.text}"
+        resp = await client.post(
+            url,
+            json=request_payload,
+            headers=_auth_headers({"Accept": "application/json"}),
         )
 
-    data = resp.json()
-    pcm_b64 = data.get("pcm_b64") or ""
-    audio_meta = data.get("audio_meta") or {}
-    codes = data.get("codes")
-    code_frames = int(data.get("code_frames") or 0)
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"prefix-cache generation failed status={resp.status_code}: {resp.text}"
+            )
 
-    if not pcm_b64:
-        raise RuntimeError("prefix-cache generation returned empty pcm_b64")
+        data = resp.json()
+        pcm_b64 = data.get("pcm_b64") or ""
+        audio_meta = data.get("audio_meta") or {}
+        codes = data.get("codes")
+        code_frames = int(data.get("code_frames") or 0)
 
-    pcm = base64.b64decode(pcm_b64)
+        if not pcm_b64:
+            raise RuntimeError("prefix-cache generation returned empty pcm_b64")
 
-    if not pcm:
-        raise RuntimeError("prefix-cache generation returned empty PCM")
+        pcm = base64.b64decode(pcm_b64)
+
+        if not pcm:
+            raise RuntimeError("prefix-cache generation returned empty PCM")
+
+        return pcm, audio_meta, codes, code_frames
+
+    pcm, audio_meta, codes, code_frames = await generate_cache_payload(text)
+    full_pcm_bytes = len(pcm)
+    prefix_audio_skip_bytes: int | None = len(pcm)
+    boundary_method = "standalone_duration"
+
+    if cache_mode == "lookahead":
+        prefix_pcm = pcm
+        prefix_audio_meta = audio_meta
+        prefix_codes = codes
+        prefix_code_frames = code_frames
+        full_pcm, full_audio_meta, _full_codes, _full_code_frames = (
+            await generate_cache_payload(generation_text)
+        )
+
+        if prefix_audio_meta != full_audio_meta:
+            raise RuntimeError(
+                "lookahead prefix-cache audio format mismatch: "
+                f"prefix={prefix_audio_meta}, full={full_audio_meta}"
+            )
+
+        sample_rate = int(prefix_audio_meta["sample_rate"])
+        channels = int(prefix_audio_meta["channels"])
+        sample_width = int(prefix_audio_meta["sample_width"])
+        frame_bytes = channels * sample_width
+        adjust_bytes = _pcm_bytes_for_duration_ms_allow_negative(
+            sample_rate,
+            channels,
+            sample_width * 8,
+            prefix_cut_adjust_ms,
+        )
+        cut_bytes = max(0, len(prefix_pcm) + adjust_bytes)
+        cut_bytes = min(len(full_pcm), _align_down(cut_bytes, frame_bytes))
+
+        if cut_bytes <= 0:
+            raise RuntimeError("lookahead prefix-cache produced empty prefix PCM")
+
+        pcm = full_pcm[:cut_bytes]
+        audio_meta = full_audio_meta
+        codes = prefix_codes
+        code_frames = prefix_code_frames
+        full_pcm_bytes = len(full_pcm)
+        prefix_audio_skip_bytes = cut_bytes
+        boundary_method = "lookahead_full_phrase_standalone_duration"
 
     if config.tts.stateful_synthesis and (not codes or code_frames <= 0):
         raise RuntimeError(
@@ -1037,6 +1135,13 @@ async def _generate_prefix_cache_entry(
         text=text,
         codes=codes,
         code_frames=code_frames,
+        cache_mode=cache_mode,
+        generation_text=generation_text,
+        lookahead_text=lookahead,
+        full_pcm_bytes=full_pcm_bytes,
+        prefix_audio_skip_bytes=prefix_audio_skip_bytes,
+        prefix_cut_adjust_ms=prefix_cut_adjust_ms,
+        boundary_method=boundary_method,
     )
 
 
@@ -1275,6 +1380,43 @@ def _resolve_prefix_cache_alias(
     return cache_text if cache_text is not None else cash_text
 
 
+def _join_prefix_and_tail(prefix: str, tail: str) -> str:
+    prefix = prefix or ""
+    tail = tail or ""
+
+    if not prefix:
+        return tail
+    if not tail:
+        return prefix
+    if prefix[-1].isspace() or tail[0].isspace():
+        return prefix + tail
+    if tail[0] in ".,!?;:…)]}»”":
+        return prefix + tail
+    return f"{prefix} {tail}"
+
+
+async def _get_prefix_cache_entry_for_commit(
+    config: ProxyConfig,
+    commit_item: dict[str, Any],
+) -> PrefixCacheEntry:
+    cache_text = (commit_item.get("prefix_cache_text") or "").strip()
+    if not cache_text:
+        raise RuntimeError("prefix-cache commit is missing prefix_cache_text")
+
+    cache_key = commit_item.get("prefix_cache_key") or _prefix_cache_key(
+        config,
+        cache_text,
+    )
+
+    entry = await prefix_cache_library.get(cache_key)
+    if entry is None:
+        raise RuntimeError(
+            f"prefix-cache entry not found for text={cache_text!r} key={cache_key[:8]}"
+        )
+
+    return entry
+
+
 def _prefix_cache_public_item(entry: PrefixCacheEntry) -> dict[str, Any]:
     return {
         "key": entry.key,
@@ -1283,6 +1425,13 @@ def _prefix_cache_public_item(entry: PrefixCacheEntry) -> dict[str, Any]:
         "pcm_bytes": len(entry.pcm),
         "code_frames": entry.code_frames,
         "audio_meta": entry.audio_meta,
+        "cache_mode": entry.cache_mode,
+        "generation_text": entry.generation_text,
+        "lookahead_text": entry.lookahead_text,
+        "full_pcm_bytes": entry.full_pcm_bytes,
+        "prefix_audio_skip_bytes": entry.prefix_audio_skip_bytes,
+        "prefix_cut_adjust_ms": entry.prefix_cut_adjust_ms,
+        "boundary_method": entry.boundary_method,
     }
 
 
@@ -1310,35 +1459,25 @@ async def emit_prefix_cache(
     client: httpx.AsyncClient,
     req_id: str,
     commit_item: dict[str, Any],
+    entry: PrefixCacheEntry,
+    full_commit_mode: bool,
+    preload_context: bool,
 ) -> AsyncGenerator[bytes, None]:
     async def emit(obj: dict[str, Any]) -> bytes:
         return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
 
     commit_seq = int(commit_item["seq"])
-    cache_text = (commit_item.get("prefix_cache_text") or "").strip()
-    if not cache_text:
-        return
-
-    cache_key = commit_item.get("prefix_cache_key") or _prefix_cache_key(
-        config,
-        cache_text,
-    )
-
-    entry = await prefix_cache_library.get(cache_key)
-    if entry is None:
-        raise RuntimeError(
-            f"prefix-cache entry not found for text={cache_text!r} key={cache_key[:8]}"
+    preloaded = False
+    if preload_context:
+        preloaded = await _preload_intro_cache_context(
+            rec=rec,
+            config=config,
+            entry=entry,
+            client=client,
+            commit_seq=0,
+            commit_reason="prefix_cache",
+            cache_kind="prefix_cache",
         )
-
-    preloaded = await _preload_intro_cache_context(
-        rec=rec,
-        config=config,
-        entry=entry,
-        client=client,
-        commit_seq=0,
-        commit_reason="prefix_cache",
-        cache_kind="prefix_cache",
-    )
 
     event_base = _prefix_cache_event_base(
         req_id=req_id,
@@ -1376,6 +1515,8 @@ async def emit_prefix_cache(
             "text_len": len(entry.text),
             "code_frames": entry.code_frames,
             "pcm_bytes": len(entry.pcm),
+            "full_commit_mode": full_commit_mode,
+            "preload_context": preload_context,
             "pause_after_ms": PREFIX_CACHE_PAUSE_AFTER_MS,
             "fade_out_ms": PREFIX_CACHE_FADE_OUT_MS,
         }
@@ -1466,6 +1607,8 @@ async def emit_prefix_cache(
             **event_base,
             "code_frames": entry.code_frames,
             "pcm_bytes": total_emitted,
+            "full_commit_mode": full_commit_mode,
+            "preload_context": preload_context,
             "pause_after_ms": PREFIX_CACHE_PAUSE_AFTER_MS,
             "fade_out_ms": PREFIX_CACHE_FADE_OUT_MS,
         }
@@ -1552,6 +1695,37 @@ def _pcm_bytes_for_duration_ms(
         raw += 1
 
     return raw
+
+
+def _pcm_bytes_for_duration_ms_allow_negative(
+    sample_rate: int,
+    channels: int,
+    bits_per_sample: int,
+    duration_ms: int,
+) -> int:
+    if duration_ms == 0:
+        return 0
+
+    bytes_per_second = sample_rate * channels * (bits_per_sample // 8)
+    raw = int(bytes_per_second * (duration_ms / 1000.0))
+
+    if raw % 2 != 0:
+        raw += 1 if raw > 0 else -1
+
+    return raw
+
+
+def _pcm_ms_estimate(
+    pcm_bytes: int,
+    *,
+    sample_rate: int,
+    channels: int,
+    sample_width: int,
+) -> float:
+    bytes_per_second = sample_rate * channels * sample_width
+    if bytes_per_second <= 0:
+        return 0.0
+    return round((pcm_bytes / bytes_per_second) * 1000.0, 2)
 
 
 def _align_down(value: int, frame_bytes: int) -> int:
@@ -2533,14 +2707,27 @@ async def session_pcm_stream(session_id: str):
         commit_seq = int(commit_item["seq"])
         is_first_commit = commit_seq == 1
         has_prefix_cache = is_first_commit and bool(commit_item.get("prefix_cache_text"))
+        full_commit_mode = bool(PREFIX_CACHE_FULL_COMMIT_MODE and has_prefix_cache)
+        prefix_cache_entry: PrefixCacheEntry | None = None
+        prefix_cache_preload_context = bool(has_prefix_cache)
+
+        if full_commit_mode and PREFIX_CACHE_DISABLE_PRELOAD_IN_FULL_COMMIT_MODE:
+            prefix_cache_preload_context = False
 
         if has_prefix_cache:
+            prefix_cache_entry = await _get_prefix_cache_entry_for_commit(
+                config,
+                commit_item,
+            )
             async for event in emit_prefix_cache(
                 rec=rec,
                 config=config,
                 client=client,
                 req_id=req_id,
                 commit_item=commit_item,
+                entry=prefix_cache_entry,
+                full_commit_mode=full_commit_mode,
+                preload_context=prefix_cache_preload_context,
             ):
                 yield event
 
@@ -2561,6 +2748,43 @@ async def session_pcm_stream(session_id: str):
             if has_prefix_cache
             else config.playback.fade_in_ms
         )
+
+        generation_tail_text = commit_item["text"]
+        prefix_cache_text = prefix_cache_entry.text if prefix_cache_entry else ""
+        upstream_text = (
+            _join_prefix_and_tail(prefix_cache_text, generation_tail_text)
+            if full_commit_mode
+            else generation_tail_text
+        )
+        planned_prefix_audio_skip_bytes = 0
+        prefix_audio_skip_ms_estimate = 0.0
+
+        if full_commit_mode and prefix_cache_entry is not None:
+            meta = prefix_cache_entry.audio_meta
+            meta_sample_rate = int(meta["sample_rate"])
+            meta_channels = int(meta["channels"])
+            meta_sample_width = int(meta["sample_width"])
+            meta_frame_bytes = meta_channels * meta_sample_width
+            adjust_bytes = _pcm_bytes_for_duration_ms_allow_negative(
+                meta_sample_rate,
+                meta_channels,
+                meta_sample_width * 8,
+                PREFIX_CACHE_SKIP_ADJUST_MS,
+            )
+            planned_prefix_audio_skip_bytes = max(
+                0,
+                len(prefix_cache_entry.pcm) + adjust_bytes,
+            )
+            planned_prefix_audio_skip_bytes = _align_down(
+                planned_prefix_audio_skip_bytes,
+                meta_frame_bytes,
+            )
+            prefix_audio_skip_ms_estimate = _pcm_ms_estimate(
+                planned_prefix_audio_skip_bytes,
+                sample_rate=meta_sample_rate,
+                channels=meta_channels,
+                sample_width=meta_sample_width,
+            )
 
         should_reset, reset_reason = _should_reset_upstream_session(
             rec,
@@ -2624,7 +2848,7 @@ async def session_pcm_stream(session_id: str):
             await asyncio.sleep(0)
 
         payload = build_upstream_payload(
-            text=commit_item["text"],
+            text=upstream_text,
             config=config,
             commit_seq=commit_seq,
         )
@@ -2647,6 +2871,9 @@ async def session_pcm_stream(session_id: str):
         upstream_bytes = 0
         first_emit_done = False
         start_buffer_bytes = 0
+        skip_remaining_bytes = planned_prefix_audio_skip_bytes
+        skipped_pcm_bytes = 0
+        skip_done_emitted = not full_commit_mode
 
         fade_in_applied = False
         sample_rate = 0
@@ -2731,6 +2958,48 @@ async def session_pcm_stream(session_id: str):
                 first_emit_done = True
                 await asyncio.sleep(0)
 
+        async def append_pcm_after_prefix_skip(
+            pcm: bytes,
+        ) -> AsyncGenerator[bytes, None]:
+            nonlocal skip_remaining_bytes, skipped_pcm_bytes, skip_done_emitted
+
+            if full_commit_mode and skip_remaining_bytes > 0:
+                take = min(skip_remaining_bytes, len(pcm))
+                if take > 0:
+                    skip_remaining_bytes -= take
+                    skipped_pcm_bytes += take
+                    pcm = pcm[take:]
+
+            if full_commit_mode and not skip_done_emitted and skip_remaining_bytes <= 0:
+                skip_done_emitted = True
+                yield await emit(
+                    {
+                        "type": "prefix_cache_generation_skip_done",
+                        "req_id": req_id,
+                        "session_id": rec.session_id,
+                        "commit_seq": commit_item["seq"],
+                        "cache_key": prefix_cache_entry.key if prefix_cache_entry else None,
+                        "cache_key_short": (
+                            prefix_cache_entry.key[:8] if prefix_cache_entry else None
+                        ),
+                        "skipped_pcm_bytes": skipped_pcm_bytes,
+                        "skipped_ms_estimate": _pcm_ms_estimate(
+                            skipped_pcm_bytes,
+                            sample_rate=sample_rate,
+                            channels=channels,
+                            sample_width=bits_per_sample // 8,
+                        ),
+                    }
+                )
+                await asyncio.sleep(0)
+
+            if not pcm:
+                return
+
+            pending_pcm.extend(pcm)
+            async for event in flush_pending(force=False):
+                yield event
+
         yield await emit(
             {
                 "type": "commit_start",
@@ -2743,6 +3012,24 @@ async def session_pcm_stream(session_id: str):
                 "effective_start_buffer_ms": effective_start_buffer_ms,
                 "effective_fade_in_ms": effective_fade_in_ms,
                 "has_prefix_cache": has_prefix_cache,
+                "full_commit_mode": full_commit_mode,
+                "prefix_cache_preload_context": prefix_cache_preload_context,
+                "prefix_cache_key": (
+                    prefix_cache_entry.key if prefix_cache_entry else None
+                ),
+                "prefix_cache_key_short": (
+                    prefix_cache_entry.key[:8] if prefix_cache_entry else None
+                ),
+                "full_generation_text_preview": upstream_text[:180],
+                "full_generation_text_len": len(upstream_text),
+                "prefix_cache_text": prefix_cache_text or None,
+                "prefix_cache_text_len": len(prefix_cache_text),
+                "generation_tail_text_preview": generation_tail_text[:180],
+                "generation_tail_text_len": len(generation_tail_text),
+                "planned_prefix_audio_skip_bytes": planned_prefix_audio_skip_bytes,
+                "prefix_audio_skip_bytes": planned_prefix_audio_skip_bytes,
+                "prefix_audio_skip_ms_estimate": prefix_audio_skip_ms_estimate,
+                "prefix_audio_skip_adjust_ms": PREFIX_CACHE_SKIP_ADJUST_MS,
                 "server_perf_ms": int(time.perf_counter() * 1000),
             }
         )
@@ -2752,10 +3039,10 @@ async def session_pcm_stream(session_id: str):
             "REQ %s commit_seq=%s upstream start text_len=%s ref=%s url=%s text=%r",
             req_id,
             commit_item["seq"],
-            len(commit_item["text"]),
+            len(upstream_text),
             payload["reference_id"],
             url,
-            commit_item["text"][:180],
+            upstream_text[:180],
         )
 
         async with client.stream(
@@ -2856,19 +3143,21 @@ async def session_pcm_stream(session_id: str):
                     header_buffer.clear()
 
                     if pcm:
-                        pending_pcm.extend(pcm)
-
-                        async for event in flush_pending(force=False):
+                        async for event in append_pcm_after_prefix_skip(pcm):
                             yield event
 
                 else:
-                    pending_pcm.extend(chunk)
-
-                    async for event in flush_pending(force=False):
+                    async for event in append_pcm_after_prefix_skip(chunk):
                         yield event
 
         if not header_sent:
             raise RuntimeError("upstream finished before WAV data header was parsed")
+
+        if full_commit_mode and skip_remaining_bytes > 0:
+            raise RuntimeError(
+                "upstream finished before prefix-cache audio skip completed: "
+                f"remaining={skip_remaining_bytes} planned={planned_prefix_audio_skip_bytes}"
+            )
 
         boundary_kind, pause_ms = _pause_ms_for_commit(
             commit_item["text"],
@@ -2932,7 +3221,7 @@ async def session_pcm_stream(session_id: str):
         )
 
         rec.chars_since_upstream_reset += int(
-            commit_item.get("text_len") or len(commit_item.get("text") or "")
+            len(upstream_text)
         )
 
         yield await emit(
@@ -2946,6 +3235,9 @@ async def session_pcm_stream(session_id: str):
                 "fade_in_ms": effective_fade_in_ms,
                 "fade_out_ms": config.playback.fade_out_ms,
                 "has_prefix_cache": has_prefix_cache,
+                "full_commit_mode": full_commit_mode,
+                "skipped_prefix_pcm_bytes": skipped_pcm_bytes,
+                "upstream_text_len": len(upstream_text),
             }
         )
 
@@ -2976,6 +3268,11 @@ async def session_pcm_stream(session_id: str):
                     "prefix_cache_fade_out_ms": PREFIX_CACHE_FADE_OUT_MS,
                     "prefix_cache_generation_fade_in_ms": (
                         PREFIX_CACHE_GENERATION_FADE_IN_MS
+                    ),
+                    "prefix_cache_full_commit_mode": PREFIX_CACHE_FULL_COMMIT_MODE,
+                    "prefix_cache_skip_adjust_ms": PREFIX_CACHE_SKIP_ADJUST_MS,
+                    "prefix_cache_disable_preload_in_full_commit_mode": (
+                        PREFIX_CACHE_DISABLE_PRELOAD_IN_FULL_COMMIT_MODE
                     ),
                     "synthesis_session_id": rec.synthesis_session_id,
                 }

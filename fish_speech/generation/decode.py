@@ -1,398 +1,604 @@
-# Internal prompt representation for Fish Speech driver generation.
-from dataclasses import dataclass, field
-from typing import List, Literal, Union
+from __future__ import annotations
 
-import numpy as np
+import os
+from typing import Iterator, Optional
+
 import torch
+import torch._inductor.config
+from loguru import logger
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from fish_speech.tokenizer import (
-    IM_END_TOKEN,
-    MODALITY_TOKENS,
-    FishTokenizer,
+from fish_speech.driver.config import load_runtime_config
+from fish_speech.generation.sampling import (
+    RAS_HIGH_TEMP,
+    RAS_HIGH_TOP_P,
+    RAS_WIN_SIZE,
+    apply_repetition_penalty,
+    sample,
 )
+from fish_speech.models.text2semantic.llama import BaseTransformer, DualARTransformer
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+torch._inductor.config.coordinate_descent_tuning = True
+torch._inductor.config.triton.unique_kernel_names = True
+
+if hasattr(torch._inductor.config, "fx_graph_cache"):
+    torch._inductor.config.fx_graph_cache = True
 
 
-def restore_ndarray(obj, to_tensor: bool = False):
-    if isinstance(obj, dict) and "__ndarray__" in obj:
-        obj = np.frombuffer(obj["data"], dtype=obj["dtype"]).reshape(obj["shape"])
-
-    if to_tensor and isinstance(obj, np.ndarray):
-        obj = torch.from_numpy(obj.copy())
-
-    return obj
-
-
-@dataclass
-class BasePart:
-    type: Literal["text", "vq", "audio"] | None = None
-    cal_loss: bool | None = None
-
-
-@dataclass(kw_only=True)
-class VQPart(BasePart):
-    type = "vq"
-    codes: torch.Tensor
-
-    def __post_init__(self: "VQPart"):
-        self.type = "vq"
-        self.codes = restore_ndarray(self.codes, to_tensor=True)
-
-
-@dataclass(kw_only=True)
-class TextPart(BasePart):
-    type = "text"
-    text: str | None = None
-    tokens: list[int] | torch.Tensor | None = None
-
-    def __post_init__(self: "TextPart"):
-        self.type = "text"
-        if self.text is None and self.tokens is None:
-            raise ValueError("Either text or tokens must be provided")
-
-
-@dataclass(kw_only=True)
-class AudioPart(BasePart):
-    type = "audio"
-    features: torch.Tensor
-
-    def __post_init__(self: "AudioPart"):
-        self.type = "audio"
-        self.features = restore_ndarray(self.features, to_tensor=True)
-
-
-@dataclass(kw_only=True)
-class EncodedMessage:
-    tokens: torch.Tensor
-    labels: torch.Tensor
-    vq_mask_tokens: torch.Tensor | None = None
-    vq_mask_labels: torch.Tensor | None = None
-    vq_parts: list[torch.Tensor]
-    vq_require_losses: torch.Tensor | None = None
-    audio_parts: list[torch.Tensor]
-    audio_masks: torch.Tensor | None = None
-    metadata: dict | None = None
-
-
-@dataclass
-class ContentSequence:
+def _to_normal_tensor(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     """
-    Flexible sequence of content parts that supports interleaved multimodal format.
-    Example format: <|interleave|><|speaker:1|> TEXT AUDIO <|im_end|><|speaker:2|> TEXT AUDIO <|im_end|>
+    Copy tensor so it is not an inference tensor.
+    Avoids CPU roundtrip for performance.
     """
+    if t is None:
+        return None
+    return t.detach().clone()
 
-    parts: list[BasePart] = field(default_factory=list)
-    modality: Literal["text", "voice", "interleave"] | None = None
-    metadata: dict | None = None
 
-    def __init__(
-        self: "ContentSequence",
-        parts: list[BasePart | dict] | None = None,
-        modality: Literal["text", "voice", "interleave"] | None = None,
-        metadata: dict | None = None,
+def _iter_no_grad(iterator: Iterator[torch.Tensor]) -> Iterator[torch.Tensor]:
+    """
+    Iterate a lazy generator under torch.no_grad().
+    """
+    with torch.no_grad():
+        for item in iterator:
+            yield item
+
+
+def _use_sdpa_math() -> bool:
+    return load_runtime_config().model.sdpa_math
+
+
+def _cache_max_seq_len(model: BaseTransformer) -> int:
+    configured = load_runtime_config().model.cache_max_seq_len
+    return min(max(1, configured), model.config.max_seq_len)
+
+
+def _model_im_end_id(model: BaseTransformer) -> int:
+    im_end_id = int(getattr(model, "im_end_token_id", -1))
+    if im_end_id < 0 or im_end_id >= model.config.vocab_size:
+        raise RuntimeError("Model sampling buffers are missing a valid IM_END token id")
+    return im_end_id
+
+
+def _mask_logits_to_max_exclusive(
+    logits: torch.Tensor,
+    max_exclusive: int | None,
+    *,
+    block_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Restrict logits to ids [0, max_exclusive).
+
+    Used for S2-Pro style DAC where the semantic row may need 4096 ids, while
+    acoustic rows must stay inside 1024 ids.
+    """
+    if max_exclusive is None:
+        return logits
+
+    max_exclusive = int(max_exclusive)
+    vocab_size = int(logits.shape[-1])
+    if max_exclusive <= 0 or max_exclusive >= vocab_size:
+        return logits
+
+    if block_mask is not None:
+        blocked = block_mask
+        if blocked.device != logits.device or blocked.dtype != torch.bool:
+            blocked = blocked.to(device=logits.device, dtype=torch.bool)
+
+        if int(blocked.shape[-1]) != vocab_size:
+            blocked = torch.arange(vocab_size, device=logits.device) >= max_exclusive
+    else:
+        blocked = torch.arange(vocab_size, device=logits.device) >= max_exclusive
+
+    while blocked.ndim < logits.ndim:
+        blocked = blocked.unsqueeze(0)
+
+    return logits.masked_fill(blocked, float("-inf"))
+
+
+def _semantic_logit_bias(
+    model: DualARTransformer,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    vocab_size = model.config.vocab_size
+    cache_key = (str(device), str(dtype), vocab_size)
+    cache = getattr(model, "_semantic_logit_bias_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(model, "_semantic_logit_bias_cache", cache)
+
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    bias = torch.full((1, 1, vocab_size), float("-inf"), device=device, dtype=dtype)
+    bias[0, 0, model.semantic_token_mask_for_sampling] = 0.0
+    bias[0, 0, _model_im_end_id(model)] = 0.0
+    cache[cache_key] = bias
+    return bias
+
+
+def _fast_input_positions(
+    model: DualARTransformer,
+    *,
+    device: torch.device,
+) -> tuple[torch.Tensor, ...]:
+    cache_key = str(device)
+    cache = getattr(model, "_fast_input_pos_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(model, "_fast_input_pos_cache", cache)
+
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    positions = tuple(
+        torch.tensor([idx], device=device, dtype=torch.long)
+        for idx in range(model.config.num_codebooks)
+    )
+    cache[cache_key] = positions
+    return positions
+
+
+def decode_one_token_ar(
+    model: DualARTransformer,
+    x: torch.Tensor,
+    input_pos: torch.Tensor,
+    temperature: torch.Tensor,
+    top_p: torch.Tensor,
+    top_k: int,
+    semantic_logit_bias: torch.Tensor,
+    audio_masks: torch.Tensor,
+    audio_parts: torch.Tensor,
+    previous_tokens: Optional[torch.Tensor] = None,
+    repetition_penalty: float = 1.0,
+    high_temperature: torch.Tensor | None = None,
+    high_top_p: torch.Tensor | None = None,
+    fast_input_positions: tuple[torch.Tensor, ...] | None = None,
+    disable_ras: bool = False,
+    disable_repetition_penalty: bool = False,
+) -> torch.Tensor:
+    forward_result = model.forward_generate(
+        x,
+        input_pos,
+        audio_masks=audio_masks,
+        audio_parts=audio_parts,
+    )
+    logits = forward_result.logits
+    hidden_states = forward_result.hidden_states
+
+    biased_logits = logits + semantic_logit_bias
+
+    if (
+        not disable_repetition_penalty
+        and repetition_penalty != 1.0
+        and previous_tokens is not None
     ):
-        self.modality = modality
-        self.metadata = metadata or {}
-
-        fixed_parts = []
-        for part in parts or []:
-            if isinstance(part, dict):
-                if part["type"] == "vq":
-                    part = VQPart(**part)
-                elif part["type"] == "audio":
-                    part = AudioPart(**part)
-                elif part["type"] == "text":
-                    part = TextPart(**part)
-                else:
-                    raise ValueError(f"Unsupported part type: {part['type']}")
-            fixed_parts.append(part)
-
-        self.parts = fixed_parts
-
-        # If modality is specified, add it at the beginning if it's not already there
-        if self.modality and not (
-            len(self.parts) > 0
-            and isinstance(self.parts[0], dict) is False
-            and isinstance(self.parts[0], TextPart)
-            and self.parts[0].text is not None
-            and self.parts[0].text.startswith(MODALITY_TOKENS[self.modality])
-        ):
-            modality_token = MODALITY_TOKENS[self.modality]
-            self.parts.insert(0, TextPart(text=modality_token))
-
-    def append(
-        self: "ContentSequence",
-        part_or_parts: Union[BasePart, List[BasePart]],
-        add_end: bool = False,
-        speaker: Union[str, int] | None = None,
-    ):
-        """
-        Append a part or list of parts to the sequence.
-
-        Args:
-            part_or_parts: A single part or list of parts to add
-            add_end: Whether to add the IM_END_TOKEN after these parts
-            speaker: Optional speaker identifier (name or ID) to add before the parts
-        """
-        parts_to_add = (
-            [part_or_parts] if not isinstance(part_or_parts, list) else part_or_parts
+        window = previous_tokens[0]
+        biased_logits = apply_repetition_penalty(
+            biased_logits,
+            window,
+            repetition_penalty,
+            valid_token_mask=model.repetition_valid_token_mask,
         )
 
-        if speaker is not None:
-            speaker_token = f"<|speaker:{speaker}|>"
-            self.parts.append(TextPart(text=speaker_token))
+    main_token_normal = sample(
+        biased_logits,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+    )[0]
 
-        self.parts.extend(parts_to_add)
+    if previous_tokens is not None and not disable_ras:
+        in_window = (previous_tokens[0] == main_token_normal).any()
+        is_semantic = model.semantic_token_mask_for_sampling[main_token_normal]
 
-        if add_end:
-            self.parts.append(
-                TextPart(text=IM_END_TOKEN, cal_loss=self.parts[-1].cal_loss)
+        should_use_high = in_window & is_semantic
+        high_temperature = (
+            high_temperature
+            if high_temperature is not None
+            else torch.tensor(
+                RAS_HIGH_TEMP,
+                device=temperature.device,
+                dtype=temperature.dtype,
+            )
+        )
+        high_top_p = (
+            high_top_p
+            if high_top_p is not None
+            else torch.tensor(RAS_HIGH_TOP_P, device=top_p.device, dtype=top_p.dtype)
+        )
+
+        main_token_high = sample(
+            biased_logits,
+            temperature=high_temperature,
+            top_p=high_top_p,
+            top_k=top_k,
+        )[0]
+        main_token_normal = torch.where(
+            should_use_high,
+            main_token_high,
+            main_token_normal,
+        )
+
+    codebooks = [main_token_normal]
+
+    if fast_input_positions is None:
+        fast_input_positions = _fast_input_positions(
+            model,
+            device=hidden_states.device,
+        )
+
+    input_pos = fast_input_positions[0]
+    model.forward_generate_fast(hidden_states, input_pos)
+
+    a = model.semantic_token_to_code_for_sampling[main_token_normal]
+    a = torch.where(a >= 0, a, torch.zeros_like(a))
+
+    hidden_states = model.fast_embeddings(a)
+    codebooks.append(a)
+
+    acoustic_codebook_size = getattr(model, "acoustic_codebook_size_for_sampling", None)
+    acoustic_block_mask = getattr(model, "acoustic_block_mask_for_sampling", None)
+
+    for codebook_idx in range(1, model.config.num_codebooks):
+        input_pos = fast_input_positions[codebook_idx]
+        logits = model.forward_generate_fast(hidden_states, input_pos)
+
+        short_logits = _mask_logits_to_max_exclusive(
+            logits,
+            acoustic_codebook_size,
+            block_mask=acoustic_block_mask,
+        )
+        a = sample(
+            short_logits,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+        )[0]
+
+        hidden_states = model.fast_embeddings(a)
+        codebooks.append(a)
+
+    codebooks = torch.stack(codebooks, dim=1)
+
+    del logits, hidden_states, forward_result
+    return codebooks.T
+
+
+def decode_n_tokens(
+    model: DualARTransformer,
+    cur_token: torch.Tensor,
+    input_pos: torch.Tensor,
+    num_new_tokens: int,
+    temperature: torch.Tensor,
+    top_p: torch.Tensor,
+    top_k: int,
+    semantic_logit_bias: torch.Tensor,
+    audio_masks: torch.Tensor,
+    audio_parts: torch.Tensor,
+    decode_one_token=decode_one_token_ar,
+    repetition_penalty: float = 1.0,
+    stream_chunk_size: Optional[int] = None,
+    initial_stream_chunk_size: Optional[int] = None,
+    initial_token_chunk: Optional[torch.Tensor] = None,
+    low_latency_first_audio: bool = False,
+    profile_decode: bool = False,
+    compile: bool = False,
+) -> Iterator[torch.Tensor]:
+    """
+    Generate tokens autoregressively.
+    """
+
+    cur_token = cur_token.detach()
+    input_pos = input_pos.detach()
+    temperature = temperature.detach()
+    top_p = top_p.detach()
+    semantic_logit_bias = semantic_logit_bias.detach()
+
+    if audio_masks is not None:
+        audio_masks = audio_masks.detach()
+    if audio_parts is not None:
+        audio_parts = audio_parts.detach()
+
+    high_temperature = torch.tensor(
+        RAS_HIGH_TEMP,
+        device=temperature.device,
+        dtype=temperature.dtype,
+    )
+    high_top_p = torch.tensor(
+        RAS_HIGH_TOP_P,
+        device=top_p.device,
+        dtype=top_p.dtype,
+    )
+    fast_input_positions = _fast_input_positions(
+        model,
+        device=cur_token.device,
+    )
+
+    previous_tokens = torch.full(
+        (model.config.num_codebooks + 1, RAS_WIN_SIZE),
+        -1,
+        dtype=torch.long,
+        device=cur_token.device,
+    )
+
+    new_tokens: list[torch.Tensor] = []
+    first_chunk_emitted = stream_chunk_size is None
+
+    if stream_chunk_size is not None:
+        if initial_stream_chunk_size is None:
+            initial_stream_chunk_size = stream_chunk_size
+        initial_stream_chunk_size = max(1, int(initial_stream_chunk_size))
+        stream_chunk_size = max(1, int(stream_chunk_size))
+
+        if initial_token_chunk is not None:
+            new_tokens.append(initial_token_chunk.detach())
+
+    im_end_id = _model_im_end_id(model)
+    do_stream_log = stream_chunk_size is not None and profile_decode
+
+    for i in range(num_new_tokens):
+        if do_stream_log and i < 3:
+            logger.info(
+                "stream: decode_n_tokens iter={} cur_token.shape={} input_pos={}",
+                i,
+                cur_token.shape,
+                input_pos.shape,
             )
 
-    def encode(
-        self: "ContentSequence",
-        tokenizer: FishTokenizer,
-        add_shift: bool = True,
-        ignore_loss_tokens: list[str] = [],
-    ) -> EncodedMessage:
-        """
-        Encode the sequence parts into tokens for the model.
+        generated_so_far = i + (1 if initial_token_chunk is not None else 0)
+        disable_fast_first = (
+            low_latency_first_audio
+            and initial_stream_chunk_size is not None
+            and generated_so_far < initial_stream_chunk_size
+        )
+        previous_for_step = None if disable_fast_first else previous_tokens
+        repetition_for_step = 1.0 if disable_fast_first else repetition_penalty
 
-        Args:
-            tokenizer: The tokenizer to use
-            add_shift: Whether to shift tokens for next-token prediction
-            ignore_loss_tokens: List of token strings to ignore when calculating loss
-
-        Returns:
-            EncodedMessage with tensors ready for the model
-        """
-        all_tokens = []
-        all_labels = []
-
-        vq_parts = []
-        vq_masks = []
-        vq_require_losses = []
-
-        audio_parts = []
-        audio_masks = []
-
-        ignore_loss_token_ids = []
-        if ignore_loss_tokens:
-            ignore_loss_token_ids = [
-                tokenizer.get_token_id(i) for i in ignore_loss_tokens
-            ]
-
-        for part in self.parts:
-            if isinstance(part, TextPart):
-                if part.tokens is None:
-                    assert part.text is not None
-                    tokens = tokenizer.encode(part.text, add_special_tokens=False)
-                    tokens = torch.tensor(tokens, dtype=torch.long)
-                else:
-                    if isinstance(part.tokens, torch.Tensor):
-                        tokens = part.tokens.detach().to(dtype=torch.long)
-                    else:
-                        tokens = torch.tensor(part.tokens, dtype=torch.long)
-
-                if tokens.ndim != 1:
-                    tokens = tokens.reshape(-1)
-
-            elif isinstance(part, VQPart):
-                curr_codes = part.codes.clone().to(torch.long)
-                semantic_codes = curr_codes[0]
-
-                if (semantic_codes < 0).any() or (
-                    semantic_codes >= tokenizer.semantic_map_tensor.numel()
-                ).any():
-                    raise ValueError("Semantic VQ code out of tokenizer semantic range")
-
-                semantic_map = tokenizer.semantic_map_tensor.to(
-                    device=semantic_codes.device
+        try:
+            use_math = _use_sdpa_math()
+            if use_math:
+                with sdpa_kernel(SDPBackend.MATH):
+                    next_token = decode_one_token(
+                        model=model,
+                        x=cur_token,
+                        input_pos=input_pos,
+                        previous_tokens=previous_for_step,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                        semantic_logit_bias=semantic_logit_bias,
+                        audio_masks=audio_masks,
+                        audio_parts=audio_parts,
+                        repetition_penalty=repetition_for_step,
+                        high_temperature=high_temperature,
+                        high_top_p=high_top_p,
+                        fast_input_positions=fast_input_positions,
+                        disable_ras=disable_fast_first,
+                        disable_repetition_penalty=disable_fast_first,
+                    )
+            else:
+                next_token = decode_one_token(
+                    model=model,
+                    x=cur_token,
+                    input_pos=input_pos,
+                    previous_tokens=previous_for_step,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    semantic_logit_bias=semantic_logit_bias,
+                    audio_masks=audio_masks,
+                    audio_parts=audio_parts,
+                    repetition_penalty=repetition_for_step,
+                    high_temperature=high_temperature,
+                    high_top_p=high_top_p,
+                    fast_input_positions=fast_input_positions,
+                    disable_ras=disable_fast_first,
+                    disable_repetition_penalty=disable_fast_first,
                 )
-                tokens = semantic_map[semantic_codes].to(torch.long)
+        except Exception as e:
+            logger.exception(
+                "stream: decode_n_tokens FAILED at iter={} (cur_token.shape={}): {}",
+                i,
+                cur_token.shape,
+                e,
+            )
+            raise
 
-                vq_parts.append(curr_codes)
-                vq_require_losses.append(part.cal_loss is True)
-            elif isinstance(part, AudioPart):
-                raise NotImplementedError("AudioPart is not supported by encode() yet")
-            else:
-                raise ValueError(f"Unsupported part type: {type(part)}")
+        next_token = next_token.detach()
+        input_pos = (input_pos + 1).detach()
+        cur_token = next_token.view(1, model.config.num_codebooks + 1, -1)
 
-            all_tokens.append(tokens)
+        prev_col = next_token.view(model.config.num_codebooks + 1, -1)[:, :1]
+        previous_tokens = torch.cat(
+            [previous_tokens[:, 1:], prev_col],
+            dim=1,
+        ).detach()
 
-            if isinstance(part, VQPart):
-                vq_masks.append(torch.ones_like(tokens, dtype=torch.bool))
-                audio_masks.append(torch.zeros_like(tokens, dtype=torch.bool))
-            else:
-                vq_masks.append(torch.zeros_like(tokens, dtype=torch.bool))
-                audio_masks.append(torch.zeros_like(tokens, dtype=torch.bool))
+        new_tokens.append(next_token)
 
-            if getattr(part, "cal_loss", None) is True:
-                all_labels.append(tokens.clone())
-            else:
-                all_labels.append(torch.full_like(tokens, -100))
+        if stream_chunk_size is not None:
+            target_chunk_size = (
+                initial_stream_chunk_size
+                if not first_chunk_emitted
+                else stream_chunk_size
+            )
+            if len(new_tokens) >= target_chunk_size:
+                chunk_out = torch.cat(new_tokens, dim=1).detach()
+                if do_stream_log:
+                    logger.info(
+                        "stream: decode_n_tokens yielding chunk shape={} after iter={} target_chunk_size={}",
+                        chunk_out.shape,
+                        i,
+                        target_chunk_size,
+                    )
+                yield chunk_out
+                new_tokens = []
+                first_chunk_emitted = True
 
-        if not all_tokens:
-            tokens = torch.empty(0, dtype=torch.long)
-            labels = torch.empty(0, dtype=torch.long)
-            vq_masks = torch.empty(0, dtype=torch.bool)
-            audio_masks = torch.empty(0, dtype=torch.bool)
-        else:
-            tokens = torch.cat(all_tokens, dim=0)
-            labels = torch.cat(all_labels, dim=0)
-            vq_masks = torch.cat(vq_masks, dim=0)
-            audio_masks = torch.cat(audio_masks, dim=0)
+        if (cur_token[0, 0, -1] == im_end_id).any():
+            if do_stream_log:
+                logger.info("stream: decode_n_tokens EOS at iter={}", i)
+            break
 
-        vq_require_losses = torch.tensor(vq_require_losses, dtype=torch.bool)
+    del cur_token
 
-        vq_mask_tokens = vq_masks
-        vq_mask_labels = vq_masks
+    if new_tokens:
+        remainder = torch.cat(new_tokens, dim=1).detach()
+        if do_stream_log:
+            logger.info(
+                "stream: decode_n_tokens yielding remainder shape={}",
+                remainder.shape,
+            )
+        yield remainder
 
-        if add_shift and len(tokens) > 0:
-            tokens = tokens[:-1]
-            labels = labels[1:]
-            vq_masks = vq_masks[:-1]
-            vq_mask_tokens = vq_mask_tokens[:-1]
-            vq_mask_labels = vq_mask_labels[1:]
-            audio_masks = audio_masks[:-1]
 
-        for i in ignore_loss_token_ids:
-            if i is not None:
-                labels[labels == i] = -100
+@torch.no_grad()
+def generate(
+    *,
+    model: DualARTransformer,
+    prompt: torch.Tensor,
+    max_new_tokens: int,
+    audio_masks: torch.Tensor,
+    audio_parts: torch.Tensor,
+    decode_one_token=decode_one_token_ar,
+    num_samples: int = 1,
+    **sampling_kwargs,
+):
+    """
+    Takes a conditioning sequence as input and continues to generate tokens.
+    """
 
-        return EncodedMessage(
-            tokens=tokens,
-            labels=labels,
-            vq_parts=vq_parts,
-            vq_mask_tokens=vq_mask_tokens,
-            vq_mask_labels=vq_mask_labels,
-            vq_require_losses=vq_require_losses,
-            audio_parts=audio_parts,
-            audio_masks=audio_masks,
-            metadata=self.metadata,
+    if num_samples != 1:
+        raise ValueError("num_samples > 1 is not supported in this inference path")
+
+    T = prompt.size(1)
+    prompt = prompt[None].repeat(num_samples, 1, 1)
+
+    cache_len = _cache_max_seq_len(model)
+
+    if T >= cache_len:
+        raise ValueError(
+            f"Input sequence length {T} exceeds cache_max_seq_len {cache_len}"
         )
 
-    def encode_for_inference(
-        self: "ContentSequence",
-        tokenizer: FishTokenizer,
-        num_codebooks: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        encoded = self.encode(tokenizer, add_shift=False)
-        tokens = encoded.tokens
+    if max_new_tokens:
+        if T + max_new_tokens > cache_len:
+            max_new_tokens = cache_len - T
+        T_new = T + max_new_tokens
+    else:
+        T_new = cache_len
+        max_new_tokens = T_new - T
 
-        values = torch.zeros((num_codebooks + 1, len(tokens)), dtype=torch.long)
-        values[0] = tokens
+    device = prompt.device
+    dtype = next(model.parameters()).dtype
 
-        if (encoded.vq_parts is None or len(encoded.vq_parts) == 0) and (
-            encoded.audio_parts is None or len(encoded.audio_parts) == 0
-        ):
-            return values, None, None
+    if not hasattr(model, "_cache_setup_done") or not model._cache_setup_done:
+        with torch.device(device):
+            model.setup_caches(
+                max_batch_size=1,
+                max_seq_len=cache_len,
+                dtype=next(model.parameters()).dtype,
+            )
+        model._cache_setup_done = True
 
-        audio_parts = None
-        audio_masks = None
+    codebook_dim = 1 + model.config.num_codebooks
 
-        if encoded.vq_parts is not None and len(encoded.vq_parts) > 0:
-            vq_parts = encoded.vq_parts
-            if len(vq_parts) > 1:
-                all_vq_codes = torch.cat(vq_parts, dim=1)
-            else:
-                all_vq_codes = vq_parts[0]
+    input_pos = torch.arange(0, T, device=device, dtype=torch.long)
 
-            if all_vq_codes.ndim != 2:
-                raise ValueError(f"VQ codes must be 2D, got {all_vq_codes.ndim}D")
+    stream_chunk_size = sampling_kwargs.get("stream_chunk_size", None)
+    if stream_chunk_size is None:
+        empty = torch.empty((codebook_dim, cache_len), dtype=prompt.dtype, device=device)
+        empty[:, :T] = prompt
+        seq = empty
+    else:
+        seq = None
 
-            if all_vq_codes.shape[0] != num_codebooks:
-                raise ValueError(
-                    f"VQ codes and model codebooks mismatch: "
-                    f"codes.C={all_vq_codes.shape[0]}, model.C={num_codebooks}"
-                )
+    temp_val = sampling_kwargs.get("temperature", 1.0)
+    top_p_val = sampling_kwargs.get("top_p", 0.9)
+    top_k_val = sampling_kwargs.get("top_k", 30)
+    repetition_penalty = sampling_kwargs.get("repetition_penalty", 1.0)
 
-            num_vq_tokens = encoded.vq_mask_tokens.sum().item()
-            if all_vq_codes.shape[-1] != num_vq_tokens:
-                raise ValueError(
-                    f"VQ codes and mask mismatch: codes.T={all_vq_codes.shape[-1]}, "
-                    f"mask={num_vq_tokens}"
-                )
+    temperature = torch.tensor(temp_val, device=device, dtype=dtype)
+    top_p = torch.tensor(top_p_val, device=device, dtype=dtype)
 
-            values[1:, encoded.vq_mask_tokens] = all_vq_codes.to(dtype=torch.long)
+    semantic_logit_bias = _semantic_logit_bias(
+        model,
+        device=device,
+        dtype=dtype,
+    )
 
-        if encoded.audio_parts is not None and len(encoded.audio_parts) > 0:
-            audio_parts = torch.cat(encoded.audio_parts, dim=0)
-            audio_masks = encoded.audio_masks[None, :]
+    prefill_decode = decode_one_token_ar
 
-        return values, audio_masks, audio_parts
+    x_prefill = prompt.view(1, codebook_dim, -1)
+    if hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "mark_dynamic"):
+        torch._dynamo.mark_dynamic(x_prefill, 2, min=1, max=cache_len)
+        torch._dynamo.mark_dynamic(input_pos, 0, min=1, max=cache_len)
 
-    def visualize(
-        self: "ContentSequence",
-        tokenizer: FishTokenizer,
-        ignore_loss_tokens: list[str] = [],
-        merge_semantic_tokens: bool = False,
-    ):
-        """
-        Visualize the encoded sequence with color-coded tokens.
-        Blue/cyan tokens contribute to loss, green tokens do not.
-        """
-        encoded = self.encode(
-            tokenizer, add_shift=False, ignore_loss_tokens=ignore_loss_tokens
-        )
+    first_token = prefill_decode(
+        model,
+        x_prefill,
+        input_pos,
+        temperature,
+        top_p,
+        top_k_val,
+        semantic_logit_bias,
+        audio_masks,
+        audio_parts,
+        repetition_penalty=repetition_penalty,
+    )
 
-        colors = {
-            "blue": "\033[94m",
-            "cyan": "\033[96m",
-            "green": "\033[92m",
-            "dark_green": "\033[32m",
-        }
-        blue_idx = 0
-        green_idx = 0
+    if seq is not None:
+        seq[:, T : T + 1] = first_token
 
-        def print_in_blue(x):
-            nonlocal blue_idx
-            color = colors["blue"] if blue_idx % 2 == 0 else colors["cyan"]
-            print(f"{color}{x}\033[0m", end="")
-            blue_idx += 1
+    input_pos = torch.tensor([T], device=device, dtype=torch.long)
+    stream_chunk_size = sampling_kwargs.pop("stream_chunk_size", None)
+    initial_stream_chunk_size = sampling_kwargs.pop("initial_stream_chunk_size", None)
+    low_latency_first_audio = sampling_kwargs.pop("low_latency_first_audio", False)
+    compile = sampling_kwargs.pop("compile", False)
 
-        def print_in_green(x):
-            nonlocal green_idx
-            color = colors["green"] if green_idx % 2 == 0 else colors["dark_green"]
-            print(f"{color}{x}\033[0m", end="")
-            green_idx += 1
+    im_end_id = _model_im_end_id(model)
+    if first_token[0, 0] == im_end_id:
+        if stream_chunk_size is not None:
+            return _iter_no_grad(iter([]))
+        return seq[:, : T + 1]
 
-        def print_semantic_token(x, count):
-            val = f"[<|semantic|>x{count}]"
-            if x == -100:
-                print_in_green(val)
-            else:
-                print_in_blue(val)
+    decode_iter = decode_n_tokens(
+        model,
+        first_token.view(1, codebook_dim, -1),
+        input_pos,
+        max(0, max_new_tokens - 1),
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k_val,
+        semantic_logit_bias=semantic_logit_bias,
+        audio_masks=audio_masks,
+        audio_parts=audio_parts,
+        decode_one_token=decode_one_token,
+        repetition_penalty=repetition_penalty,
+        stream_chunk_size=stream_chunk_size,
+        initial_stream_chunk_size=initial_stream_chunk_size,
+        initial_token_chunk=first_token.clone() if stream_chunk_size is not None else None,
+        low_latency_first_audio=low_latency_first_audio,
+        compile=compile,
+    )
 
-        count_semantic_tokens = 0
-        semantic_label = None
+    if stream_chunk_size is None:
+        try:
+            x = next(iter(decode_iter))
+        except StopIteration:
+            seq = seq[:, : T + 1]
+            del first_token, prompt, empty, input_pos
+            return seq
 
-        for tok, lab in zip(encoded.tokens, encoded.labels):
-            token_id = int(tok.item())
+        seq = seq[:, : T + 1 + x.size(1)]
+        seq[:, T + 1 :] = x
+        del first_token, x, prompt, empty, input_pos
+        return seq
 
-            if merge_semantic_tokens:
-                if (
-                    tokenizer.semantic_begin_id <= token_id <= tokenizer.semantic_end_id
-                    and (semantic_label is None or semantic_label == lab)
-                ):
-                    count_semantic_tokens += 1
-                    semantic_label = lab
-                    continue
-                elif count_semantic_tokens > 0:
-                    print_semantic_token(semantic_label, count_semantic_tokens)
-                    count_semantic_tokens = 0
-                    semantic_label = None
-
-            val = tokenizer.decode([token_id])
-
-            if not val:
-                val = f"<{token_id}>"
-
-            if lab == -100:
-                print_in_green(val)
-            else:
-                print_in_blue(val)
-
-        if merge_semantic_tokens and count_semantic_tokens > 0:
-            print_semantic_token(semantic_label, count_semantic_tokens)
-
-        print()
+    return _iter_no_grad(decode_iter)

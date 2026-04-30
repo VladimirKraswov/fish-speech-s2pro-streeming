@@ -1646,11 +1646,12 @@ async def session_open(req: SessionOpenRequest) -> JSONResponse:
         except Exception as exc:
             if not config.intro_cache.ignore_errors:
                 if rec.synthesis_session_id:
-                    await _close_upstream_synthesis_session(
-                        client,
-                        rec.synthesis_session_id,
-                        reason="warm_intro_failed",
-                    )
+                    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as cleanup_client:
+                        await _close_upstream_synthesis_session(
+                            cleanup_client,
+                            rec.synthesis_session_id,
+                            reason="warm_intro_failed",
+                        )
                 await session_store.close(rec.session_id)
                 raise HTTPException(
                     502,

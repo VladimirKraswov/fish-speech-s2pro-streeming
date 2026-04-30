@@ -34,6 +34,8 @@ if os.getenv("UPSTREAM_TTS_URL"):
 
 UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=None)
 FISH_API_KEY = os.getenv("FISH_API_KEY", "").strip()
+PREFIX_CACHE_SALT = os.getenv("FISH_PREFIX_CACHE_SALT", "").strip()
+PREFIX_CACHE_SCHEMA_VERSION = 2
 
 DEFAULT_REFERENCE_ID = _RUNTIME.proxy.default_reference_id
 SESSION_TTL_SEC = _RUNTIME.proxy.session_ttl_sec
@@ -576,6 +578,10 @@ def normalize_config(config_text: str) -> ProxyConfig:
         raise HTTPException(400, detail=str(exc)) from exc
 
 
+def _normalized_reference_id(config: ProxyConfig) -> str:
+    return (config.tts.reference_id or config.default_reference_id or "").strip()
+
+
 def build_upstream_payload(
     text: str,
     config: ProxyConfig,
@@ -583,7 +589,7 @@ def build_upstream_payload(
     commit_seq: int | None = None,
 ) -> dict[str, Any]:
     tts = config.tts
-    reference_id = (tts.reference_id or "").strip() or config.default_reference_id
+    reference_id = _normalized_reference_id(config)
 
     payload = {
         "text": text,
@@ -683,9 +689,17 @@ def _normalize_tail_after_commit(text: str) -> str:
 
 def _intro_cache_key(config: ProxyConfig) -> str:
     tts = config.tts
+
     payload = {
-        "text": config.intro_cache.text,
-        "reference_id": tts.reference_id or config.default_reference_id,
+        "cache_schema": PREFIX_CACHE_SCHEMA_VERSION,
+        "prefix_cache_salt": PREFIX_CACHE_SALT,
+        "runtime_version": _RUNTIME.version,
+        "llama_checkpoint_path": _RUNTIME.paths.llama_checkpoint_path,
+        "decoder_checkpoint_path": _RUNTIME.paths.decoder_checkpoint_path,
+        "decoder_config_name": _RUNTIME.paths.decoder_config_name,
+        "upstream_url": UPSTREAM_TTS_URL,
+        "intro_text": config.intro_cache.text,
+        "reference_id": _normalized_reference_id(config),
         "format": tts.format,
         "seed": tts.seed,
         "normalize": tts.normalize,
@@ -700,9 +714,18 @@ def _intro_cache_key(config: ProxyConfig) -> str:
         "stream_chunk_size": tts.stream_chunk_size,
         "first_initial_stream_chunk_size": tts.first_initial_stream_chunk_size,
         "first_stream_chunk_size": tts.first_stream_chunk_size,
-        "upstream_url": UPSTREAM_TTS_URL,
+        "stateful_synthesis": tts.stateful_synthesis,
+        "stateful_history_turns": tts.stateful_history_turns,
+        "stateful_history_chars": tts.stateful_history_chars,
+        "stateful_history_code_frames": tts.stateful_history_code_frames,
     }
-    dump = json.dumps(payload, sort_keys=True)
+
+    dump = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
     return hashlib.sha256(dump.encode("utf-8")).hexdigest()
 
 
@@ -1506,6 +1529,26 @@ async def root() -> dict[str, Any]:
 async def health() -> dict[str, Any]:
     stats = await session_store.stats()
     return {"ok": True, **stats}
+
+
+@app.post("/intro-cache/key")
+async def intro_cache_key(req: SessionOpenRequest) -> JSONResponse:
+    config = normalize_config(req.config_text)
+    key = _intro_cache_key(config)
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "key": key,
+            "key_short": key[:8],
+            "schema": PREFIX_CACHE_SCHEMA_VERSION,
+            "salt_set": bool(PREFIX_CACHE_SALT),
+            "reference_id": _normalized_reference_id(config),
+            "intro_text_len": len(config.intro_cache.text),
+            "intro_enabled": config.intro_cache.enabled,
+            "warm_on_session_open": config.intro_cache.warm_on_session_open,
+        }
+    )
 
 
 @app.get("/intro-cache/stats")

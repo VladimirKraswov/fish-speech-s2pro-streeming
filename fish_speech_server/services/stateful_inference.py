@@ -14,6 +14,49 @@ from fish_speech_server.services.synthesis_context import (
     estimate_code_frames,
 )
 
+def _codes_to_cpu_2d(codes: Any) -> torch.Tensor | None:
+    if codes is None:
+        return None
+
+    if torch.is_tensor(codes):
+        tensor = codes.detach().cpu().long()
+    else:
+        tensor = torch.tensor(codes, dtype=torch.long)
+
+    while tensor.dim() > 2 and tensor.shape[0] == 1:
+        tensor = tensor.squeeze(0)
+
+    if tensor.dim() == 1:
+        tensor = tensor.unsqueeze(0)
+
+    if tensor.dim() != 2:
+        raise ValueError(
+            f"Expected codes with 2 dims [codebooks, frames], got {tuple(tensor.shape)}"
+        )
+
+    return tensor.contiguous()
+
+
+def _concat_code_chunks(chunks: list[Any]) -> torch.Tensor | None:
+    tensors: list[torch.Tensor] = []
+
+    for chunk in chunks:
+        tensor = _codes_to_cpu_2d(chunk)
+        if tensor is not None and tensor.numel() > 0:
+            tensors.append(tensor)
+
+    if not tensors:
+        return None
+
+    codebook_count = tensors[0].shape[0]
+    for tensor in tensors:
+        if tensor.shape[0] != codebook_count:
+            raise ValueError(
+                f"Mismatched codebook count: expected {codebook_count}, got {tensor.shape[0]}"
+            )
+
+    return torch.cat(tensors, dim=-1).cpu().contiguous()
+
 if TYPE_CHECKING:
     from fish_speech_server.schema import StatefulTTSRequest
     from fish_speech_server.services.synthesis_context import SynthesisContext
@@ -58,29 +101,19 @@ async def stateful_inference_async(
     # Concatenate collected codes if any
     final_codes = None
     code_frames = 0
+
     if collected_codes:
         try:
-            # In real environment, collected_codes is a list of torch.Tensors
-            # with shape (codebooks, frames)
-            if all(hasattr(c, "shape") for c in collected_codes):
-                final_codes = torch.cat(collected_codes, dim=1).cpu()
-            else:
-                # Fallback or mixed types (unlikely in practice)
-                # If they are not tensors, we still try to move them to CPU if they are objects
-                final_codes = []
-                for c in collected_codes:
-                    if hasattr(c, "cpu"):
-                        final_codes.append(c.cpu())
-                    else:
-                        final_codes.append(c)
+            final_codes = _concat_code_chunks(collected_codes)
 
-            # Crop codes to limit before storing in history
             if final_codes is not None and context.max_history_code_frames > 0:
                 final_codes = crop_codes_tail(
-                    final_codes, context.max_history_code_frames
+                    final_codes,
+                    context.max_history_code_frames,
                 )
 
             code_frames = estimate_code_frames(final_codes)
+
         except Exception as e:
             logger.warning(f"Failed to concatenate collected codes: {e}")
             final_codes = None

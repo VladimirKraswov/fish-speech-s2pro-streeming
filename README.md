@@ -895,6 +895,85 @@ export COMPOSE_DOCKER_CLI_BUILD=1
 
 ---
 
+# Extreme TTFA Profiles
+
+Для достижения минимально возможной задержки (Extreme TTFA) используйте следующие профили в `runtime.json` или в `config_text` при открытии сессии.
+
+### Агрессивный профиль (Aggressive)
+
+Максимально быстрая реакция, минимальные буферы.
+
+```json
+{
+  "commit": {
+    "first": {
+      "min_chars": 1,
+      "target_chars": 8,
+      "max_chars": 18,
+      "max_wait_ms": 60,
+      "allow_partial_after_ms": 120
+    },
+    "next": {
+      "min_chars": 24,
+      "target_chars": 80,
+      "max_chars": 140,
+      "max_wait_ms": 240,
+      "allow_partial_after_ms": 420
+    },
+    "flush_on_sentence_punctuation": true,
+    "flush_on_clause_punctuation": false,
+    "flush_on_newline": true,
+    "carry_incomplete_tail": true
+  },
+  "tts": {
+    "stream_tokens": true,
+    "first_initial_stream_chunk_size": 4,
+    "first_stream_chunk_size": 2,
+    "initial_stream_chunk_size": 8,
+    "stream_chunk_size": 4
+  },
+  "playback": {
+    "first_commit_target_emit_bytes": 512,
+    "first_commit_start_buffer_ms": 0,
+    "client_initial_start_delay_ms": 0,
+    "client_start_buffer_ms": 80,
+    "stop_grace_ms": 0
+  },
+  "intro_cache": {
+    "enabled": true,
+    "warm_on_session_open": true,
+    "ignore_errors": true,
+    "emit_bytes": 4096,
+    "pause_after_ms": 0
+  }
+}
+```
+
+### Безопасный профиль (Safe)
+
+Более стабильный поток при сохранении низкой задержки.
+
+```json
+{
+  "tts": {
+    "stream_tokens": true,
+    "first_initial_stream_chunk_size": 6,
+    "first_stream_chunk_size": 4,
+    "initial_stream_chunk_size": 10,
+    "stream_chunk_size": 6
+  },
+  "playback": {
+    "first_commit_target_emit_bytes": 1024,
+    "first_commit_start_buffer_ms": 20,
+    "client_initial_start_delay_ms": 20,
+    "client_start_buffer_ms": 100,
+    "stop_grace_ms": 0
+  }
+}
+```
+
+---
+
 # Требования к оборудованию
 
 Минимально:

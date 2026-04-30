@@ -26,7 +26,12 @@ from loguru import logger
 from starlette.responses import Response
 from typing_extensions import Annotated
 
-from fish_speech import DriverErrorEvent, DriverFinalAudioEvent
+from fish_speech import (
+    DriverAudioChunkEvent,
+    DriverErrorEvent,
+    DriverFinalAudioEvent,
+    DriverTokenChunkEvent,
+)
 from fish_speech_server.schema import (
     AddEncodedReferenceResponse,
     AddReferenceResponse,
@@ -693,7 +698,7 @@ async def close_synthesis_session(synthesis_session_id: str = Body(...)):
     )
 
 
-def _codes_to_cpu_tensor(codes) -> torch.Tensor | None:
+def _codes_to_cpu_tensor(codes: Any) -> torch.Tensor | None:
     if codes is None:
         return None
 
@@ -716,8 +721,8 @@ def _codes_to_cpu_tensor(codes) -> torch.Tensor | None:
     return tensor.contiguous()
 
 
-def _concat_code_chunks(chunks: list) -> torch.Tensor | None:
-    tensors = []
+def _concat_code_chunks(chunks: list[Any]) -> torch.Tensor | None:
+    tensors: list[torch.Tensor] = []
 
     for chunk in chunks:
         tensor = _codes_to_cpu_tensor(chunk)
@@ -726,6 +731,13 @@ def _concat_code_chunks(chunks: list) -> torch.Tensor | None:
 
     if not tensors:
         return None
+
+    codebook_count = tensors[0].shape[0]
+    for tensor in tensors:
+        if tensor.shape[0] != codebook_count:
+            raise ValueError(
+                f"Mismatched codebook count: expected {codebook_count}, got {tensor.shape[0]}"
+            )
 
     return torch.cat(tensors, dim=-1).cpu().contiguous()
 
@@ -840,7 +852,7 @@ async def generate_intro_cache(req: Annotated[ServeTTSRequest, Body(exclusive=Tr
         if not codes_list or code_frames <= 0:
             raise HTTPException(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
-                content=("Intro audio generated, but no continuation codes were produced"),
+                content="Intro audio generated, but no continuation codes were produced",
             )
 
         pcm = b"".join(pcm_parts)

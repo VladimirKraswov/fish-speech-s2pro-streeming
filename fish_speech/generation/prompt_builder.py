@@ -314,7 +314,11 @@ def generate_committed_segments(
             _count_code_frames(_as_list(continuation_tokens)),
         )
 
-    model_size = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    model_size = getattr(model, "_trainable_param_count", None)
+    if model_size is None:
+        model_size = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        model._trainable_param_count = model_size
+
     tokenizer = model.tokenizer
     max_length = _cache_max_seq_len(model)
 
@@ -367,7 +371,7 @@ def generate_committed_segments(
     requested_max_new_tokens = int(max_new_tokens or 0)
 
     for sample_idx in range(num_samples):
-        if torch.cuda.is_available():
+        if profile and torch.cuda.is_available():
             torch.cuda.synchronize()
 
         t0 = time.perf_counter()
@@ -731,7 +735,7 @@ def generate_committed_segments(
                         time.perf_counter() - t0,
                     )
 
-                if torch.cuda.is_available():
+                if profile and torch.cuda.is_available():
                     torch.cuda.synchronize()
 
                 t_batch = time.perf_counter() - t0

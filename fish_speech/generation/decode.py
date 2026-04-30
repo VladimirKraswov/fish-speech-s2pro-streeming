@@ -508,9 +508,14 @@ def generate(
     codebook_dim = 1 + model.config.num_codebooks
 
     input_pos = torch.arange(0, T, device=device, dtype=torch.long)
-    empty = torch.empty((codebook_dim, cache_len), dtype=prompt.dtype, device=device)
-    empty[:, :T] = prompt
-    seq = empty
+
+    stream_chunk_size = sampling_kwargs.get("stream_chunk_size", None)
+    if stream_chunk_size is None:
+        empty = torch.empty((codebook_dim, cache_len), dtype=prompt.dtype, device=device)
+        empty[:, :T] = prompt
+        seq = empty
+    else:
+        seq = None
 
     temp_val = sampling_kwargs.get("temperature", 1.0)
     top_p_val = sampling_kwargs.get("top_p", 0.9)
@@ -520,13 +525,11 @@ def generate(
     temperature = torch.tensor(temp_val, device=device, dtype=dtype)
     top_p = torch.tensor(top_p_val, device=device, dtype=dtype)
 
-    vocab_size = model.config.vocab_size
-    semantic_logit_bias = torch.full(
-        (1, 1, vocab_size), float("-inf"), device=device, dtype=dtype
+    semantic_logit_bias = _semantic_logit_bias(
+        model,
+        device=device,
+        dtype=dtype,
     )
-
-    semantic_logit_bias[0, 0, model.semantic_token_mask_for_sampling] = 0.0
-    semantic_logit_bias[0, 0, _model_im_end_id(model)] = 0.0
 
     prefill_decode = decode_one_token_ar
 
@@ -547,11 +550,13 @@ def generate(
         audio_parts,
         repetition_penalty=repetition_penalty,
     )
-    seq[:, T : T + 1] = first_token
+    if seq is not None:
+        seq[:, T : T + 1] = first_token
 
     input_pos = torch.tensor([T], device=device, dtype=torch.long)
     stream_chunk_size = sampling_kwargs.pop("stream_chunk_size", None)
     initial_stream_chunk_size = sampling_kwargs.pop("initial_stream_chunk_size", None)
+    low_latency_first_audio = sampling_kwargs.pop("low_latency_first_audio", False)
     compile = sampling_kwargs.pop("compile", False)
 
     im_end_id = _model_im_end_id(model)
@@ -577,6 +582,7 @@ def generate(
         stream_chunk_size=stream_chunk_size,
         initial_stream_chunk_size=initial_stream_chunk_size,
         initial_token_chunk=first_token.clone() if stream_chunk_size is not None else None,
+        low_latency_first_audio=low_latency_first_audio,
         compile=compile,
     )
 

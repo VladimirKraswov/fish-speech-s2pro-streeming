@@ -251,6 +251,14 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
             stream_decode = bool(req.stream_tokens or req.stream_audio)
             emit_token_events = bool(req.stream_tokens)
+
+            if emit_token_events and req.stream_audio:
+                logger.warning(
+                    "latency_warning: both stream_tokens and stream_audio are enabled. "
+                    "This will cause a CPU/GPU synchronization on every chunk and increase TTFA. "
+                    "For production low-latency, use stream_audio=True and stream_tokens=False."
+                )
+
             collect_codes = not req.stream_audio
             ack_queue = queue.Queue() if stream_decode else None
             cancel_event = threading.Event() if stream_decode else None

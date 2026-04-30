@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { FishProxyClient } from './api/client';
 import { AudioEngine } from './audio/engine';
 import { LLMSimulator, type ChunkMode } from './lib/simulator';
-import type { CommittedItem, ProxyConfig, StreamEvent } from './types';
+import type { CommittedItem, PrefixCacheItem, ProxyConfig, StreamEvent } from './types';
 import './app.css';
 
 const PROXY_URL =
@@ -226,6 +226,15 @@ export function App() {
   const [activeCommit, setActiveCommit] = useState('');
   const [logs, setLogs] = useState<string[]>([]);
 
+  const [llmVisibleText, setLlmVisibleText] = useState('');
+  const [llmTyping, setLlmTyping] = useState(false);
+
+  const [prefixCacheList, setPrefixCacheList] = useState<PrefixCacheItem[]>([]);
+  const [selectedCache, setSelectedCache] = useState<PrefixCacheItem | null>(null);
+  const [prefixInput, setPrefixInput] = useState('');
+  const [prefixAdding, setPrefixAdding] = useState(false);
+
+  const chatScrollRef = useRef<HTMLDivElement>(null);
   const client = useRef(new FishProxyClient(PROXY_URL));
   const abortController = useRef<AbortController | null>(null);
   const simulator = useRef<LLMSimulator | null>(null);
@@ -342,6 +351,42 @@ export function App() {
     } catch {
       setWebUiHealth({ ok: false });
     }
+
+    await refreshPrefixStats();
+  };
+
+  const refreshPrefixStats = async () => {
+    try {
+      const stats = await client.current.getPrefixCacheStats();
+      setPrefixCacheList(stats.entries);
+    } catch (error) {
+      log(`failed to fetch prefix stats: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  const clearPrefixCache = async () => {
+    try {
+      await client.current.clearPrefixCache();
+      log('prefix cache cleared');
+      setSelectedCache(null);
+      await refreshPrefixStats();
+    } catch (error) {
+      log(`failed to clear prefix cache: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  const addPrefixCache = async () => {
+    if (!prefixInput) return;
+    setPrefixAdding(true);
+    try {
+      const resp = await client.current.addPrefixCache(configText, prefixInput);
+      log(`prefix cache added: ${resp.key_short}`);
+      await refreshPrefixStats();
+    } catch (error) {
+      log(`failed to add prefix cache: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setPrefixAdding(false);
+    }
   };
 
   useEffect(() => {
@@ -452,12 +497,22 @@ export function App() {
     setActiveCommit('');
   };
 
+  useEffect(() => {
+    if (chatScrollRef.current) {
+      chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
+    }
+  }, [llmVisibleText]);
+
   const startTextStream = () => {
     if (!sessionId || isStreaming) return;
 
     setIsStreaming(true);
+    setLlmTyping(true);
+    setLlmVisibleText('');
     setSessionStatus('open');
     log('LLM text simulation started');
+
+    let isFirstChunk = true;
 
     simulator.current = new LLMSimulator({
       mode,
@@ -467,17 +522,30 @@ export function App() {
       speedMultiplier,
       onChunk: async (chunk) => {
         try {
-          const data = await client.current.appendText(sessionId, chunk);
+          const options: { cache?: string; cache_key?: string } = {};
+          if (isFirstChunk) {
+            if (selectedCache) {
+              options.cache_key = selectedCache.key;
+            } else if (prefixInput) {
+              options.cache = prefixInput;
+            }
+            isFirstChunk = false;
+          }
+
+          const data = await client.current.appendText(sessionId, chunk, options);
+          setLlmVisibleText((prev) => prev + chunk);
           addCommitted(data.committed);
           return true;
         } catch (error) {
           log(`append failed: ${error instanceof Error ? error.message : String(error)}`);
           setIsStreaming(false);
+          setLlmTyping(false);
           return false;
         }
       },
       onFinish: async () => {
         setIsStreaming(false);
+        setLlmTyping(false);
         log('LLM text simulation finished');
         await finishSession();
       },
@@ -489,6 +557,7 @@ export function App() {
   const stopTextStream = async () => {
     simulator.current?.stop();
     setIsStreaming(false);
+    setLlmTyping(false);
     log('LLM text simulation stopped');
     await finishSession();
   };
@@ -554,11 +623,57 @@ export function App() {
             <span class={`session-badge ${sessionId ? 'on' : ''}`}>{sessionStatus}</span>
           </div>
 
-          <textarea
-            class="text-input"
-            value={text}
-            onInput={(e) => setText((e.currentTarget as HTMLTextAreaElement).value)}
-          />
+          <div class="input-container">
+            <textarea
+              class="text-input"
+              value={text}
+              onInput={(e) => setText((e.currentTarget as HTMLTextAreaElement).value)}
+            />
+
+            <div class="chat-preview">
+              <div class="chat-head">
+                <span>Assistant</span>
+                <span class={`chat-status ${llmTyping ? 'typing' : ''}`}>
+                  {llmTyping ? 'typing...' : llmVisibleText ? 'finished' : 'idle'}
+                </span>
+              </div>
+              <div class="chat-body" ref={chatScrollRef}>
+                {llmVisibleText ? (
+                  <div class="chat-bubble">
+                    {llmVisibleText}
+                    {llmTyping && <span class="typing-cursor">|</span>}
+                  </div>
+                ) : (
+                  <div class="chat-placeholder">Здесь будет появляться ответ LLM...</div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div class="prefix-controls">
+            <div class="prefix-input-row">
+              <label>
+                Prefix for cache
+                <div class="input-with-button">
+                  <input
+                    type="text"
+                    value={prefixInput}
+                    onInput={(e) => {
+                      setPrefixInput((e.currentTarget as HTMLInputElement).value);
+                      setSelectedCache(null);
+                    }}
+                    placeholder="Enter prefix text..."
+                  />
+                  {selectedCache && (
+                    <div class="selected-badge">
+                      <span>{selectedCache.key_short}</span>
+                      <button onClick={() => setSelectedCache(null)}>×</button>
+                    </div>
+                  )}
+                </div>
+              </label>
+            </div>
+          </div>
 
           <div class="controls-grid">
             <label>
@@ -604,39 +719,94 @@ export function App() {
           </div>
         </div>
 
-        <div class="panel config-panel">
-          <div class="panel-head">
-            <div>
-              <h2>Runtime preset</h2>
-              <p>
-                JSON override для `/session/open`. Runtime default использует `runtime.json` без override.
-                Balanced, Low latency и Stable — явные UI overrides.
-              </p>
+        <div class="config-stack">
+          <div class="panel config-panel">
+            <div class="panel-head">
+              <div>
+                <h2>Runtime preset</h2>
+                <p>
+                  JSON override для `/session/open`. Runtime default использует `runtime.json` без override.
+                  Balanced, Low latency и Stable — явные UI overrides.
+                </p>
+              </div>
+            </div>
+
+            <div class="preset-row">
+              {Object.entries(PRESETS).map(([key, value]) => (
+                <button
+                  key={key}
+                  class={preset === key ? 'selected' : ''}
+                  onClick={() => applyPreset(key as keyof typeof PRESETS)}
+                  disabled={!!sessionId}
+                >
+                  {value.title}
+                </button>
+              ))}
+            </div>
+
+            {configError && <div class="error-box">{configError}</div>}
+
+            <textarea
+              class="config-input"
+              value={configText}
+              spellcheck={false}
+              onInput={(e) => setConfigText((e.currentTarget as HTMLTextAreaElement).value)}
+              disabled={!!sessionId}
+            />
+          </div>
+
+          <div class="panel library-panel">
+            <div class="panel-head">
+              <div>
+                <h2>Prefix cache library</h2>
+                <p>Управление сохраненными префиксами для быстрого старта.</p>
+              </div>
+              <div class="button-row">
+                <button class="ghost" onClick={refreshPrefixStats}>Refresh</button>
+                <button class="danger ghost" onClick={clearPrefixCache}>Clear all</button>
+              </div>
+            </div>
+
+            <div class="add-prefix-row">
+              <input
+                type="text"
+                placeholder="Prefix text to cache..."
+                value={prefixInput}
+                onInput={(e) => setPrefixInput((e.currentTarget as HTMLInputElement).value)}
+              />
+              <button class="primary" onClick={addPrefixCache} disabled={prefixAdding || !prefixInput}>
+                {prefixAdding ? 'Adding...' : 'Add cache'}
+              </button>
+            </div>
+
+            <div class="cache-list">
+              {prefixCacheList.length === 0 ? (
+                <div class="empty">Библиотека пуста. Добавьте первый префикс.</div>
+              ) : (
+                prefixCacheList.map((item) => (
+                  <div key={item.key} class={`cache-item ${selectedCache?.key === item.key ? 'selected' : ''}`}>
+                    <div class="cache-info">
+                      <div class="cache-main">
+                        <span class="cache-key">{item.key_short}</span>
+                        <span class="cache-mode">{item.cache_mode}</span>
+                        <span class="cache-method">{item.boundary_method}</span>
+                      </div>
+                      <div class="cache-text">{item.text}</div>
+                      <div class="cache-stats">
+                        {item.pcm_bytes.toLocaleString()} bytes · {item.code_frames} frames
+                      </div>
+                    </div>
+                    <button class="ghost" onClick={() => {
+                      setSelectedCache(item);
+                      setPrefixInput(item.text);
+                    }}>
+                      Use
+                    </button>
+                  </div>
+                ))
+              )}
             </div>
           </div>
-
-          <div class="preset-row">
-            {Object.entries(PRESETS).map(([key, value]) => (
-              <button
-                key={key}
-                class={preset === key ? 'selected' : ''}
-                onClick={() => applyPreset(key as keyof typeof PRESETS)}
-                disabled={!!sessionId}
-              >
-                {value.title}
-              </button>
-            ))}
-          </div>
-
-          {configError && <div class="error-box">{configError}</div>}
-
-          <textarea
-            class="config-input"
-            value={configText}
-            spellcheck={false}
-            onInput={(e) => setConfigText((e.currentTarget as HTMLTextAreaElement).value)}
-            disabled={!!sessionId}
-          />
         </div>
       </section>
 

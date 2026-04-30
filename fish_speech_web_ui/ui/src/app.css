@@ -239,10 +239,213 @@ p {
   background: rgba(49, 208, 147, 0.14);
 }
 
+.input-container {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
 .text-input {
-  min-height: 240px;
+  min-height: 320px;
   line-height: 1.55;
   font-size: 16px;
+}
+
+.chat-preview {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.2);
+  overflow: hidden;
+  height: 320px;
+}
+
+.chat-head {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.05);
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--muted);
+}
+
+.chat-status.typing {
+  color: var(--primary2);
+}
+
+.chat-body {
+  flex: 1;
+  padding: 14px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chat-bubble {
+  align-self: flex-start;
+  max-width: 90%;
+  padding: 10px 14px;
+  border-radius: 18px 18px 18px 4px;
+  background: var(--panel-strong);
+  color: var(--text);
+  line-height: 1.5;
+  font-size: 15px;
+  white-space: pre-wrap;
+}
+
+.typing-cursor {
+  display: inline-block;
+  width: 2px;
+  margin-left: 2px;
+  background: var(--primary2);
+  animation: blink 1s infinite;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 0; }
+  50% { opacity: 1; }
+}
+
+.chat-placeholder {
+  color: var(--muted);
+  font-style: italic;
+  font-size: 14px;
+  text-align: center;
+  margin-top: auto;
+  margin-bottom: auto;
+}
+
+.prefix-controls {
+  margin-bottom: 12px;
+}
+
+.prefix-input-row label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.input-with-button {
+  position: relative;
+  margin-top: 6px;
+}
+
+.selected-badge {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: var(--primary);
+  color: white;
+  padding: 2px 8px;
+  border-radius: 8px;
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.selected-badge button {
+  padding: 0;
+  border: none;
+  background: none;
+  color: white;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.config-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.library-panel {
+  flex: 1;
+}
+
+.add-prefix-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.add-prefix-row input {
+  flex: 1;
+}
+
+.add-prefix-row button {
+  white-space: nowrap;
+}
+
+.cache-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.cache-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.cache-item.selected {
+  border-color: var(--primary);
+  background: rgba(139, 92, 246, 0.1);
+}
+
+.cache-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.cache-main {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.cache-key {
+  font-weight: 800;
+  font-size: 12px;
+  font-family: ui-monospace, monospace;
+  color: var(--primary2);
+}
+
+.cache-mode, .cache-method {
+  font-size: 10px;
+  text-transform: uppercase;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--muted);
+}
+
+.cache-text {
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-bottom: 2px;
+}
+
+.cache-stats {
+  font-size: 11px;
+  color: var(--muted);
 }
 
 .config-input {

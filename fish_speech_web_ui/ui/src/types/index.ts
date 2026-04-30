@@ -219,3 +219,33 @@ export type StreamEvent =
       req_id?: string;
       message: string;
     };
+
+export interface PrefixCacheItem {
+  key: string;
+  key_short: string;
+  text: string;
+  pcm_bytes: number;
+  code_frames: number;
+  audio_meta?: any;
+  cache_mode: string;
+  generation_text?: string;
+  lookahead_text?: string;
+  full_pcm_bytes?: number;
+  prefix_audio_skip_bytes?: number;
+  prefix_cut_adjust_ms?: number;
+  boundary_method?: string;
+}
+
+export interface PrefixCacheStatsResponse {
+  ok: boolean;
+  count: number;
+  entries: PrefixCacheItem[];
+}
+
+export interface PrefixCacheAddResponse {
+  ok: boolean;
+  key: string;
+  key_short: string;
+  already_exists: boolean;
+  item: PrefixCacheItem;
+}

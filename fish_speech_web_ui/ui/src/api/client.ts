@@ -1,4 +1,9 @@
-import type { SessionOpenResponse, SessionAppendResponse } from '../types';
+import type {
+  SessionOpenResponse,
+  SessionAppendResponse,
+  PrefixCacheStatsResponse,
+  PrefixCacheAddResponse,
+} from '../types';
 
 async function readError(resp: Response): Promise<string> {
   const payload = await resp.json().catch(() => null);
@@ -30,11 +35,19 @@ export class FishProxyClient {
     return resp.json();
   }
 
-  async appendText(sessionId: string, text: string): Promise<SessionAppendResponse> {
+  async appendText(
+    sessionId: string,
+    text: string,
+    options?: { cache?: string; cache_key?: string }
+  ): Promise<SessionAppendResponse> {
+    const body: Record<string, unknown> = { text };
+    if (options?.cache_key) body.cache_key = options.cache_key;
+    else if (options?.cache) body.cache = options.cache;
+
     const resp = await fetch(`${this.baseUrl}/session/${sessionId}/append`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify(body),
     });
     if (!resp.ok) throw new Error(await readError(resp));
     return resp.json();
@@ -72,5 +85,34 @@ export class FishProxyClient {
 
   getStreamUrl(sessionId: string): string {
     return `${this.baseUrl}/session/${sessionId}/pcm-stream`;
+  }
+
+  async getPrefixCacheStats(): Promise<PrefixCacheStatsResponse> {
+    const resp = await fetch(`${this.baseUrl}/prefix-cache/stats`, {
+      cache: 'no-store',
+    });
+    if (!resp.ok) throw new Error(await readError(resp));
+    return resp.json();
+  }
+
+  async addPrefixCache(
+    configText: string,
+    text: string
+  ): Promise<PrefixCacheAddResponse> {
+    const resp = await fetch(`${this.baseUrl}/prefix-cache/add`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ config_text: configText, text }),
+    });
+    if (!resp.ok) throw new Error(await readError(resp));
+    return resp.json();
+  }
+
+  async clearPrefixCache(): Promise<{ ok: boolean; count: number }> {
+    const resp = await fetch(`${this.baseUrl}/prefix-cache/clear`, {
+      method: 'POST',
+    });
+    if (!resp.ok) throw new Error(await readError(resp));
+    return resp.json();
   }
 }

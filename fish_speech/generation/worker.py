@@ -111,7 +111,22 @@ def launch_thread_safe_queue(
                     raise ValueError(
                         f"acoustic_codebook_size must be positive, got {acoustic_size}"
                     )
+
                 model.acoustic_codebook_size_for_sampling = acoustic_size
+
+                acoustic_block_mask = (
+                    torch.arange(model.config.codebook_size, device=device)
+                    >= acoustic_size
+                )
+                if hasattr(model, "acoustic_block_mask_for_sampling"):
+                    model.acoustic_block_mask_for_sampling = acoustic_block_mask
+                else:
+                    model.register_buffer(
+                        "acoustic_block_mask_for_sampling",
+                        acoustic_block_mask,
+                        persistent=False,
+                    )
+
                 logger.info(
                     "Acoustic codebook sampling limit: {} / fast_vocab={}",
                     acoustic_size,
@@ -131,10 +146,12 @@ def launch_thread_safe_queue(
                     dtype=next(model.parameters()).dtype,
                 )
             model._cache_setup_done = True
+
             if memory_info is not None:
                 gb, count = _model_param_memory_gb(model)
                 memory_info["llama_param_gb"] = gb
                 memory_info["llama_param_count"] = count
+
             init_event.set()
         except BaseException as e:
             logger.exception("Failed to initialize LLaMA worker")
@@ -203,8 +220,10 @@ def launch_thread_safe_queue(
             response_queue = item.response_queue
             t_req_start = time.perf_counter()
             t_last_put = t_req_start
-            stream_tokens = kwargs.get("stream_tokens", False)
-            stream_audio = kwargs.get("stream_audio", False)
+
+            stream_tokens = bool(kwargs.get("stream_tokens", False))
+            stream_audio = bool(kwargs.pop("stream_audio", False))
+
             put_count = 0
             if stream_tokens and profile_cadence:
                 logger.info(
@@ -221,6 +240,7 @@ def launch_thread_safe_queue(
                     and cancel_event.is_set()
                 ):
                     raise _StreamingRequestCancelled("Streaming request cancelled")
+
                 for chunk in generate_committed_segments(
                     model=model,
                     decode_one_token=decode_one_token,
@@ -235,6 +255,7 @@ def launch_thread_safe_queue(
                         raise _StreamingRequestCancelled(
                             "Streaming request cancelled"
                         )
+
                     if stream_tokens and profile_cadence and put_count < 5:
                         logger.info(
                             "stream: worker putting chunk put_count={} action={} req={}",
@@ -242,7 +263,9 @@ def launch_thread_safe_queue(
                             getattr(chunk, "action", None),
                             req_tag,
                         )
+
                     put_count += 1
+
                     if profile_cadence:
                         now = time.perf_counter()
                         delta_ms = (now - t_last_put) * 1000.0
@@ -263,6 +286,7 @@ def launch_thread_safe_queue(
                             total_ms,
                             vram_s,
                         )
+
                     out = chunk
                     codes = getattr(chunk, "codes", None)
                     if codes is not None and codes.is_cuda and not stream_audio:
@@ -271,11 +295,14 @@ def launch_thread_safe_queue(
                             codes=codes.cpu(),
                             text=getattr(chunk, "text", None),
                         )
+
                     response_queue.put(
                         WrappedGenerateResponse(status="success", response=out)
                     )
+
                     if stream_tokens and ack_queue is not None:
                         wait_for_stream_ack(ack_queue, cancel_event)
+
                     if (
                         stream_tokens
                         and empty_cache_per_stream_chunk
@@ -325,8 +352,10 @@ def launch_thread_safe_queue(
                     maybe_cleanup(reason="error", force=True)
 
     threading.Thread(target=worker, daemon=True).start()
+
     if not init_event.wait(timeout=300):
         raise TimeoutError("Timed out initializing LLaMA worker")
+
     if init_error:
         raise RuntimeError("Failed to initialize LLaMA worker") from init_error[0]
 

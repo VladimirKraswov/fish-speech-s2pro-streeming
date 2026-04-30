@@ -42,7 +42,7 @@ class VQPart(BasePart):
 class TextPart(BasePart):
     type = "text"
     text: str | None = None
-    tokens: list[int] | None = None
+    tokens: list[int] | torch.Tensor | None = None
 
     def __post_init__(self: "TextPart"):
         self.type = "text"
@@ -133,20 +133,16 @@ class ContentSequence:
             add_end: Whether to add the IM_END_TOKEN after these parts
             speaker: Optional speaker identifier (name or ID) to add before the parts
         """
-        # Convert single part to list
         parts_to_add = (
             [part_or_parts] if not isinstance(part_or_parts, list) else part_or_parts
         )
 
-        # Add speaker token if specified
         if speaker is not None:
             speaker_token = f"<|speaker:{speaker}|>"
             self.parts.append(TextPart(text=speaker_token))
 
-        # Add all the parts
         self.parts.extend(parts_to_add)
 
-        # Add end token if requested
         if add_end:
             self.parts.append(
                 TextPart(text=IM_END_TOKEN, cal_loss=self.parts[-1].cal_loss)
@@ -172,7 +168,6 @@ class ContentSequence:
         all_tokens = []
         all_labels = []
 
-        # Multi-modal elements
         vq_parts = []
         vq_masks = []
         vq_require_losses = []
@@ -180,10 +175,8 @@ class ContentSequence:
         audio_parts = []
         audio_masks = []
 
-        # Optimization: Batch conversion for ignore tokens
         ignore_loss_token_ids = []
         if ignore_loss_tokens:
-            # Use the wrapper method which uses convert_tokens_to_ids
             ignore_loss_token_ids = [
                 tokenizer.get_token_id(i) for i in ignore_loss_tokens
             ]
@@ -192,13 +185,17 @@ class ContentSequence:
             if isinstance(part, TextPart):
                 if part.tokens is None:
                     assert part.text is not None
-                    # Optimization: Explicitly disable special tokens (BOS/EOS)
-                    # because we are constructing the sequence manually
                     tokens = tokenizer.encode(part.text, add_special_tokens=False)
+                    tokens = torch.tensor(tokens, dtype=torch.long)
                 else:
-                    tokens = part.tokens
+                    if isinstance(part.tokens, torch.Tensor):
+                        tokens = part.tokens.detach().to(dtype=torch.long)
+                    else:
+                        tokens = torch.tensor(part.tokens, dtype=torch.long)
 
-                tokens = torch.tensor(tokens, dtype=torch.long)
+                if tokens.ndim != 1:
+                    tokens = tokens.reshape(-1)
+
             elif isinstance(part, VQPart):
                 curr_codes = part.codes.clone().to(torch.long)
                 semantic_codes = curr_codes[0]
@@ -222,7 +219,6 @@ class ContentSequence:
 
             all_tokens.append(tokens)
 
-            # Set masks for different part types
             if isinstance(part, VQPart):
                 vq_masks.append(torch.ones_like(tokens, dtype=torch.bool))
                 audio_masks.append(torch.zeros_like(tokens, dtype=torch.bool))
@@ -230,15 +226,12 @@ class ContentSequence:
                 vq_masks.append(torch.zeros_like(tokens, dtype=torch.bool))
                 audio_masks.append(torch.zeros_like(tokens, dtype=torch.bool))
 
-            # Set labels based on whether we want to calculate loss for this part
             if getattr(part, "cal_loss", None) is True:
                 all_labels.append(tokens.clone())
             else:
                 all_labels.append(torch.full_like(tokens, -100))
 
-        # Concatenate all tensors
         if not all_tokens:
-            # Handle empty case safely
             tokens = torch.empty(0, dtype=torch.long)
             labels = torch.empty(0, dtype=torch.long)
             vq_masks = torch.empty(0, dtype=torch.bool)
@@ -251,7 +244,6 @@ class ContentSequence:
 
         vq_require_losses = torch.tensor(vq_require_losses, dtype=torch.bool)
 
-        # Apply shift if needed for next-token prediction
         vq_mask_tokens = vq_masks
         vq_mask_labels = vq_masks
 
@@ -263,7 +255,6 @@ class ContentSequence:
             vq_mask_labels = vq_mask_labels[1:]
             audio_masks = audio_masks[:-1]
 
-        # Ignore specified tokens
         for i in ignore_loss_token_ids:
             if i is not None:
                 labels[labels == i] = -100
@@ -287,8 +278,7 @@ class ContentSequence:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         encoded = self.encode(tokenizer, add_shift=False)
         tokens = encoded.tokens
-        # Use int32 for prompt cache to save memory, convert to model dtype later if needed
-        # Or keep as input_ids (long)
+
         values = torch.zeros((num_codebooks + 1, len(tokens)), dtype=torch.long)
         values[0] = tokens
 
@@ -302,20 +292,11 @@ class ContentSequence:
 
         if encoded.vq_parts is not None and len(encoded.vq_parts) > 0:
             vq_parts = encoded.vq_parts
-            # List[Tensor(1, T)] -> Tensor(1, Total_T) -> Tensor(1, Total_T)
-            # Ensure we are handling the list concatenation correctly
             if len(vq_parts) > 1:
-                # We need to be careful here: vq_parts is a list of tensors from different VQPart segments
-                # They correspond to encoded.vq_mask_tokens
-                # Since we just want to fill the 'values' tensor at the right positions:
-                all_vq_codes = torch.cat(
-                    vq_parts, dim=1
-                )  # Shape: (C, Total_Semantic_Tokens)
+                all_vq_codes = torch.cat(vq_parts, dim=1)
             else:
                 all_vq_codes = vq_parts[0]
 
-            # Values[0] is already the Main Token ID (Semantic Begin + Code)
-            # Values[1:] should be the codes themselves
             if all_vq_codes.ndim != 2:
                 raise ValueError(f"VQ codes must be 2D, got {all_vq_codes.ndim}D")
 
@@ -354,12 +335,11 @@ class ContentSequence:
             tokenizer, add_shift=False, ignore_loss_tokens=ignore_loss_tokens
         )
 
-        # Colors for alternating tokens
         colors = {
-            "blue": "\033[94m",  # Light blue
-            "cyan": "\033[96m",  # Cyan
-            "green": "\033[92m",  # Light green
-            "dark_green": "\033[32m",  # Dark green
+            "blue": "\033[94m",
+            "cyan": "\033[96m",
+            "green": "\033[92m",
+            "dark_green": "\033[32m",
         }
         blue_idx = 0
         green_idx = 0
@@ -402,10 +382,8 @@ class ContentSequence:
                     count_semantic_tokens = 0
                     semantic_label = None
 
-            # Use HF decode
             val = tokenizer.decode([token_id])
 
-            # Simple fallback for visualization if decode returns empty or weird stuff for special tokens
             if not val:
                 val = f"<{token_id}>"
 

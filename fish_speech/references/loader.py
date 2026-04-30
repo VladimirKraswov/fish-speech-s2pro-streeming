@@ -1,5 +1,8 @@
 # Driver reference loading, caching, and filesystem-backed reference store.
+from __future__ import annotations
+
 import io
+import re
 from hashlib import sha256
 from pathlib import Path
 from typing import Callable, Literal, Tuple
@@ -25,6 +28,21 @@ from fish_speech.utils.file import (
 )
 
 
+REFERENCE_ID_RE = re.compile(r"^[a-zA-Z0-9\-_ ]+$")
+
+
+def _validate_reference_id_value(value: str, *, name: str = "Reference ID") -> None:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} cannot be empty")
+    if not REFERENCE_ID_RE.match(value):
+        raise ValueError(
+            f"{name} contains invalid characters. Only alphanumeric, hyphens, "
+            "underscores, and spaces are allowed."
+        )
+    if len(value) > 255:
+        raise ValueError(f"{name} is too long. Maximum length is 255 characters.")
+
+
 class ReferenceLoader:
     def __init__(self) -> None:
         """
@@ -36,11 +54,9 @@ class ReferenceLoader:
         self.ref_by_hash = self.cache.by_hash
         self.references_dir = get_references_dir()
 
-        # Make Pylance happy (attribut/method not defined...)
         self.decoder_model: DAC
         self.encode_reference: Callable
 
-        # Define the torchaudio backend
         backends = torchaudio.list_audio_backends()
         if "ffmpeg" in backends:
             self.backend = "ffmpeg"
@@ -52,8 +68,15 @@ class ReferenceLoader:
         id: str,
         use_cache: Literal["on", "off"],
     ) -> Tuple:
-        # Load the references audio and text by id.
-        # Each reference can be: (a) .wav + .lab → encode at load, or (b) .codes.pt + .lab → load pre-encoded (no encoder run).
+        """
+        Load references by ID.
+
+        Each reference can be:
+        - audio + .lab, encoded at load time;
+        - *.codes.pt + .lab, loaded pre-encoded.
+        """
+        _validate_reference_id_value(id)
+
         ref_folder = self.references_dir / id
         if not ref_folder.is_dir():
             raise FileNotFoundError(f"Reference ID '{id}' does not exist")
@@ -63,7 +86,6 @@ class ReferenceLoader:
         )
         ref_codes = list(ref_folder.glob("*.codes.pt"))
 
-        # .codes.pt filename stem is "en.codes" (Path.stem); we want logical stem "en" for en.lab / en.codes.pt
         def _stem_for_codes(p: Path) -> str:
             s = p.stem
             return s.removesuffix(".codes") if s.endswith(".codes") else s
@@ -74,6 +96,7 @@ class ReferenceLoader:
         if use_cache == "off" or id not in self.ref_by_id:
             prompt_tokens = []
             prompt_texts = []
+
             for stem in stems:
                 lab_path = ref_folder / f"{stem}.lab"
                 codes_path = ref_folder / f"{stem}.codes.pt"
@@ -85,6 +108,7 @@ class ReferenceLoader:
                     ),
                     None,
                 )
+
                 if not lab_path.exists():
                     logger.warning("Reference stem {} missing .lab, skipping", stem)
                     continue
@@ -92,8 +116,6 @@ class ReferenceLoader:
                 prompt_texts.append(read_ref_text(str(lab_path)))
 
                 if codes_path.exists():
-                    # Pre-encoded: load from disk (no encoder run). File must be tensor shape (num_codebooks, T) from DAC encode.
-                    # map_location="cpu" = put tensor in RAM (worker will .to(device) later).
                     try:
                         loaded = load_codes_pt(
                             codes_path, name=f"reference {id}/{stem}"
@@ -120,6 +142,7 @@ class ReferenceLoader:
                         raise ValueError(
                             f"Invalid pre-encoded reference at {codes_path}: {e}"
                         ) from e
+
                 elif audio_path is not None:
                     encoded = self.encode_reference(
                         reference_audio=audio_to_bytes(str(audio_path)),
@@ -131,6 +154,7 @@ class ReferenceLoader:
                         name=f"reference {id}/{stem}",
                     )
                     prompt_tokens.append(encoded)
+
                 else:
                     logger.warning(
                         "Reference stem {} has .lab but no .codes.pt or audio, skipping",
@@ -146,7 +170,6 @@ class ReferenceLoader:
             self.ref_by_id[id] = (prompt_tokens, prompt_texts)
 
         else:
-            # Reuse already encoded references
             logger.info("Use same references")
             prompt_tokens, prompt_texts = self.ref_by_id[id]
 
@@ -157,16 +180,21 @@ class ReferenceLoader:
         references: list[DriverReference],
         use_cache: Literal["on", "off"],
     ) -> Tuple:
-        # Cache is keyed only by audio hash. Text stays request-local so callers
-        # can reuse the same audio reference with different prompt transcripts.
+        """
+        Load request-provided references by audio hash.
+
+        Cache key is audio-only. Text stays request-local so callers can reuse
+        the same audio reference with different prompt transcripts.
+        """
         audio_hashes = [sha256(ref.audio).hexdigest() for ref in references]
 
         cache_used = False
         prompt_tokens, prompt_texts = [], []
+
         for i, ref in enumerate(references):
             audio_hash = audio_hashes[i]
+
             if use_cache == "off" or audio_hash not in self.ref_by_hash:
-                # If the references are not already loaded, encode them
                 prompt_token = self.encode_reference(
                     reference_audio=ref.audio,
                     enable_reference_audio=True,
@@ -181,7 +209,6 @@ class ReferenceLoader:
                 self.ref_by_hash[audio_hash] = prompt_token
 
             else:
-                # Reuse already encoded references
                 cached_value = self.ref_by_hash[audio_hash]
                 if isinstance(cached_value, (tuple, list)):
                     if not cached_value:
@@ -209,7 +236,7 @@ class ReferenceLoader:
 
     def load_audio(self, reference_audio: bytes | str | bytearray | Path, sr: int):
         """
-        Load the audio data from a file or bytes.
+        Load audio data from a file path or bytes.
         """
         if isinstance(reference_audio, (bytes, bytearray)):
             reference_audio = io.BytesIO(reference_audio)
@@ -219,11 +246,12 @@ class ReferenceLoader:
                 raise FileNotFoundError(f"Reference audio not found: {audio_path}")
             reference_audio = audio_path
         else:
-            # Fallback for other potential types, try wrapping in BytesIO
             try:
                 reference_audio = io.BytesIO(reference_audio)
             except Exception:
-                raise TypeError(f"Unsupported reference_audio type: {type(reference_audio)}")
+                raise TypeError(
+                    f"Unsupported reference_audio type: {type(reference_audio)}"
+                )
 
         waveform, original_sr = torchaudio.load(reference_audio, backend=self.backend)
 
@@ -242,9 +270,10 @@ class ReferenceLoader:
     def list_reference_ids(self) -> list[str]:
         """
         List all valid reference IDs.
+
         Valid reference:
-          - audio + .lab
-          - or .codes.pt + .lab
+        - audio + .lab;
+        - or .codes.pt + .lab.
         """
         ref_base_path = self.references_dir
         if not ref_base_path.exists():
@@ -280,25 +309,25 @@ class ReferenceLoader:
         return sorted(valid_ids)
 
     def add_reference_encoded(
-        self, id: str, codes_bytes: bytes, lab_text: str, stem: str | None = None
+        self,
+        id: str,
+        codes_bytes: bytes,
+        lab_text: str,
+        stem: str | None = None,
     ) -> Literal["created", "updated", "unchanged"]:
         """
-        Add or update a pre-encoded reference (e.g. from preencode_references.py).
-        Writes references/<id>/<stem>.codes.pt and <stem>.lab (stem defaults to id). Skips if hash matches.
-        """
-        import re
+        Add or update a pre-encoded reference.
 
-        if not re.match(r"^[a-zA-Z0-9\-_ ]+$", id):
-            raise ValueError(
-                "Reference ID contains invalid characters. Only alphanumeric, hyphens, underscores, and spaces are allowed."
-            )
-        if len(id) > 255:
-            raise ValueError(
-                "Reference ID is too long. Maximum length is 255 characters."
-            )
+        Writes:
+        - references/<id>/<stem>.codes.pt
+        - references/<id>/<stem>.lab
+
+        Skips write when content hash matches.
+        """
+        _validate_reference_id_value(id)
+
         stem = stem or id
-        if not re.match(r"^[a-zA-Z0-9\-_ ]+$", stem):
-            raise ValueError("Stem contains invalid characters.")
+        _validate_reference_id_value(stem, name="Stem")
 
         ref_dir = self.references_dir / id
         payload = codes_bytes + lab_text.encode("utf-8")
@@ -312,7 +341,6 @@ class ReferenceLoader:
                 )
                 return "unchanged"
 
-        # Validate incoming codes
         codes = load_codes_pt(codes_bytes, name=f"reference {id}/{stem}")
         codes = validate_codes_for_decoder(
             codes,
@@ -348,60 +376,41 @@ class ReferenceLoader:
             FileNotFoundError: If the audio file doesn't exist
             OSError: If file operations fail
         """
-        # Validate ID format
-        import re
+        _validate_reference_id_value(id)
 
-        if not re.match(r"^[a-zA-Z0-9\-_ ]+$", id):
-            raise ValueError(
-                "Reference ID contains invalid characters. Only alphanumeric, hyphens, underscores, and spaces are allowed."
-            )
-
-        if len(id) > 255:
-            raise ValueError(
-                "Reference ID is too long. Maximum length is 255 characters."
-            )
-
-        # Check if reference already exists
         ref_dir = self.references_dir / id
         if ref_dir.exists():
             raise FileExistsError(f"Reference ID '{id}' already exists")
 
-        # Check if audio file exists
         audio_path = Path(wav_file_path)
         if not audio_path.exists():
             raise FileNotFoundError(f"Audio file not found: {wav_file_path}")
 
-        # Validate audio file extension
         if audio_path.suffix.lower() not in AUDIO_EXTENSIONS:
             raise ValueError(
-                f"Unsupported audio format: {audio_path.suffix}. Supported formats: {', '.join(AUDIO_EXTENSIONS)}"
+                f"Unsupported audio format: {audio_path.suffix}. "
+                f"Supported formats: {', '.join(AUDIO_EXTENSIONS)}"
             )
 
         try:
-            # Create reference directory
             ref_dir.mkdir(parents=True, exist_ok=False)
 
-            # Determine the target audio filename with original extension
             target_audio_path = ref_dir / f"sample{audio_path.suffix}"
 
-            # Copy audio file
             import shutil
 
             shutil.copy2(audio_path, target_audio_path)
 
-            # Create .lab file
             lab_path = ref_dir / "sample.lab"
             with open(lab_path, "w", encoding="utf-8") as f:
                 f.write(reference_text)
 
-            # Clear cache for this ID if it exists
             if id in self.ref_by_id:
                 del self.ref_by_id[id]
 
             logger.info(f"Successfully added reference voice with ID: {id}")
 
         except Exception as e:
-            # Clean up on failure
             if ref_dir.exists():
                 import shutil
 
@@ -419,18 +428,17 @@ class ReferenceLoader:
             FileNotFoundError: If the reference ID doesn't exist
             OSError: If file operations fail
         """
-        # Check if reference exists
+        _validate_reference_id_value(id)
+
         ref_dir = self.references_dir / id
         if not ref_dir.exists():
             raise FileNotFoundError(f"Reference ID '{id}' does not exist")
 
         try:
-            # Remove the entire reference directory
             import shutil
 
             shutil.rmtree(ref_dir)
 
-            # Clear cache for this ID if it exists
             if id in self.ref_by_id:
                 del self.ref_by_id[id]
 

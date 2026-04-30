@@ -169,3 +169,35 @@ class StatefulTTSRequest(ServeTTSRequest):
     synthesis_session_id: str
     commit_seq: Annotated[int, conint(ge=1, strict=True)]
     commit_reason: str = "unknown"
+
+
+class AppendHistoryRequest(BaseModel):
+    text: str
+    codes: SkipValidation[list[list[int]]]
+    reason: str = "unknown"
+    commit_seq: int = 0
+
+
+class GenerateIntroCacheResponse(BaseModel):
+    ok: bool
+    text: str
+    audio_meta: dict[str, int]
+    pcm_b64: str
+    pcm_bytes: int
+    codes: SkipValidation[list[list[int]]] | None = None
+    code_frames: int = 0
+
+
+class PreloadSynthesisTurnRequest(BaseModel):
+    synthesis_session_id: str = Field(..., min_length=1)
+    text: str = Field(..., min_length=1)
+    codes: SkipValidation[list[list[int]]]
+    commit_seq: int = Field(0, ge=0)
+    commit_reason: str = Field("intro_cache", min_length=1)
+
+
+class PreloadSynthesisTurnResponse(BaseModel):
+    ok: bool
+    synthesis_session_id: str
+    code_frames: int
+    context: dict

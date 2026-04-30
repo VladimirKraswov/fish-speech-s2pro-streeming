@@ -1,4 +1,6 @@
+import base64
 import io
+import json
 import os
 import re
 import tempfile
@@ -24,7 +26,12 @@ from loguru import logger
 from starlette.responses import Response
 from typing_extensions import Annotated
 
-from fish_speech import DriverErrorEvent, DriverFinalAudioEvent
+from fish_speech import (
+    DriverAudioChunkEvent,
+    DriverErrorEvent,
+    DriverFinalAudioEvent,
+    DriverTokenChunkEvent,
+)
 from fish_speech_server.schema import (
     AddEncodedReferenceResponse,
     AddReferenceResponse,
@@ -32,6 +39,10 @@ from fish_speech_server.schema import (
     DeleteReferenceResponse,
     ListReferencesResponse,
     OpenSynthesisSessionRequest,
+    AppendHistoryRequest,
+    GenerateIntroCacheResponse,
+    PreloadSynthesisTurnRequest,
+    PreloadSynthesisTurnResponse,
     OpenSynthesisSessionResponse,
     ServeTTSRequest,
     ServeVQGANDecodeRequest,
@@ -51,6 +62,10 @@ from fish_speech_server.api.utils import (
 from fish_speech_server.services.adapter import (
     api_tts_to_driver_request,
     stateful_tts_to_driver_request,
+)
+from fish_speech_server.services.synthesis_context import (
+    SynthesisTurn,
+    estimate_code_frames,
 )
 from fish_speech_server.services.continuation import build_continuation_debug_summary
 from fish_speech_server.services.inference import float_audio_to_pcm16_bytes
@@ -681,6 +696,295 @@ async def close_synthesis_session(synthesis_session_id: str = Body(...)):
             synthesis_session_id=synthesis_session_id,
         ).model_dump(mode="json")
     )
+
+
+def _codes_to_cpu_tensor(codes) -> torch.Tensor | None:
+    if codes is None:
+        return None
+
+    if torch.is_tensor(codes):
+        tensor = codes.detach().cpu().long()
+    else:
+        tensor = torch.tensor(codes, dtype=torch.long)
+
+    while tensor.dim() > 2 and tensor.shape[0] == 1:
+        tensor = tensor.squeeze(0)
+
+    if tensor.dim() == 1:
+        tensor = tensor.unsqueeze(0)
+
+    if tensor.dim() != 2:
+        raise ValueError(
+            f"Expected codes with 2 dims [codebooks, frames], got {tuple(tensor.shape)}"
+        )
+
+    return tensor.contiguous()
+
+
+def _concat_code_chunks(chunks: list) -> torch.Tensor | None:
+    tensors = []
+
+    for chunk in chunks:
+        tensor = _codes_to_cpu_tensor(chunk)
+        if tensor is not None and tensor.numel() > 0:
+            tensors.append(tensor)
+
+    if not tensors:
+        return None
+
+    return torch.cat(tensors, dim=-1).cpu().contiguous()
+
+
+@routes.http.post("/v1/synthesis/sessions/{synthesis_session_id}/history")
+async def append_synthesis_history(
+    req: Annotated[AppendHistoryRequest, Body(exclusive=True)]
+):
+    try:
+        synthesis_session_id = request.path_params.get("synthesis_session_id")
+        store = request.app.state.synthesis_session_store
+        ctx = await store.get(synthesis_session_id, touch=True)
+
+        if ctx is None:
+            raise HTTPException(
+                HTTPStatus.NOT_FOUND,
+                content="Synthesis session not found",
+            )
+
+        try:
+            codes_tensor = _codes_to_cpu_tensor(req.codes)
+            code_frames = estimate_code_frames(codes_tensor)
+        except Exception as e:
+            raise HTTPException(
+                HTTPStatus.BAD_REQUEST,
+                content=f"Invalid codes: {e}",
+            )
+
+        turn = SynthesisTurn(
+            commit_seq=req.commit_seq,
+            text=req.text,
+            reason=req.reason,
+            created_at=time.time(),
+            completed_at=time.time(),
+            codes=codes_tensor,
+            code_frames=code_frames,
+        )
+
+        async with ctx.lock:
+            ctx.append_turn(turn)
+
+        return JSONResponse({"ok": True})
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error appending history: {e}", exc_info=True)
+        raise HTTPException(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            content="Failed to append history",
+        )
+
+
+@routes.http.post("/v1/synthesis/intro-cache/generate")
+async def generate_intro_cache(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
+    try:
+        app_state = request.app.state
+        model_manager: ModelManager = app_state.model_manager
+        driver = model_manager.driver
+
+        if not req.reference_id and not req.references:
+            raise HTTPException(
+                HTTPStatus.BAD_REQUEST,
+                content="Reference is required: provide reference_id or references",
+            )
+
+        if app_state.max_text_length > 0 and len(req.text) > app_state.max_text_length:
+            raise HTTPException(
+                HTTPStatus.BAD_REQUEST,
+                content=f"Text is too long, max length is {app_state.max_text_length}",
+            )
+
+        intro_req = req.model_copy(
+            update={
+                "streaming": True,
+                "stream_tokens": True,
+                "format": "wav",
+            }
+        )
+
+        driver_req = api_tts_to_driver_request(intro_req)
+
+        pcm_parts: list[bytes] = []
+        code_chunks: list = []
+        final_audio = None
+
+        for event in driver.synthesize(driver_req):
+            if isinstance(event, DriverErrorEvent) and event.error:
+                raise RuntimeError(str(event.error))
+
+            if isinstance(event, DriverAudioChunkEvent):
+                pcm_parts.append(float_audio_to_pcm16_bytes(event.audio))
+
+            elif isinstance(event, DriverTokenChunkEvent):
+                if event.codes is not None:
+                    code_chunks.append(event.codes)
+
+            elif isinstance(event, DriverFinalAudioEvent):
+                final_audio = event.audio
+
+        if not pcm_parts and final_audio is not None:
+            pcm_parts.append(float_audio_to_pcm16_bytes(final_audio))
+
+        if not pcm_parts:
+            raise HTTPException(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                content="No intro audio generated",
+            )
+
+        final_codes = _concat_code_chunks(code_chunks)
+        code_frames = estimate_code_frames(final_codes)
+        codes_list = final_codes.tolist() if final_codes is not None else None
+
+        if not codes_list or code_frames <= 0:
+            raise HTTPException(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                content=("Intro audio generated, but no continuation codes were produced"),
+            )
+
+        pcm = b"".join(pcm_parts)
+
+        response = GenerateIntroCacheResponse(
+            ok=True,
+            text=intro_req.text,
+            audio_meta={
+                "sample_rate": int(driver.sample_rate),
+                "channels": 1,
+                "sample_width": 2,
+            },
+            pcm_b64=base64.b64encode(pcm).decode("ascii"),
+            pcm_bytes=len(pcm),
+            codes=codes_list,
+            code_frames=code_frames,
+        )
+
+        return JSONResponse(response.model_dump(mode="json"))
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        logger.error(f"Error generating intro cache: {e}", exc_info=True)
+        raise HTTPException(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            content="Failed to generate intro cache",
+        )
+
+
+@routes.http.post("/v1/synthesis/sessions/preload")
+async def preload_synthesis_session(
+    req: Annotated[PreloadSynthesisTurnRequest, Body(exclusive=True)]
+):
+    try:
+        store = request.app.state.synthesis_session_store
+        ctx = await store.get(req.synthesis_session_id, touch=True)
+
+        if ctx is None:
+            raise HTTPException(
+                HTTPStatus.NOT_FOUND,
+                content="Synthesis session not found",
+            )
+
+        codes_tensor = _codes_to_cpu_tensor(req.codes)
+        code_frames = estimate_code_frames(codes_tensor)
+
+        if codes_tensor is None or code_frames <= 0:
+            raise HTTPException(
+                HTTPStatus.BAD_REQUEST,
+                content="Preload requires non-empty continuation codes",
+            )
+
+        now = time.time()
+
+        async with ctx.lock:
+            turn = SynthesisTurn(
+                commit_seq=req.commit_seq,
+                text=req.text,
+                reason=req.commit_reason,
+                created_at=now,
+                completed_at=now,
+                pcm_bytes=0,
+                codes=codes_tensor,
+                code_frames=code_frames,
+            )
+            ctx.append_turn(turn)
+            context = ctx.to_public_dict()
+
+        return JSONResponse(
+            PreloadSynthesisTurnResponse(
+                ok=True,
+                synthesis_session_id=req.synthesis_session_id,
+                code_frames=code_frames,
+                context=context,
+            ).model_dump(mode="json")
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        logger.error(f"Error preloading synthesis session: {e}", exc_info=True)
+        raise HTTPException(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            content="Failed to preload synthesis session",
+        )
+
+
+@routes.http.post("/v1/synthesis/synthesize-ndjson")
+async def synthesize_ndjson(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
+    try:
+        app_state = request.app.state
+        model_manager = app_state.model_manager
+        driver = model_manager.driver
+
+        async def gen():
+            async for event in inference_async(req, driver, yield_tokens=True):
+                if isinstance(event, bytes):
+                    yield (
+                        json.dumps(
+                            {
+                                "type": "audio",
+                                "data": base64.b64encode(event).decode("ascii"),
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                elif isinstance(event, DriverTokenChunkEvent):
+                    codes = (
+                        event.codes.tolist()
+                        if hasattr(event.codes, "tolist")
+                        else event.codes
+                    )
+                    yield (
+                        json.dumps(
+                            {
+                                "type": "tokens",
+                                "text": event.text,
+                                "codes": codes,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+
+        from starlette.responses import StreamingResponse
+        return StreamingResponse(gen(), media_type="application/x-ndjson")
+
+    except Exception as e:
+        logger.error(f"Error in synthesize-ndjson: {e}", exc_info=True)
+        raise HTTPException(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            content="Failed to generate speech",
+        )
 
 
 @routes.http.post("/v1/synthesis/synthesize")

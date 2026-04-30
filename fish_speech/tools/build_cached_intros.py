@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import shutil
@@ -129,6 +130,22 @@ def _load_raw_items(input_path: str | Path) -> list[Any]:
     return payload
 
 
+def _resolve_device(device: str) -> str:
+    if device == "auto":
+        if torch.cuda.is_available():
+            return "cuda"
+        if torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+    if device == "cuda" and not torch.cuda.is_available():
+        logger.warning("Configured device cuda is not available, falling back to cpu")
+        return "cpu"
+    if device == "mps" and not torch.backends.mps.is_available():
+        logger.warning("Configured device mps is not available, falling back to cpu")
+        return "cpu"
+    return device
+
+
 def load_and_validate_items(input_path: str | Path) -> list[IntroItem]:
     raw_items = _load_raw_items(input_path)
     items: list[IntroItem] = []
@@ -186,7 +203,7 @@ def _resolve_settings(args: argparse.Namespace) -> BuildSettings:
             args.decoder_checkpoint_path or paths_cfg.decoder_checkpoint_path
         ),
         decoder_config_name=args.decoder_config_name or paths_cfg.decoder_config_name,
-        device=args.device or model_cfg.device,
+        device=_resolve_device(args.device or model_cfg.device),
         precision=precision,
         compile=compile_value,
         reference_id=args.reference_id or warmup_cfg.reference_id,

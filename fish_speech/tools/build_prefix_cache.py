@@ -177,6 +177,22 @@ def _validate_cache_id(cache_id: str, *, item_label: str) -> str:
     return cache_id
 
 
+def _resolve_device(device: str) -> str:
+    if device == "auto":
+        if torch.cuda.is_available():
+            return "cuda"
+        if torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+    if device == "cuda" and not torch.cuda.is_available():
+        logger.warning("Configured device cuda is not available, falling back to cpu")
+        return "cpu"
+    if device == "mps" and not torch.backends.mps.is_available():
+        logger.warning("Configured device mps is not available, falling back to cpu")
+        return "cpu"
+    return device
+
+
 def _slugify(value: str) -> str:
     value = normalize_prefix_text(value)
     value = re.sub(r"[^\w]+", "_", value, flags=re.UNICODE)
@@ -298,7 +314,7 @@ def _resolve_settings(args: argparse.Namespace) -> BuildSettings:
             args.decoder_checkpoint_path or paths_cfg.decoder_checkpoint_path
         ),
         decoder_config_name=args.decoder_config_name or paths_cfg.decoder_config_name,
-        device=args.device or model_cfg.device,
+        device=_resolve_device(args.device or model_cfg.device),
         precision=precision,
         compile=compile_value,
         default_voice_id=args.voice_id or args.reference_id or warmup_cfg.reference_id,
@@ -612,7 +628,7 @@ def _generate_prefix(
 
         _move_artifacts(tmp_paths, final_paths)
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        if not _artifact_complete(output_dir, item.cache_id):
+        if not _artifact_complete(output_dir, item, settings):
             raise RuntimeError(f"Incomplete artifacts for {item.cache_id}")
         return "generated", manifest_entry
     except Exception:

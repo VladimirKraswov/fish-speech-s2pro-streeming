@@ -138,7 +138,7 @@ def set_seed(seed: int):
 def enforce_tags(cfg: DictConfig, save_to_file: bool = False) -> None:
     """Prompts user to input tags from command line if none are provided in the config."""
     if not cfg.get("tags"):
-        if "rich" in find_spec("rich").name:
+        if find_spec("rich") is not None:
             from rich.prompt import Prompt
 
             tags = Prompt.ask("Enter tags (comma separated)")

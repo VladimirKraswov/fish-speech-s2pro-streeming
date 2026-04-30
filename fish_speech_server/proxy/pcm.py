@@ -1523,6 +1523,8 @@ async def intro_cache_stats() -> JSONResponse:
                     "age_sec": round(now - entry.created_at, 1),
                     "expires_in_sec": round(max(0, entry.expires_at - now), 1),
                     "pcm_bytes": len(entry.pcm),
+                    "code_frames": entry.code_frames,
+                    "has_codes": bool(entry.codes),
                     "text_preview": entry.text[:180],
                     "audio_meta": entry.audio_meta,
                 }
@@ -1648,6 +1650,10 @@ async def session_get(session_id: str) -> JSONResponse:
             "commit_chars": rec.commit_chars,
             "input_closed": rec.input_closed,
             "synthesis_session_id": rec.synthesis_session_id,
+            "intro_preloaded_cache_key": rec.intro_preloaded_cache_key,
+            "audio_meta": rec.audio_meta,
+            "next_commit_seq": rec.next_commit_seq,
+            "next_pcm_seq": rec.next_pcm_seq,
             "stateful_synthesis": config.tts.stateful_synthesis,
             "stream_started": rec.stream_started,
             "stream_finished": rec.stream_finished,
@@ -1846,6 +1852,7 @@ async def session_pcm_stream(session_id: str):
         client: httpx.AsyncClient,
         req_id: str,
         commit_item: dict[str, Any],
+        skip_live_fade_in: bool = False,
     ) -> AsyncGenerator[bytes, None]:
         commit_seq = int(commit_item["seq"])
         is_first_commit = commit_seq == 1
@@ -1946,7 +1953,7 @@ async def session_pcm_stream(session_id: str):
         first_emit_done = False
         start_buffer_bytes = 0
 
-        fade_in_applied = False
+        fade_in_applied = skip_live_fade_in
         sample_rate = 0
         channels = 0
         bits_per_sample = 0
@@ -1964,6 +1971,7 @@ async def session_pcm_stream(session_id: str):
 
                 if (
                     config.playback.boundary_smoothing_enabled
+                    and not skip_live_fade_in
                     and not fade_in_applied
                     and fade_in_bytes > 0
                     and len(pending_pcm) >= fade_in_bytes
@@ -2039,6 +2047,7 @@ async def session_pcm_stream(session_id: str):
                 "text_len": len(commit_item["text"]),
                 "effective_target_emit_bytes": effective_target_emit_bytes,
                 "effective_start_buffer_ms": effective_start_buffer_ms,
+                "skip_fade_in": skip_live_fade_in,
                 "server_perf_ms": int(time.perf_counter() * 1000),
             }
         )
@@ -2244,8 +2253,76 @@ async def session_pcm_stream(session_id: str):
             }
         )
 
+    async def pump_commit_to_queue(client, req_id, item, out_queue, skip_live_fade_in=False):
+        try:
+            async for event in stream_one_commit(client, req_id, item, skip_live_fade_in=skip_live_fade_in):
+                await out_queue.put(("event", event))
+        except Exception as exc:
+            await out_queue.put(("error", exc))
+        finally:
+            await out_queue.put(("done", None))
+
     async def body_iter() -> AsyncGenerator[bytes, None]:
         req_id = uuid.uuid4().hex[:8]
+        prefetch_task = None
+        prefetch_queue = None
+        prefetched_first_item = None
+
+        async def maybe_start_first_commit_prefetch(client):
+            nonlocal prefetch_task, prefetch_queue, prefetched_first_item
+
+            if prefetch_task is not None:
+                return
+
+            if not config.intro_cache.enabled or not config.intro_cache.text.strip():
+                return
+
+            if not rec.synthesis_session_id or not config.tts.stateful_synthesis:
+                return
+
+            try:
+                item = rec.commit_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+
+            if item["type"] != "commit":
+                await rec.commit_queue.put(item)
+                return
+
+            prefetched_first_item = item
+            prefetch_queue = asyncio.Queue(maxsize=64)
+
+            skip_live_fade_in = (
+                int(item["seq"]) == 1
+                and rec.intro_preloaded_cache_key is not None
+            )
+
+            prefetch_task = asyncio.create_task(
+                pump_commit_to_queue(client, req_id, item, prefetch_queue, skip_live_fade_in=skip_live_fade_in)
+            )
+
+        async def drain_prefetch():
+            nonlocal prefetch_task, prefetch_queue, prefetched_first_item
+
+            if prefetch_task is None or prefetch_queue is None:
+                return
+
+            while True:
+                kind, payload = await prefetch_queue.get()
+
+                if kind == "event":
+                    yield payload
+                    continue
+
+                if kind == "error":
+                    raise payload
+
+                if kind == "done":
+                    await _touch_session(rec)
+                    prefetch_task = None
+                    prefetch_queue = None
+                    prefetched_first_item = None
+                    return
 
         async with rec.stream_lock:
             rec.stream_started = True
@@ -2282,7 +2359,13 @@ async def session_pcm_stream(session_id: str):
                                 client=client,
                                 req_id=req_id,
                             ):
+                                await maybe_start_first_commit_prefetch(client)
                                 yield event
+
+                            if prefetch_task is not None:
+                                async for event in drain_prefetch():
+                                    yield event
+
                         except Exception as exc:
                             if not config.intro_cache.ignore_errors:
                                 raise
@@ -2341,6 +2424,9 @@ async def session_pcm_stream(session_id: str):
                 return
 
             finally:
+                if prefetch_task is not None and not prefetch_task.done():
+                    prefetch_task.cancel()
+
                 rec.stream_finished = True
                 await _touch_session(rec)
 

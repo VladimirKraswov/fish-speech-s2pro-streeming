@@ -26,7 +26,12 @@ from loguru import logger
 from starlette.responses import Response
 from typing_extensions import Annotated
 
-from fish_speech import DriverErrorEvent, DriverFinalAudioEvent
+from fish_speech import (
+    DriverAudioChunkEvent,
+    DriverErrorEvent,
+    DriverFinalAudioEvent,
+    DriverTokenChunkEvent,
+)
 from fish_speech_server.schema import (
     AddEncodedReferenceResponse,
     AddReferenceResponse,
@@ -746,7 +751,8 @@ async def append_synthesis_history(
             )
 
         try:
-            codes_tensor = torch.tensor(req.codes, dtype=torch.long)
+            codes_tensor = _codes_to_cpu_tensor(req.codes)
+            code_frames = estimate_code_frames(codes_tensor)
         except Exception as e:
             raise HTTPException(
                 HTTPStatus.BAD_REQUEST,
@@ -760,6 +766,7 @@ async def append_synthesis_history(
             created_at=time.time(),
             completed_at=time.time(),
             codes=codes_tensor,
+            code_frames=code_frames,
         )
 
         async with ctx.lock:

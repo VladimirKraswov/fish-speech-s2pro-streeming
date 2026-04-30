@@ -693,10 +693,14 @@ def _intro_cache_key(config: ProxyConfig) -> str:
     payload = {
         "cache_schema": PREFIX_CACHE_SCHEMA_VERSION,
         "prefix_cache_salt": PREFIX_CACHE_SALT,
+        "proxy_version": config.version,
         "runtime_version": _RUNTIME.version,
         "llama_checkpoint_path": _RUNTIME.paths.llama_checkpoint_path,
         "decoder_checkpoint_path": _RUNTIME.paths.decoder_checkpoint_path,
         "decoder_config_name": _RUNTIME.paths.decoder_config_name,
+        "model_device": _RUNTIME.model.device,
+        "model_precision": _RUNTIME.model.precision,
+        "model_compile": _RUNTIME.model.compile,
         "upstream_url": UPSTREAM_TTS_URL,
         "intro_text": config.intro_cache.text,
         "reference_id": _normalized_reference_id(config),
@@ -1395,7 +1399,7 @@ async def _open_upstream_synthesis_session(
     config: ProxyConfig,
 ) -> str:
     open_payload = {
-        "reference_id": config.tts.reference_id or config.default_reference_id,
+        "reference_id": _normalized_reference_id(config),
         "max_history_turns": config.tts.stateful_history_turns,
         "max_history_chars": config.tts.stateful_history_chars,
         "max_history_code_frames": config.tts.stateful_history_code_frames,
@@ -1641,6 +1645,12 @@ async def session_open(req: SessionOpenRequest) -> JSONResponse:
                     )
         except Exception as exc:
             if not config.intro_cache.ignore_errors:
+                if rec.synthesis_session_id:
+                    await _close_upstream_synthesis_session(
+                        client,
+                        rec.synthesis_session_id,
+                        reason="warm_intro_failed",
+                    )
                 await session_store.close(rec.session_id)
                 raise HTTPException(
                     502,

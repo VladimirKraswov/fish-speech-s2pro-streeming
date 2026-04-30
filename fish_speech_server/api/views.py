@@ -7,6 +7,7 @@ import tempfile
 import time
 from http import HTTPStatus
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import ormsgpack

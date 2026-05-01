@@ -49,11 +49,12 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
       top_p: 0.82,
       repetition_penalty: 1.03,
       temperature: 0.7,
-      stream_tokens: true,
+      stream_tokens: false,
+      low_latency_first_audio: true,
       initial_stream_chunk_size: 28,
       stream_chunk_size: 20,
-      first_initial_stream_chunk_size: 10,
-      first_stream_chunk_size: 8,
+      first_initial_stream_chunk_size: 6,
+      first_stream_chunk_size: 4,
       stateful_synthesis: true,
       stateful_fallback_to_stateless: false,
       stateful_history_turns: 1,
@@ -105,10 +106,11 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
 
     base.tts.max_new_tokens = 300;
     base.tts.chunk_length = 180;
+    base.tts.low_latency_first_audio = true;
     base.tts.initial_stream_chunk_size = 22;
     base.tts.stream_chunk_size = 16;
-    base.tts.first_initial_stream_chunk_size = 6;
-    base.tts.first_stream_chunk_size = 5;
+    base.tts.first_initial_stream_chunk_size = 4;
+    base.tts.first_stream_chunk_size = 3;
 
     base.tts.stateful_history_turns = 1;
     base.tts.stateful_history_chars = 120;
@@ -143,6 +145,7 @@ function makePresetConfig(kind: 'balanced' | 'lowLatency' | 'stable'): ProxyConf
 
     base.tts.max_new_tokens = 300;
     base.tts.chunk_length = 220;
+    base.tts.low_latency_first_audio = false;
     base.tts.initial_stream_chunk_size = 36;
     base.tts.stream_chunk_size = 28;
     base.tts.first_initial_stream_chunk_size = 14;
@@ -251,7 +254,8 @@ export function App() {
       log(
         `pcm stream opened, target_emit_bytes=${event.target_emit_bytes ?? 'n/a'}, ` +
         `first_emit=${event.first_commit_target_emit_bytes ?? 'n/a'}, ` +
-        `client_buffer=${event.client_start_buffer_ms ?? 'n/a'}ms`
+        `client_buffer=${event.client_start_buffer_ms ?? 'n/a'}ms, ` +
+        `prefix_seam=${event.prefix_cache_seam_alignment_enabled ? 'adaptive' : 'planned'}`
       );
     }
 
@@ -288,7 +292,11 @@ export function App() {
     }
 
     if (event.type === 'prefix_cache_generation_skip_done') {
-      log(`prefix cache skip done: skipped_pcm_bytes=${event.skipped_pcm_bytes}, skipped_ms=${event.skipped_ms_estimate}ms`);
+      log(
+        `prefix cache skip done: skipped_pcm_bytes=${event.skipped_pcm_bytes}, ` +
+        `skipped_ms=${event.skipped_ms_estimate}ms, method=${event.adaptive_skip_method ?? 'n/a'}, ` +
+        `delta=${event.adaptive_skip_delta_ms ?? 0}ms`
+      );
     }
 
     if (event.type === 'prefix_cache_context_preloaded') {

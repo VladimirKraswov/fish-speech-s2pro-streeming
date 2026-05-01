@@ -294,11 +294,18 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             stream_decode = bool(req.stream_tokens or req.stream_audio)
             emit_token_events = bool(req.stream_tokens)
 
+            collect_stream_codes = bool(
+                req.stream_audio
+                and req.collect_tokens
+                and not emit_token_events
+            )
+
             if emit_token_events and req.stream_audio:
                 logger.warning(
                     "latency_warning: both stream_tokens and stream_audio are enabled. "
                     "This will cause a CPU/GPU synchronization on every chunk and increase TTFA. "
-                    "For production low-latency, use stream_audio=True and stream_tokens=False."
+                    "For production low-latency, use stream_audio=True, stream_tokens=False, "
+                    "and collect_tokens=True for stateful history."
                 )
 
             collect_codes = not req.stream_audio
@@ -327,6 +334,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
             segments = []
             all_codes = []
+            collected_stream_codes = []
             seg_idx = 0
             stream_decode_idx = 0
             max_vq_context_frames = 8 if req.low_latency_first_audio else 32
@@ -397,6 +405,8 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                         if result.codes is not None:
                             if collect_codes:
                                 all_codes.append(result.codes)
+                            elif collect_stream_codes:
+                                collected_stream_codes.append(result.codes.detach())
 
                             if emit_token_events:
                                 yield InferenceResult(
@@ -607,6 +617,25 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                     ),
                 )
             elif req.stream_audio:
+                if collected_stream_codes:
+                    try:
+                        final_stream_codes = torch.cat(
+                            collected_stream_codes,
+                            dim=1,
+                        )
+                        yield InferenceResult(
+                            code="tokens",
+                            audio=None,
+                            error=None,
+                            tokens=(
+                                final_stream_codes.cpu()
+                                if getattr(final_stream_codes, "is_cuda", False)
+                                else final_stream_codes
+                            ),
+                        )
+                    finally:
+                        collected_stream_codes.clear()
+
                 _mark("stream_done", total_segments=len(segments))
                 logger.info("stream: stream_done req={}", req_tag)
             elif not req.stream_audio:

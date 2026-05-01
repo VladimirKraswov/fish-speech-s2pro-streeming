@@ -21,6 +21,7 @@ class DriverGenerationOptions:
     stream_chunk_size: int = 8
     initial_stream_chunk_size: int = 10
     low_latency_first_audio: bool = False
+    collect_tokens: bool = False
 
     def __post_init__(self) -> None:
         if not self.low_latency_first_audio:
@@ -110,6 +111,10 @@ class DriverSynthesisRequest:
     @property
     def low_latency_first_audio(self) -> bool:
         return self.generation.low_latency_first_audio
+
+    @property
+    def collect_tokens(self) -> bool:
+        return self.generation.collect_tokens
 
 
 @dataclass

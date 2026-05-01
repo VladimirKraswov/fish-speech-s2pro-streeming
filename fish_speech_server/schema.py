@@ -96,6 +96,7 @@ class ServeTTSRequest(BaseModel):
     normalize: bool = True
     streaming: bool = False
     stream_tokens: bool = False
+    low_latency_first_audio: bool = False
     stream_chunk_size: Annotated[int, conint(ge=1, le=200, strict=True)] = 8
     initial_stream_chunk_size: Annotated[int, conint(ge=1, le=200, strict=True)] = 10
     max_new_tokens: Annotated[int, conint(ge=1, le=4096, strict=True)] = 512

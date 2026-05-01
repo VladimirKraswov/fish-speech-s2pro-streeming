@@ -39,6 +39,7 @@ export interface ProxyConfig {
     repetition_penalty: number;
     temperature: number;
     stream_tokens?: boolean;
+    low_latency_first_audio?: boolean;
     initial_stream_chunk_size: number;
     stream_chunk_size: number;
     first_initial_stream_chunk_size?: number | null;
@@ -112,6 +113,11 @@ export type StreamEvent =
       first_commit_start_buffer_ms?: number;
       client_start_buffer_ms?: number;
       client_initial_start_delay_ms?: number;
+      prefix_cache_crossfade_ms?: number;
+      prefix_cache_seam_alignment_enabled?: boolean;
+      prefix_cache_seam_search_ms?: number;
+      prefix_cache_seam_lookahead_ms?: number;
+      prefix_cache_seam_match_ms?: number;
     }
   | {
       type: 'meta';
@@ -149,6 +155,12 @@ export type StreamEvent =
       prefix_runtime_skip_adjust_ms?: number;
       planned_prefix_audio_skip_bytes?: number;
       prefix_audio_skip_ms_estimate?: number;
+      prefix_cache_held_tail_bytes?: number;
+      prefix_cache_crossfade_ms?: number;
+      prefix_cache_adaptive_skip_enabled?: boolean;
+      prefix_cache_adaptive_search_ms?: number;
+      prefix_cache_adaptive_lookahead_ms?: number;
+      prefix_cache_adaptive_match_ms?: number;
     }
   | {
       type: 'pcm';
@@ -246,6 +258,8 @@ export type StreamEvent =
       pcm_bytes?: number;
       cache_mode?: string;
       boundary_method?: string;
+      planned_held_tail_bytes?: number;
+      crossfade_ms?: number;
     }
   | {
       type: 'prefix_cache_done';
@@ -254,6 +268,8 @@ export type StreamEvent =
       cache_key?: string;
       cache_key_short?: string;
       pcm_bytes?: number;
+      held_tail_bytes?: number;
+      crossfade_ms?: number;
     }
   | {
       type: 'prefix_cache_generation_skip_done';
@@ -261,6 +277,11 @@ export type StreamEvent =
       req_id?: string;
       skipped_pcm_bytes?: number;
       skipped_ms_estimate?: number;
+      adaptive_skip_method?: string;
+      adaptive_skip_score?: number | null;
+      adaptive_skip_delta_bytes?: number;
+      adaptive_skip_delta_ms?: number;
+      adaptive_skip_candidates?: number;
     }
   | {
       type: 'prefix_cache_context_preloaded';

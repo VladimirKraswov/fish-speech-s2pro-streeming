@@ -121,6 +121,7 @@ def api_tts_to_driver_request(req: ServeTTSRequest) -> DriverSynthesisRequest:
             stream_tokens=req.stream_tokens,
             stream_chunk_size=req.stream_chunk_size,
             initial_stream_chunk_size=req.initial_stream_chunk_size,
+            low_latency_first_audio=req.low_latency_first_audio,
         ),
     )
 
@@ -138,7 +139,7 @@ def stateful_tts_to_driver_request(
 
     driver_req = api_tts_to_driver_request(req)
     driver_req.reference_id = req.reference_id or context.reference_id
-    driver_req.generation.stream_tokens = True
+    driver_req.generation.collect_tokens = True
     driver_req.segments = [req.text] if req.text.strip() else []
 
     continuation_parts = select_continuation_parts_for_prompt(context)

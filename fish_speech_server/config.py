@@ -137,7 +137,8 @@ class ProxyTTSConfig(BaseModel):
     repetition_penalty: float = Field(1.0, ge=0.9, le=2.0)
     temperature: float = Field(0.66, ge=0.1, le=1.0)
 
-    stream_tokens: bool = True
+    stream_tokens: bool = False
+    low_latency_first_audio: bool = True
     initial_stream_chunk_size: int = Field(10, ge=1, le=200)
     stream_chunk_size: int = Field(8, ge=1, le=200)
     first_initial_stream_chunk_size: int | None = Field(None, ge=1, le=200)

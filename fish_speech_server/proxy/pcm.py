@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import struct
@@ -51,17 +52,30 @@ PREFIX_CACHE_EMIT_BYTES = int(os.getenv("FISH_PREFIX_CACHE_EMIT_BYTES", "8192"))
 
 # Пауза после озвученного prefix-cache перед генерацией хвоста.
 # Не портит append_sent_to_first_pcm: первый звук уже отдан из cache.
-PREFIX_CACHE_PAUSE_AFTER_MS = int(os.getenv("FISH_PREFIX_CACHE_PAUSE_AFTER_MS", "90"))
+PREFIX_CACHE_PAUSE_AFTER_MS = int(os.getenv("FISH_PREFIX_CACHE_PAUSE_AFTER_MS", "0"))
 
 # Затухание конца prefix-cache, чтобы склейка не щёлкала.
-PREFIX_CACHE_FADE_OUT_MS = int(os.getenv("FISH_PREFIX_CACHE_FADE_OUT_MS", "14"))
+PREFIX_CACHE_FADE_OUT_MS = int(os.getenv("FISH_PREFIX_CACHE_FADE_OUT_MS", "0"))
 
 # Мягкий вход генерации после prefix-cache.
 PREFIX_CACHE_GENERATION_FADE_IN_MS = int(
-    os.getenv("FISH_PREFIX_CACHE_GENERATION_FADE_IN_MS", "6")
+    os.getenv("FISH_PREFIX_CACHE_GENERATION_FADE_IN_MS", "0")
 )
+PREFIX_CACHE_SEAM_ALIGNMENT_ENABLED = _env_flag(
+    "FISH_PREFIX_CACHE_SEAM_ALIGNMENT_ENABLED",
+    True,
+)
+PREFIX_CACHE_SEAM_SEARCH_MS = int(os.getenv("FISH_PREFIX_CACHE_SEAM_SEARCH_MS", "90"))
+PREFIX_CACHE_SEAM_LOOKAHEAD_MS = int(
+    os.getenv("FISH_PREFIX_CACHE_SEAM_LOOKAHEAD_MS", "140")
+)
+PREFIX_CACHE_SEAM_MATCH_MS = int(os.getenv("FISH_PREFIX_CACHE_SEAM_MATCH_MS", "55"))
+PREFIX_CACHE_SEAM_MIN_HEAD_MS = int(
+    os.getenv("FISH_PREFIX_CACHE_SEAM_MIN_HEAD_MS", "28")
+)
+PREFIX_CACHE_CROSSFADE_MS = int(os.getenv("FISH_PREFIX_CACHE_CROSSFADE_MS", "12"))
 PREFIX_CACHE_FULL_COMMIT_MODE = _env_flag("FISH_PREFIX_CACHE_FULL_COMMIT_MODE", True)
-PREFIX_CACHE_SKIP_ADJUST_MS = int(os.getenv("FISH_PREFIX_CACHE_SKIP_ADJUST_MS", "35"))
+PREFIX_CACHE_SKIP_ADJUST_MS = int(os.getenv("FISH_PREFIX_CACHE_SKIP_ADJUST_MS", "0"))
 PREFIX_CACHE_STRIP_PREFIX_FROM_TEXT = _env_flag(
     "FISH_PREFIX_CACHE_STRIP_PREFIX_FROM_TEXT",
     True,
@@ -787,6 +801,9 @@ def build_upstream_payload(
         "use_memory_cache": tts.use_memory_cache,
         "max_new_tokens": tts.max_new_tokens,
         "chunk_length": tts.chunk_length,
+        "low_latency_first_audio": bool(
+            tts.low_latency_first_audio and commit_seq == 1
+        ),
         "top_p": tts.top_p,
         "repetition_penalty": tts.repetition_penalty,
         "temperature": tts.temperature,
@@ -898,6 +915,7 @@ def _intro_cache_key(config: ProxyConfig) -> str:
         "repetition_penalty": tts.repetition_penalty,
         "temperature": tts.temperature,
         "stream_tokens": True,
+        "low_latency_first_audio": False,
         "initial_stream_chunk_size": tts.initial_stream_chunk_size,
         "stream_chunk_size": tts.stream_chunk_size,
         "first_initial_stream_chunk_size": tts.first_initial_stream_chunk_size,
@@ -956,6 +974,7 @@ def _prefix_cache_key(
         "temperature": tts.temperature,
         "streaming": True,
         "stream_tokens": True,
+        "low_latency_first_audio": False,
         "initial_stream_chunk_size": tts.initial_stream_chunk_size,
         "stream_chunk_size": tts.stream_chunk_size,
         "first_initial_stream_chunk_size": tts.first_initial_stream_chunk_size,
@@ -986,6 +1005,7 @@ async def _generate_intro_cache_entry(
     payload["streaming"] = True
     payload["stream_tokens"] = True
     payload["format"] = "wav"
+    payload["low_latency_first_audio"] = False
 
     url = UPSTREAM_TTS_URL.replace(
         "/v1/tts",
@@ -1070,6 +1090,7 @@ async def _generate_prefix_cache_entry(
     payload["streaming"] = True
     payload["stream_tokens"] = True
     payload["format"] = "wav"
+    payload["low_latency_first_audio"] = False
 
     url = UPSTREAM_TTS_URL.replace(
         "/v1/tts",
@@ -1553,6 +1574,7 @@ async def emit_prefix_cache(
     entry: PrefixCacheEntry,
     full_commit_mode: bool,
     preload_context: bool,
+    hold_tail_bytes: int = 0,
 ) -> AsyncGenerator[bytes, None]:
     async def emit(obj: dict[str, Any]) -> bytes:
         return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
@@ -1616,6 +1638,8 @@ async def emit_prefix_cache(
             "prefix_audio_skip_bytes": entry.prefix_audio_skip_bytes,
             "prefix_cut_adjust_ms": entry.prefix_cut_adjust_ms,
             "boundary_method": entry.boundary_method,
+            "planned_held_tail_bytes": hold_tail_bytes,
+            "crossfade_ms": PREFIX_CACHE_CROSSFADE_MS if hold_tail_bytes else 0,
         }
     )
 
@@ -1637,8 +1661,14 @@ async def emit_prefix_cache(
     sample_width = int(rec.audio_meta["sample_width"])
     bits_per_sample = sample_width * 8
     frame_bytes = channels * sample_width
+    held_tail = b""
+    hold_tail_bytes = _align_down(max(0, int(hold_tail_bytes)), frame_bytes)
+    if hold_tail_bytes > 0 and len(pcm) > hold_tail_bytes:
+        held_tail = pcm[-hold_tail_bytes:]
+        pcm = pcm[:-hold_tail_bytes]
+        commit_item["_prefix_cache_held_tail_pcm"] = held_tail
 
-    if PREFIX_CACHE_FADE_OUT_MS > 0 and pcm:
+    if PREFIX_CACHE_FADE_OUT_MS > 0 and pcm and not held_tail:
         fade_out_bytes = _align_down(
             _pcm_bytes_for_duration_ms(
                 sample_rate,
@@ -1663,7 +1693,7 @@ async def emit_prefix_cache(
             )
             pcm = bytes(buf)
 
-    if PREFIX_CACHE_PAUSE_AFTER_MS > 0:
+    if PREFIX_CACHE_PAUSE_AFTER_MS > 0 and not held_tail:
         pcm += _pcm_silence_bytes(
             sample_rate=sample_rate,
             channels=channels,
@@ -1708,6 +1738,8 @@ async def emit_prefix_cache(
             "preload_context": preload_context,
             "pause_after_ms": PREFIX_CACHE_PAUSE_AFTER_MS,
             "fade_out_ms": PREFIX_CACHE_FADE_OUT_MS,
+            "held_tail_bytes": len(held_tail),
+            "crossfade_ms": PREFIX_CACHE_CROSSFADE_MS if held_tail else 0,
         }
     )
 
@@ -1956,6 +1988,255 @@ def _apply_pcm16_fade(
                 scale_frame(start + i, 1.0 - (i / denom))
 
     return bytes(out)
+
+
+def _pcm16le_mono_samples(pcm: bytes, *, channels: int) -> list[float]:
+    if not pcm or channels <= 0:
+        return []
+
+    frame_bytes = channels * 2
+    usable_len = len(pcm) - (len(pcm) % frame_bytes)
+    if usable_len <= 0:
+        return []
+
+    out: list[float] = []
+    for frame_start in range(0, usable_len, frame_bytes):
+        total = 0
+        for ch in range(channels):
+            total += struct.unpack_from("<h", pcm, frame_start + ch * 2)[0]
+        out.append((total / channels) / 32768.0)
+
+    return out
+
+
+def _rms_float(samples: list[float]) -> float:
+    if not samples:
+        return 0.0
+    return math.sqrt(sum(sample * sample for sample in samples) / len(samples))
+
+
+def _normalized_tail_match_score(
+    cached_tail: list[float],
+    candidate_tail: list[float],
+) -> float:
+    n = min(len(cached_tail), len(candidate_tail))
+    if n <= 0:
+        return float("inf")
+
+    cached = cached_tail[-n:]
+    candidate = candidate_tail[-n:]
+    rms_cached = _rms_float(cached)
+    rms_candidate = _rms_float(candidate)
+    denom = max(1e-4, rms_cached + rms_candidate)
+    diff = math.sqrt(
+        sum((a - b) * (a - b) for a, b in zip(cached, candidate)) / n
+    )
+    return diff / denom
+
+
+def _adaptive_prefix_skip_plan(
+    *,
+    cached_pcm: bytes,
+    upstream_pcm: bytes,
+    planned_skip_bytes: int,
+    sample_rate: int,
+    channels: int,
+    sample_width: int,
+    search_ms: int = PREFIX_CACHE_SEAM_SEARCH_MS,
+    match_ms: int = PREFIX_CACHE_SEAM_MATCH_MS,
+    min_head_ms: int = PREFIX_CACHE_SEAM_MIN_HEAD_MS,
+) -> dict[str, Any]:
+    """
+    Find the live upstream boundary that best matches the end of cached prefix.
+
+    Full-prefix mode plays cached PCM immediately, then generates the full text
+    upstream and skips the generated prefix. The standalone cached prefix and
+    the same prefix inside the full phrase can differ by tens of milliseconds,
+    so a fixed byte skip often repeats or chops the last phoneme. This search
+    aligns by waveform around the expected boundary and returns an aligned byte
+    offset plus diagnostics.
+    """
+    frame_bytes = channels * sample_width
+    planned = _align_down(max(0, int(planned_skip_bytes)), frame_bytes)
+    planned = min(planned, _align_down(len(upstream_pcm), frame_bytes))
+
+    base = {
+        "skip_bytes": planned,
+        "planned_skip_bytes": planned,
+        "skip_delta_bytes": 0,
+        "skip_delta_ms": 0.0,
+        "method": "planned",
+        "score": None,
+        "candidate_count": 0,
+        "search_ms": search_ms,
+        "match_ms": match_ms,
+        "min_head_ms": min_head_ms,
+    }
+
+    if (
+        not PREFIX_CACHE_SEAM_ALIGNMENT_ENABLED
+        or not cached_pcm
+        or not upstream_pcm
+        or sample_rate <= 0
+        or channels <= 0
+        or sample_width != 2
+        or frame_bytes <= 0
+        or search_ms <= 0
+        or match_ms <= 0
+    ):
+        return {**base, "method": "disabled"}
+
+    usable_upstream_len = _align_down(len(upstream_pcm), frame_bytes)
+    if usable_upstream_len <= 0:
+        return {**base, "method": "empty_upstream"}
+
+    radius_bytes = _align_down(
+        _pcm_bytes_for_duration_ms(sample_rate, channels, sample_width * 8, search_ms),
+        frame_bytes,
+    )
+    match_bytes = _align_down(
+        _pcm_bytes_for_duration_ms(sample_rate, channels, sample_width * 8, match_ms),
+        frame_bytes,
+    )
+    min_head_bytes = _align_down(
+        _pcm_bytes_for_duration_ms(
+            sample_rate,
+            channels,
+            sample_width * 8,
+            min_head_ms,
+        ),
+        frame_bytes,
+    )
+    boundary_bytes = _align_down(
+        _pcm_bytes_for_duration_ms(sample_rate, channels, sample_width * 8, 8),
+        frame_bytes,
+    )
+
+    match_bytes = min(
+        match_bytes,
+        _align_down(len(cached_pcm), frame_bytes),
+        usable_upstream_len,
+    )
+    if match_bytes <= 0:
+        return {**base, "method": "insufficient_match_window"}
+
+    min_candidate = max(match_bytes, planned - radius_bytes)
+    max_candidate = min(usable_upstream_len - min_head_bytes, planned + radius_bytes)
+
+    if max_candidate < min_candidate:
+        return {**base, "method": "insufficient_lookahead"}
+
+    cached_tail = _pcm16le_mono_samples(
+        cached_pcm[-match_bytes:],
+        channels=channels,
+    )
+    if not cached_tail:
+        return {**base, "method": "empty_cached_tail"}
+
+    step_frames = max(1, int(sample_rate * 0.002))
+    step_bytes = max(frame_bytes, step_frames * frame_bytes)
+    step_bytes = _align_down(step_bytes, frame_bytes) or frame_bytes
+
+    best_skip = planned
+    best_score = float("inf")
+    candidate_count = 0
+
+    candidate = _align_down(min_candidate, frame_bytes)
+    while candidate <= max_candidate:
+        candidate_count += 1
+
+        tail_pcm = upstream_pcm[candidate - match_bytes : candidate]
+        candidate_tail = _pcm16le_mono_samples(tail_pcm, channels=channels)
+        match_score = _normalized_tail_match_score(cached_tail, candidate_tail)
+
+        boundary_start = max(0, candidate - boundary_bytes // 2)
+        boundary_end = min(usable_upstream_len, candidate + boundary_bytes // 2)
+        boundary_samples = _pcm16le_mono_samples(
+            upstream_pcm[boundary_start:boundary_end],
+            channels=channels,
+        )
+        boundary_energy = _rms_float(boundary_samples)
+
+        distance = abs(candidate - planned) / max(1, radius_bytes)
+        score = match_score * 0.74 + boundary_energy * 0.16 + distance * 0.10
+
+        if score < best_score:
+            best_score = score
+            best_skip = candidate
+
+        candidate += step_bytes
+
+    delta_bytes = best_skip - planned
+    return {
+        **base,
+        "skip_bytes": best_skip,
+        "skip_delta_bytes": delta_bytes,
+        "skip_delta_ms": _pcm_ms_estimate(
+            abs(delta_bytes),
+            sample_rate=sample_rate,
+            channels=channels,
+            sample_width=sample_width,
+        )
+        * (-1 if delta_bytes < 0 else 1),
+        "method": "adaptive_waveform",
+        "score": round(best_score, 6),
+        "candidate_count": candidate_count,
+    }
+
+
+def _pcm16_crossfade(
+    prefix_tail: bytes,
+    live_head: bytes,
+    *,
+    channels: int,
+) -> bytes:
+    if not prefix_tail:
+        return live_head
+    if not live_head:
+        return prefix_tail
+    if channels <= 0:
+        return prefix_tail + live_head
+
+    frame_bytes = channels * 2
+    overlap_len = min(len(prefix_tail), len(live_head))
+    overlap_len = _align_down(overlap_len, frame_bytes)
+    if overlap_len <= 0:
+        return prefix_tail + live_head
+
+    prefix_overlap = prefix_tail[-overlap_len:]
+    live_overlap = live_head[:overlap_len]
+    prefix_before = prefix_tail[:-overlap_len]
+    live_after = live_head[overlap_len:]
+    frames = overlap_len // frame_bytes
+    mixed = bytearray(overlap_len)
+
+    def clamp_i16(value: float) -> int:
+        ivalue = int(round(value))
+        if ivalue > 32767:
+            return 32767
+        if ivalue < -32768:
+            return -32768
+        return ivalue
+
+    denom = max(1, frames - 1)
+    for frame_idx in range(frames):
+        x = frame_idx / denom
+        live_gain = x
+        prefix_gain = 1.0 - x
+        base = frame_idx * frame_bytes
+
+        for ch in range(channels):
+            offset = base + ch * 2
+            a = struct.unpack_from("<h", prefix_overlap, offset)[0]
+            b = struct.unpack_from("<h", live_overlap, offset)[0]
+            struct.pack_into(
+                "<h",
+                mixed,
+                offset,
+                clamp_i16(a * prefix_gain + b * live_gain),
+            )
+
+    return prefix_before + bytes(mixed) + live_after
 
 
 def _last_boundary_before(
@@ -2935,6 +3216,16 @@ async def session_pcm_stream(session_id: str):
                 )
                 prefix_cache_preload_context = False
 
+            prefix_hold_tail_bytes = 0
+            if PREFIX_CACHE_CROSSFADE_MS > 0 and prefix_cache_entry:
+                meta = prefix_cache_entry.audio_meta
+                prefix_hold_tail_bytes = _pcm_bytes_for_duration_ms(
+                    int(meta["sample_rate"]),
+                    int(meta["channels"]),
+                    int(meta["sample_width"]) * 8,
+                    PREFIX_CACHE_CROSSFADE_MS,
+                )
+
             async for event in emit_prefix_cache(
                 rec=rec,
                 config=config,
@@ -2944,6 +3235,7 @@ async def session_pcm_stream(session_id: str):
                 entry=prefix_cache_entry,
                 full_commit_mode=full_commit_mode,
                 preload_context=prefix_cache_preload_context,
+                hold_tail_bytes=prefix_hold_tail_bytes,
             ):
                 yield event
 
@@ -3103,6 +3395,10 @@ async def session_pcm_stream(session_id: str):
             config=config,
             commit_seq=commit_seq,
         )
+        if has_prefix_cache:
+            # The cached PCM already gives near-zero perceived TTFA; keep the
+            # live full-phrase generation on the quality-oriented path.
+            payload["low_latency_first_audio"] = False
 
         url = UPSTREAM_TTS_URL
         if rec.synthesis_session_id and config.tts.stateful_synthesis:
@@ -3122,9 +3418,15 @@ async def session_pcm_stream(session_id: str):
         upstream_bytes = 0
         first_emit_done = False
         start_buffer_bytes = 0
-        skip_remaining_bytes = planned_prefix_audio_skip_bytes
         skipped_pcm_bytes = 0
         skip_done_emitted = not full_commit_mode
+        prefix_skip_buffer = bytearray()
+        prefix_skip_plan: dict[str, Any] | None = None
+        live_crossfade_buffer = bytearray()
+        held_prefix_tail_pcm = bytes(
+            commit_item.pop("_prefix_cache_held_tail_pcm", b"")
+        )
+        crossfade_done = not held_prefix_tail_pcm
 
         fade_in_applied = False
         sample_rate = 0
@@ -3209,45 +3511,139 @@ async def session_pcm_stream(session_id: str):
                 first_emit_done = True
                 await asyncio.sleep(0)
 
+        async def _emit_prefix_skip_done() -> AsyncGenerator[bytes, None]:
+            if not full_commit_mode or skip_done_emitted:
+                return
+
+            yield await emit(
+                {
+                    "type": "prefix_cache_generation_skip_done",
+                    "req_id": req_id,
+                    "session_id": rec.session_id,
+                    "commit_seq": commit_item["seq"],
+                    "cache_key": prefix_cache_entry.key if prefix_cache_entry else None,
+                    "cache_key_short": (
+                        prefix_cache_entry.key[:8] if prefix_cache_entry else None
+                    ),
+                    "skipped_pcm_bytes": skipped_pcm_bytes,
+                    "skipped_ms_estimate": _pcm_ms_estimate(
+                        skipped_pcm_bytes,
+                        sample_rate=sample_rate,
+                        channels=channels,
+                        sample_width=bits_per_sample // 8,
+                    ),
+                    "expected_skip_bytes": planned_prefix_audio_skip_bytes,
+                    "planned_prefix_audio_skip_bytes": planned_prefix_audio_skip_bytes,
+                    "adaptive_skip_method": (
+                        prefix_skip_plan.get("method") if prefix_skip_plan else None
+                    ),
+                    "adaptive_skip_score": (
+                        prefix_skip_plan.get("score") if prefix_skip_plan else None
+                    ),
+                    "adaptive_skip_delta_bytes": (
+                        prefix_skip_plan.get("skip_delta_bytes")
+                        if prefix_skip_plan
+                        else 0
+                    ),
+                    "adaptive_skip_delta_ms": (
+                        prefix_skip_plan.get("skip_delta_ms")
+                        if prefix_skip_plan
+                        else 0.0
+                    ),
+                    "adaptive_skip_candidates": (
+                        prefix_skip_plan.get("candidate_count")
+                        if prefix_skip_plan
+                        else 0
+                    ),
+                }
+            )
+            await asyncio.sleep(0)
+
         async def append_pcm_after_prefix_skip(
             pcm: bytes,
+            *,
+            force: bool = False,
         ) -> AsyncGenerator[bytes, None]:
-            nonlocal skip_remaining_bytes, skipped_pcm_bytes, skip_done_emitted
+            nonlocal skipped_pcm_bytes, skip_done_emitted, prefix_skip_plan
+            nonlocal crossfade_done
 
-            if full_commit_mode and skip_remaining_bytes > 0:
-                take = min(skip_remaining_bytes, len(pcm))
-                if take > 0:
-                    skip_remaining_bytes -= take
-                    skipped_pcm_bytes += take
-                    pcm = pcm[take:]
+            if full_commit_mode and not skip_done_emitted:
+                if pcm:
+                    prefix_skip_buffer.extend(pcm)
 
-            if full_commit_mode and not skip_done_emitted and skip_remaining_bytes <= 0:
-                skip_done_emitted = True
-                yield await emit(
-                    {
-                        "type": "prefix_cache_generation_skip_done",
-                        "req_id": req_id,
-                        "session_id": rec.session_id,
-                        "commit_seq": commit_item["seq"],
-                        "cache_key": prefix_cache_entry.key if prefix_cache_entry else None,
-                        "cache_key_short": (
-                            prefix_cache_entry.key[:8] if prefix_cache_entry else None
-                        ),
-                        "skipped_pcm_bytes": skipped_pcm_bytes,
-                        "skipped_ms_estimate": _pcm_ms_estimate(
-                            skipped_pcm_bytes,
-                            sample_rate=sample_rate,
-                            channels=channels,
-                            sample_width=bits_per_sample // 8,
-                        ),
-                        "expected_skip_bytes": planned_prefix_audio_skip_bytes,
-                        "planned_prefix_audio_skip_bytes": planned_prefix_audio_skip_bytes,
-                    }
+                search_bytes = _pcm_bytes_for_duration_ms(
+                    sample_rate,
+                    channels,
+                    bits_per_sample,
+                    PREFIX_CACHE_SEAM_SEARCH_MS,
                 )
-                await asyncio.sleep(0)
+                min_head_bytes = _pcm_bytes_for_duration_ms(
+                    sample_rate,
+                    channels,
+                    bits_per_sample,
+                    max(PREFIX_CACHE_SEAM_MIN_HEAD_MS, PREFIX_CACHE_CROSSFADE_MS),
+                )
+                lookahead_bytes = _pcm_bytes_for_duration_ms(
+                    sample_rate,
+                    channels,
+                    bits_per_sample,
+                    PREFIX_CACHE_SEAM_LOOKAHEAD_MS,
+                )
+                if PREFIX_CACHE_SEAM_ALIGNMENT_ENABLED:
+                    required_bytes = planned_prefix_audio_skip_bytes + max(
+                        search_bytes + min_head_bytes,
+                        lookahead_bytes,
+                    )
+                else:
+                    required_bytes = planned_prefix_audio_skip_bytes + min_head_bytes
 
-            if not pcm:
+                required_bytes = _align_down(required_bytes, frame_bytes)
+
+                if not force and len(prefix_skip_buffer) < required_bytes:
+                    return
+
+                prefix_skip_plan = _adaptive_prefix_skip_plan(
+                    cached_pcm=prefix_cache_entry.pcm if prefix_cache_entry else b"",
+                    upstream_pcm=bytes(prefix_skip_buffer),
+                    planned_skip_bytes=planned_prefix_audio_skip_bytes,
+                    sample_rate=sample_rate,
+                    channels=channels,
+                    sample_width=bits_per_sample // 8,
+                    min_head_ms=max(
+                        PREFIX_CACHE_SEAM_MIN_HEAD_MS,
+                        PREFIX_CACHE_CROSSFADE_MS,
+                    ),
+                )
+                skip_bytes = int(prefix_skip_plan["skip_bytes"])
+                skip_bytes = min(skip_bytes, len(prefix_skip_buffer))
+                skip_bytes = _align_down(skip_bytes, frame_bytes)
+                skipped_pcm_bytes = skip_bytes
+
+                pcm = bytes(prefix_skip_buffer[skip_bytes:])
+                prefix_skip_buffer.clear()
+                async for event in _emit_prefix_skip_done():
+                    yield event
+                skip_done_emitted = True
+
+            if not pcm and not (
+                force and not crossfade_done and live_crossfade_buffer
+            ):
                 return
+
+            if not crossfade_done:
+                if pcm:
+                    live_crossfade_buffer.extend(pcm)
+                need_bytes = _align_down(len(held_prefix_tail_pcm), frame_bytes)
+                if not force and len(live_crossfade_buffer) < need_bytes:
+                    return
+
+                pcm = _pcm16_crossfade(
+                    held_prefix_tail_pcm,
+                    bytes(live_crossfade_buffer),
+                    channels=channels,
+                )
+                live_crossfade_buffer.clear()
+                crossfade_done = True
 
             pending_pcm.extend(pcm)
             async for event in flush_pending(force=False):
@@ -3298,6 +3694,16 @@ async def session_pcm_stream(session_id: str):
                 "prefix_runtime_skip_adjust_ms": PREFIX_CACHE_SKIP_ADJUST_MS,
                 "planned_prefix_audio_skip_bytes": planned_prefix_audio_skip_bytes,
                 "prefix_audio_skip_ms_estimate": prefix_audio_skip_ms_estimate,
+                "prefix_cache_held_tail_bytes": len(held_prefix_tail_pcm),
+                "prefix_cache_crossfade_ms": (
+                    PREFIX_CACHE_CROSSFADE_MS if held_prefix_tail_pcm else 0
+                ),
+                "prefix_cache_adaptive_skip_enabled": (
+                    PREFIX_CACHE_SEAM_ALIGNMENT_ENABLED
+                ),
+                "prefix_cache_adaptive_search_ms": PREFIX_CACHE_SEAM_SEARCH_MS,
+                "prefix_cache_adaptive_lookahead_ms": PREFIX_CACHE_SEAM_LOOKAHEAD_MS,
+                "prefix_cache_adaptive_match_ms": PREFIX_CACHE_SEAM_MATCH_MS,
                 "server_perf_ms": int(time.perf_counter() * 1000),
             }
         )
@@ -3421,10 +3827,13 @@ async def session_pcm_stream(session_id: str):
         if not header_sent:
             raise RuntimeError("upstream finished before WAV data header was parsed")
 
-        if full_commit_mode and skip_remaining_bytes > 0:
+        async for event in append_pcm_after_prefix_skip(b"", force=True):
+            yield event
+
+        if full_commit_mode and not skip_done_emitted:
             raise RuntimeError(
-                "upstream finished before prefix-cache audio skip completed: "
-                f"remaining={skip_remaining_bytes} planned={planned_prefix_audio_skip_bytes}"
+                "upstream finished before prefix-cache audio skip could be resolved: "
+                f"planned={planned_prefix_audio_skip_bytes}"
             )
 
         boundary_kind, pause_ms = _pause_ms_for_commit(
@@ -3537,6 +3946,13 @@ async def session_pcm_stream(session_id: str):
                     "prefix_cache_generation_fade_in_ms": (
                         PREFIX_CACHE_GENERATION_FADE_IN_MS
                     ),
+                    "prefix_cache_crossfade_ms": PREFIX_CACHE_CROSSFADE_MS,
+                    "prefix_cache_seam_alignment_enabled": (
+                        PREFIX_CACHE_SEAM_ALIGNMENT_ENABLED
+                    ),
+                    "prefix_cache_seam_search_ms": PREFIX_CACHE_SEAM_SEARCH_MS,
+                    "prefix_cache_seam_lookahead_ms": PREFIX_CACHE_SEAM_LOOKAHEAD_MS,
+                    "prefix_cache_seam_match_ms": PREFIX_CACHE_SEAM_MATCH_MS,
                     "prefix_cache_full_commit_mode": PREFIX_CACHE_FULL_COMMIT_MODE,
                     "prefix_cache_strip_prefix_from_text": (
                         PREFIX_CACHE_STRIP_PREFIX_FROM_TEXT

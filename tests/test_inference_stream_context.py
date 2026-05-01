@@ -81,6 +81,14 @@ def _collect_audio_events(engine, request):
     ]
 
 
+def _collect_events(engine, request):
+    return [
+        event
+        for event in engine.inference(request)
+        if isinstance(event, InferenceResult)
+    ]
+
+
 def test_stream_audio_initializes_left_context_from_last_continuation_turn():
     segment = np.arange(6, dtype=np.float32)
     engine = _ProbeEngine(segment)
@@ -128,3 +136,25 @@ def test_stream_audio_without_continuation_keeps_no_left_context_and_raw_segment
     assert engine.seen_left_context == [None]
     assert len(events) == 1
     assert np.array_equal(events[0].audio[1], segment)
+
+
+def test_stream_audio_can_collect_history_codes_without_public_token_stream():
+    segment = np.arange(5, dtype=np.float32)
+    engine = _ProbeEngine(segment)
+
+    events = _collect_events(
+        engine,
+        DriverSynthesisRequest(
+            text="plain",
+            segments=["plain"],
+            reference_id="voice",
+            stream_audio=True,
+            generation=DriverGenerationOptions(
+                stream_tokens=False,
+                collect_tokens=True,
+            ),
+        ),
+    )
+
+    assert [event.code for event in events] == ["segment", "tokens"]
+    assert events[1].tokens.shape == (2, 4)

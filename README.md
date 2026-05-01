@@ -895,6 +895,33 @@ export COMPOSE_DOCKER_CLI_BUILD=1
 
 ---
 
+# Streaming TTFA и Prefix Cache
+
+Текущий рекомендуемый режим разделяет два потока:
+
+- `stream_audio=true` всегда включает внутреннюю потоковую генерацию токенов для раннего аудио;
+- `tts.stream_tokens=false` не отдаёт токены наружу на каждом чанке, поэтому первый звук не ждёт лишних CPU/GPU sync;
+- stateful-history всё равно получает codes через внутренний `collect_tokens` в конце коммита;
+- `tts.low_latency_first_audio=true` применяется к первому обычному коммиту, но отключается для prefix-cache full generation, где важнее качество фразы.
+
+Prefix cache в proxy работает в `full_commit_mode`: cached PCM отдаётся сразу, upstream генерирует полную фразу, затем proxy адаптивно ищет границу prefix-а в PCM и делает короткий crossfade. Это убирает типичные дефекты вроде повторной последней буквы/звука prefix-а.
+
+Диагностика приходит в NDJSON:
+
+- `prefix_cache_generation_skip_done.adaptive_skip_method`
+- `adaptive_skip_delta_ms`
+- `adaptive_skip_score`
+- `prefix_cache_crossfade_ms`
+
+Если UI показывает `input_already_finished`, это поздний append после `finish`; proxy теперь игнорирует такие чанки идемпотентно и возвращает `ignored: true`.
+
+После правок protocol/UI перезапустите:
+
+```bash
+make restart SERVICE=proxy
+make restart SERVICE=webui
+```
+
 # Extreme TTFA Profiles
 
 Для достижения минимально возможной задержки (Extreme TTFA) используйте следующие профили в `runtime.json` или в `config_text` при открытии сессии.
@@ -926,9 +953,10 @@ export COMPOSE_DOCKER_CLI_BUILD=1
     "carry_incomplete_tail": true
   },
   "tts": {
-    "stream_tokens": true,
+    "stream_tokens": false,
+    "low_latency_first_audio": true,
     "first_initial_stream_chunk_size": 4,
-    "first_stream_chunk_size": 2,
+    "first_stream_chunk_size": 3,
     "initial_stream_chunk_size": 8,
     "stream_chunk_size": 4
   },
@@ -956,7 +984,8 @@ export COMPOSE_DOCKER_CLI_BUILD=1
 ```json
 {
   "tts": {
-    "stream_tokens": true,
+    "stream_tokens": false,
+    "low_latency_first_audio": true,
     "first_initial_stream_chunk_size": 6,
     "first_stream_chunk_size": 4,
     "initial_stream_chunk_size": 10,

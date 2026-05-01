@@ -224,6 +224,7 @@ export function App() {
   const [sessionStatus, setSessionStatus] = useState('idle');
   const [audioStatus, setAudioStatus] = useState('idle');
   const [isStreaming, setIsStreaming] = useState(false);
+  const [inputClosed, setInputClosed] = useState(false);
 
   const [committed, setCommitted] = useState<CommittedItem[]>([]);
   const [activeCommit, setActiveCommit] = useState('');
@@ -241,12 +242,20 @@ export function App() {
   const client = useRef(new FishProxyClient(PROXY_URL));
   const abortController = useRef<AbortController | null>(null);
   const simulator = useRef<LLMSimulator | null>(null);
+  const inputClosedRef = useRef(false);
+  const finishingRef = useRef(false);
+  const activeSessionIdRef = useRef<string | null>(null);
 
   const [speedMultiplier, setSpeedMultiplier] = useState(1.0);
 
   const log = (message: string) => {
     const time = new Date().toLocaleTimeString();
     setLogs((prev) => [...prev.slice(-180), `[${time}] ${message}`]);
+  };
+
+  const markInputClosed = (value: boolean) => {
+    inputClosedRef.current = value;
+    setInputClosed(value);
   };
 
   const onStreamEvent = (event: StreamEvent) => {
@@ -331,17 +340,22 @@ export function App() {
     if (event.type === 'error') {
       log(`stream error: ${event.message}`);
       setIsStreaming(false);
+      finishingRef.current = false;
     }
 
     if (event.type === 'session_done') {
       setSessionStatus('finished');
       setIsStreaming(false);
+      markInputClosed(true);
+      finishingRef.current = false;
       log(`session done, commits=${event.commit_count ?? 'n/a'}`);
     }
 
     if (event.type === 'session_aborted') {
       setSessionStatus('aborted');
       setIsStreaming(false);
+      markInputClosed(true);
+      finishingRef.current = false;
       log('session aborted');
     }
   };
@@ -451,11 +465,15 @@ export function App() {
     setSessionStatus('opening');
     setCommitted([]);
     setActiveCommit('');
+    markInputClosed(false);
+    finishingRef.current = false;
+    activeSessionIdRef.current = null;
 
     try {
       const data = await client.current.openSession(configText);
 
       setSessionId(data.session_id);
+      activeSessionIdRef.current = data.session_id;
       setSessionStatus('open');
 
       const stateful = data.config?.tts?.stateful_synthesis ? 'stateful' : 'stateless';
@@ -486,11 +504,21 @@ export function App() {
 
   const finishSession = async () => {
     if (!sessionId) return;
+    if (finishingRef.current) return;
+    if (inputClosedRef.current) {
+      log('finish already sent');
+      return;
+    }
 
+    const id = sessionId;
+    finishingRef.current = true;
+    markInputClosed(true);
     setSessionStatus('finishing');
 
     try {
-      const data = await client.current.finishSession(sessionId, 'llm_input_finished');
+      const data = await client.current.finishSession(id, 'llm_input_finished');
+      if (activeSessionIdRef.current !== id) return;
+
       addCommitted(data.committed);
 
       if (data.committed?.length) {
@@ -499,8 +527,15 @@ export function App() {
         log('finish sent, no buffered text');
       }
     } catch (error) {
-      setSessionStatus('open');
+      if (activeSessionIdRef.current === id) {
+        markInputClosed(false);
+        setSessionStatus('open');
+      }
       log(`finish failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      if (activeSessionIdRef.current === id) {
+        finishingRef.current = false;
+      }
     }
   };
 
@@ -512,6 +547,9 @@ export function App() {
     simulator.current?.stop();
     abortController.current?.abort();
     audioEngine.current.reset();
+    activeSessionIdRef.current = null;
+    finishingRef.current = false;
+    markInputClosed(false);
 
     setIsStreaming(false);
     setSessionStatus('closing');
@@ -536,7 +574,7 @@ export function App() {
   }, [llmVisibleText]);
 
   const startTextStream = () => {
-    if (!sessionId || isStreaming) return;
+    if (!sessionId || isStreaming || inputClosedRef.current) return;
 
     setIsStreaming(true);
     setLlmTyping(true);
@@ -553,6 +591,10 @@ export function App() {
       interval: intervalMs,
       speedMultiplier,
       onChunk: async (chunk) => {
+        if (inputClosedRef.current || activeSessionIdRef.current !== sessionId) {
+          return false;
+        }
+
         try {
           const options: { cache?: string; cache_key?: string } = {};
           if (isFirstChunk) {
@@ -565,6 +607,10 @@ export function App() {
           }
 
           const data = await client.current.appendText(sessionId, chunk, options);
+          if (data.ignored || inputClosedRef.current) {
+            return false;
+          }
+
           setLlmVisibleText((prev) => prev + chunk);
           addCommitted(data.committed);
           return true;
@@ -578,6 +624,9 @@ export function App() {
       onFinish: async () => {
         setIsStreaming(false);
         setLlmTyping(false);
+        if (inputClosedRef.current) {
+          return;
+        }
         log('LLM text simulation finished');
         await finishSession();
       },
@@ -595,7 +644,7 @@ export function App() {
   };
 
   const flush = async () => {
-    if (!sessionId) return;
+    if (!sessionId || inputClosedRef.current) return;
 
     try {
       const data = await client.current.flushSession(sessionId, 'manual_flush');
@@ -742,12 +791,12 @@ export function App() {
           </div>
 
           <div class="button-row">
-            <button class="primary" onClick={startTextStream} disabled={!sessionId || isStreaming}>
+            <button class="primary" onClick={startTextStream} disabled={!sessionId || isStreaming || inputClosed}>
               Start streaming
             </button>
             <button onClick={stopTextStream} disabled={!sessionId || !isStreaming}>Stop + finish</button>
-            <button onClick={flush} disabled={!sessionId}>Force flush</button>
-            <button onClick={finishSession} disabled={!sessionId || sessionStatus === 'finishing'}>Finish input</button>
+            <button onClick={flush} disabled={!sessionId || inputClosed}>Force flush</button>
+            <button onClick={finishSession} disabled={!sessionId || inputClosed || sessionStatus === 'finishing'}>Finish input</button>
           </div>
         </div>
 

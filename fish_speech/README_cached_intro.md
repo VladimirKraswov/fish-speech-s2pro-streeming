@@ -1,8 +1,7 @@
 # Cached Intro Mode in Fish Speech Core
 
 Cached intro mode lowers perceived TTFA by letting a server/proxy play a
-pre-generated prefix immediately while Fish Speech generates only the live
-suffix.
+pre-generated prefix immediately while Fish Speech continues the phrase.
 
 Fish Speech core does not do prefix matching, browser streaming, PCM queueing,
 or protocol events. Core is responsible for two things:
@@ -167,7 +166,12 @@ Cached intro:
 Что такое
 ```
 
-The server/proxy:
+The server/proxy has two safe runtime strategies.
+
+### Continuation-only
+
+This mode sends cached PCM to the client and sends only the suffix to Fish
+Speech with cached codes in `continuation_text` / `continuation_tokens`:
 
 1. matches the cached prefix;
 2. immediately sends `prefix_cache/pcm/voice_ru_chto_takoe_v1.pcm` to the client;
@@ -191,6 +195,31 @@ request = DriverSynthesisRequest(
 
 The cached prefix is not sent as normal TTS text and is not mixed into Fish
 Speech audio generation. Fish Speech sees it only as continuation history.
+
+### Full-commit proxy mode
+
+The proxy can also generate the full phrase upstream while cached PCM is already
+playing. It then skips the generated prefix in PCM space. This is the default
+for high-quality prefix-cache playback because the model reads the whole phrase
+with natural prosody instead of starting cold at the suffix.
+
+To avoid duplicated final phonemes, the proxy does not use a blind fixed cut:
+
+- it buffers a short upstream window around the expected prefix duration;
+- compares the cached prefix tail with candidate upstream tails;
+- chooses an adaptive skip point near the acoustic match;
+- holds a tiny cached tail and crossfades it into the live head.
+
+Useful NDJSON diagnostics:
+
+- `prefix_cache_generation_skip_done.adaptive_skip_method`
+- `adaptive_skip_delta_ms`
+- `adaptive_skip_score`
+- `prefix_cache_crossfade_ms`
+
+`stream_tokens` should normally stay `false` for browser streaming. The engine
+still streams tokens internally for audio and can collect final codes for
+stateful history without yielding every token chunk to the HTTP/UI layer.
 
 ## Codec Utilities
 

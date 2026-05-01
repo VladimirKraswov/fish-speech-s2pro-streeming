@@ -96,6 +96,9 @@ export interface SessionAppendResponse {
   ok: boolean;
   session_id: string;
   accepted_chars?: number;
+  ignored_chars?: number;
+  ignored?: boolean;
+  reason?: string;
   buffer_text?: string;
   buffer_chars?: number;
   committed?: CommittedItem[];

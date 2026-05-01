@@ -2922,12 +2922,31 @@ async def session_append(session_id: str, req: SessionAppendRequest) -> JSONResp
         if prefix_cache_text is not None:
             prefix_cache_key = _prefix_cache_key(config, prefix_cache_text)
 
-    if len(req.text) + len(rec.buffer_text) > config.session.max_buffer_chars:
-        raise HTTPException(400, detail="session buffer limit exceeded")
-
     async with rec.lock:
         if rec.input_closed:
-            raise HTTPException(409, detail="session input already finished")
+            logger.info(
+                "late append ignored session=%s chars=%s",
+                rec.session_id[:8],
+                len(req.text),
+            )
+            await _touch_session(rec)
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "session_id": rec.session_id,
+                    "accepted_chars": 0,
+                    "ignored_chars": len(req.text),
+                    "ignored": True,
+                    "reason": "input_already_finished",
+                    "buffer_text": rec.buffer_text,
+                    "buffer_chars": len(rec.buffer_text),
+                    "committed": [],
+                    "input_closed": True,
+                }
+            )
+
+        if len(req.text) + len(rec.buffer_text) > config.session.max_buffer_chars:
+            raise HTTPException(400, detail="session buffer limit exceeded")
 
         if prefix_cache_text is not None or req.cache_key:
             if rec.next_commit_seq != 1 or rec.commit_history:

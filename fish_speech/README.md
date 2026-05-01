@@ -163,6 +163,7 @@ POST /v1/tts
 - Аудиосегмент упаковывается в `InferenceResult(code="segment", audio=(sample_rate, segment))`.
 - Если `req.stream_audio = True` — каждый сегмент сразу же возвращается наружу (через `yield`).
 - В конце возвращается `InferenceResult(code="final", audio=(sample_rate, full_audio))`.
+- Для stateful streaming codes могут собираться внутренне (`collect_tokens=True`) и отдаваться одним событием после аудио. Это сохраняет acoustic continuation без задержек от публичного token stream.
 
 ### Шаг 7. Driver возвращает события
 - Сессия `yield`'ит `DriverAudioChunkEvent` для каждого сегмента и `DriverFinalAudioEvent` в конце.
@@ -187,7 +188,18 @@ POST /v1/tts
 
 1. **Архитектура** — «нейронный кодек + авторегрессия»: LLaMA генерирует токены, DAC декодирует в аудио.
 2. **Модульность**: драйвер → инференс‑движок → очередь генерации → декодер аудио. Всё распараллелено (отдельный поток для Llama).
-3. **Потоковый режим**: токены отдаются чанками, аудио — тоже чанками, HTTP — `Transfer-Encoding: chunked`.
+3. **Потоковый режим**: аудио отдаётся чанками; публичный `stream_tokens` выключается для минимального TTFA, а codes для истории собираются отдельным внутренним путём.
 4. **Референсы** кэшируются на диске и в оперативной памяти (по желанию) — ускоряет первые запросы.
 5. **Проект оптимизирован под 32 ГБ VRAM** (RTX 5090): используется `torch.compile`, int8/int4‑квантизация, настройки очистки кэша, контроль `max_new_tokens`.
 6. **Код написан на чистом PyTorch** с минимальными зависимостями (`kui` for ASGI, `uvicorn`, `fastapi` для прокси).
+
+## Prefix Cache Seam
+
+Proxy-level prefix cache отдаёт cached PCM сразу, а live-продолжение склеивает по PCM:
+
+- `full_commit_mode` генерирует полную фразу upstream для лучшей просодии;
+- proxy адаптивно ищет skip point рядом с ожидаемой длительностью prefix-а;
+- небольшой cached tail смешивается с live head через crossfade;
+- поздние `append` после `finish` считаются идемпотентными и игнорируются, чтобы UI не зависал в полуоткрытой сессии.
+
+Эта логика живёт в `fish_speech_server/proxy/pcm.py`; core Fish Speech по-прежнему принимает только текст, reference и optional continuation codes.
